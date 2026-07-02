@@ -364,6 +364,17 @@ void generate_leaves(RackListLeave *leave_list, const KLV *klv,
     const int number_of_letters_in_leave = rack_get_total_letters(leave);
     if (number_of_letters_in_leave > 0 &&
         number_of_letters_in_leave < (RACK_SIZE)) {
+      if (word_index == KLV_UNFOUND_INDEX || word_index == 0) {
+        // The leave isn't in the KLV's word graph: the starting leaves were
+        // built for a different letter distribution (e.g. Scrabble leaves
+        // cannot represent a five-S Crossplay leave). Without this check the
+        // next line writes to leave_list[word_index - 1] with a sentinel
+        // index — a wild write that crashes deep in generation writeout.
+        log_fatal("leave not present in KLV word graph (word_index sentinel); "
+                  "the starting leaves file does not match the letter "
+                  "distribution — bootstrap zeroed leaves for this "
+                  "distribution with 'createdata klv <NAME> <ld>' first");
+      }
       // Count the number of ways we can draw the remaining letters for this
       // rack after the leave is subtracted from the letter distribution.
       const uint64_t count = get_total_combos_for_rack(rl_ld, full_rack);
