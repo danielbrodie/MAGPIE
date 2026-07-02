@@ -16,7 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -371,7 +373,9 @@ static inline void rack_info_table_destroy(RackInfoTable *rit) {
   }
   free(rit->name);
   if (rit->is_mmapped) {
+#ifndef _WIN32
     munmap(rit->mmap_base, rit->mmap_size);
+#endif
   } else {
     free(rit->bucket_starts);
     free(rit->entries);
@@ -648,7 +652,11 @@ static inline void rack_info_table_load_mmap(RackInfoTable *rit,
                                              const char *name,
                                              const char *filename,
                                              ErrorStack *error_stack) {
-#if !IS_LITTLE_ENDIAN
+#ifdef _WIN32
+  // Native Windows: no mmap -- use the portable fread loader. Identical
+  // result; the mapped path only skips the fread startup cost.
+  rack_info_table_load(rit, name, filename, error_stack);
+#elif !IS_LITTLE_ENDIAN
   (void)rit;
   (void)name;
   error_stack_push(

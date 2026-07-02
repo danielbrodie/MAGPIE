@@ -23,6 +23,29 @@ typedef struct FileCache {
 
 static FileCache file_cache = {0};
 
+#ifdef _WIN32
+// fmemopen replacement for native-Windows builds: spill the buffer to a
+// delete-on-close temp file. Only ever used for read-only cached streams.
+static FILE *fmemopen(void *buf, size_t size, const char *mode) {
+  (void)mode;
+  char *name = _tempnam(NULL, "magpie");
+  if (!name) {
+    return NULL;
+  }
+  FILE *stream = fopen(name, "w+bD"); // D: delete-on-close (UCRT extension)
+  free(name);
+  if (!stream) {
+    return NULL;
+  }
+  if (fwrite(buf, 1, size, stream) != size) {
+    fclose(stream);
+    return NULL;
+  }
+  rewind(stream);
+  return stream;
+}
+#endif // _WIN32
+
 FILE *stream_from_filename(const char *filename, ErrorStack *error_stack) {
   // Look in cache.
   if (!filename) {

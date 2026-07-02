@@ -3,7 +3,7 @@
 #include "../util/fileproxy.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
-#include <glob.h>
+#include "../compat/cglob.h"
 #include <stdlib.h>
 #include <unistd.h>
 

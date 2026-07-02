@@ -1,5 +1,11 @@
 #include "config.h"
 
+#ifdef _WIN32
+#include <direct.h>
+// Windows _mkdir takes no mode argument.
+#define mkdir(path, mode) _mkdir(path)
+#endif
+
 #include "../compat/ctime.h"
 #include "../compat/memory_info.h"
 #include "../def/autoplay_defs.h"

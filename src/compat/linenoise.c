@@ -1,3 +1,4 @@
+#ifndef _WIN32 // native-Windows builds use linenoise_win.c instead
 /* linenoise.c -- guerrilla line editing library against the idea that a
  * line editing lib needs to be 20,000 lines of C code.
  *
@@ -1436,3 +1437,5 @@ int linenoiseHistoryLoad(const char *filename) {
   fclose(fp);
   return 0;
 }
+
+#endif // !_WIN32

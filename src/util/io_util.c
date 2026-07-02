@@ -211,6 +211,43 @@ void write_to_stream(FILE *stream, const char *fmt, ...) {
   va_end(args);
 }
 
+#ifdef _WIN32
+// getline replacement for native-Windows builds (POSIX-compatible subset).
+static ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+  if (!lineptr || !n || !stream) {
+    return -1;
+  }
+  if (!*lineptr || *n == 0) {
+    *n = 256;
+    *lineptr = (char *)malloc(*n);
+    if (!*lineptr) {
+      return -1;
+    }
+  }
+  size_t len = 0;
+  int ch = EOF;
+  while ((ch = fgetc(stream)) != EOF) {
+    if (len + 2 > *n) {
+      *n *= 2;
+      char *grown = (char *)realloc(*lineptr, *n);
+      if (!grown) {
+        return -1;
+      }
+      *lineptr = grown;
+    }
+    (*lineptr)[len++] = (char)ch;
+    if (ch == '\n') {
+      break;
+    }
+  }
+  if (len == 0 && ch == EOF) {
+    return -1;
+  }
+  (*lineptr)[len] = '\0';
+  return (ssize_t)len;
+}
+#endif // _WIN32
+
 ssize_t getline_ignore_carriage_return(char **lineptr, size_t *n,
                                        FILE *stream) {
   ssize_t nread = getline(lineptr, n, stream);

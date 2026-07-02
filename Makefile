@@ -77,6 +77,10 @@ CFLAGS += -DBOARD_DIM=$(BOARD_DIM) -DRACK_SIZE=$(RACK_SIZE)
 LFLAGS := ${lflags.${BUILD}}
 LDFLAGS  := ${ldflags.${BUILD}}
 LDLIBS   := -lm
+ifeq ($(OS),Windows_NT)
+# POSIX regex for src/impl/gcg.c comes from MSYS2 libsystre (TRE wrapper).
+LDLIBS += -lsystre -ltre
+endif
 
 .PHONY: all clean iwyu
 
