@@ -4,48 +4,50 @@
 #include "../util/io_util.h"
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#else
+#ifndef _WIN32
 #include <sys/poll.h>
 #include <unistd.h>
 #endif
 
 #ifdef _WIN32
-// Native-Windows variant: no poll(2). The waiter simply blocks reading stdin;
-// the finished-signal wakeup is not implemented, so async mode degrades (the
-// reader thread only wakes on input or EOF). Sync mode -- the only mode the
-// Windows build is used in -- is unaffected.
+// Native-Windows variant. The POSIX implementation polls {stdin, signal
+// pipe} so the waiter wakes on either input or command completion without
+// consuming stdin it wasn't granted. Windows has no poll(2) on anonymous
+// pipes, and a blocking-read stub would RACE THE MAIN LOOP for stdin lines
+// (observed: the startup async-mode 'set' command's waiter stealing the
+// next piped command nondeterministically). So on Windows the waiter never
+// reads stdin at all: it waits on the finished flag only. Degradation: no
+// 'stop' input while a command is running -- irrelevant for the piped batch
+// usage (leavegen/autoplay) this port exists for.
+#include <stdatomic.h>
+#include <synchapi.h>
+
 typedef struct AsyncCommandControl {
-  int pipefds[2];
+  atomic_int finished;
 } AsyncCommandControl;
 
 static inline AsyncCommandControl *async_command_control_create(void) {
   AsyncCommandControl *acc =
       (AsyncCommandControl *)malloc_or_die(sizeof(AsyncCommandControl));
-  if (_pipe(acc->pipefds, 256, _O_BINARY) == -1) {
-    perror("pipe");
-    log_fatal("failed to create pipe for async command control");
-  }
+  atomic_init(&acc->finished, 0);
   return acc;
 }
 
 static inline void async_command_control_destroy(AsyncCommandControl *acc) {
-  _close(acc->pipefds[0]);
-  _close(acc->pipefds[1]);
   free(acc);
 }
 
 static inline void
 async_command_control_send_finished_signal(AsyncCommandControl *acc) {
-  (void)acc;
+  atomic_store(&acc->finished, 1);
 }
 
 static inline char *async_command_control_wait_for_input_or_finished_signal(
     AsyncCommandControl *acc) {
-  (void)acc;
-  return read_line_from_stream_in();
+  while (!atomic_load(&acc->finished)) {
+    Sleep(10);
+  }
+  return NULL;
 }
 #else
 
