@@ -1,6 +1,5 @@
 #include "cpeg.h"
 
-#include "../compat/cpthread.h"
 #include "../def/equity_defs.h"
 #include "../def/game_defs.h"
 #include "../def/game_history_defs.h"
@@ -22,6 +21,7 @@
 #include "gameplay.h"
 #include "move_gen.h"
 #include "peg_combinatorics.h"
+#include "peg_pool.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -593,13 +593,63 @@ typedef struct CpegRootCand {
   double weighted_spread; // sum over worlds of world_weight * in-world value
 } CpegRootCand;
 
+// Build the immutable post-placement state shared by every world for one root
+// candidate. The board, mover leave, side to move, and cross-sets are identical
+// across worlds; only the bag and opponent rack vary.
+static Game *cpeg_build_root_template(const Game *root_game,
+                                      const Move *move) {
+  Game *template_game = game_duplicate(root_game);
+  play_move_without_drawing_tiles(move, template_game);
+  game_gen_all_cross_sets(template_game);
+  return template_game;
+}
+
+// Value to the root mover of a placement that has already been applied to
+// post_place_game. This is the root-only counterpart of cpeg_eval_place: it
+// enumerates the same draws, but copies the immutable candidate template
+// instead of replaying the candidate and rebuilding its post-move state for
+// every draw in every world.
+static double cpeg_eval_post_place(CpegPreCtx *ctx,
+                                   const Game *post_place_game,
+                                   int tiles_played, int score, int depth) {
+  const Bag *bag = game_get_bag(post_place_game);
+  const int bag_count = bag_get_letters(bag);
+  const int k_drawn = tiles_played < bag_count ? tiles_played : bag_count;
+
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  const int n_draws =
+      cpeg_enum_submultisets(counts, ctx->ld_size, k_drawn, draws, CPEG_ENUM_CAP);
+
+  double weighted_sum = 0.0;
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    const CpegMultiset *draw = &draws[draw_idx];
+    Game *child = cpeg_child_game(ctx, depth, post_place_game);
+    Bag *child_bag = game_get_bag(child);
+    Rack *mover_rack =
+        player_get_rack(game_get_player(child, ctx->mover_idx));
+    for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+      bag_draw_letter(child_bag, draw->tiles[tile_idx], ctx->mover_idx);
+      rack_add_letter(mover_rack, draw->tiles[tile_idx]);
+    }
+    game_set_consecutive_scoreless_turns(child, 0);
+    game_set_game_end_reason(child, GAME_END_REASON_NONE);
+    weighted_sum += (double)draw->weight * cpeg_value(ctx, child, 0, depth + 1);
+    weight_total += draw->weight;
+  }
+  const double child_expectation =
+      weight_total > 0 ? weighted_sum / (double)weight_total : 0.0;
+  return (double)score - child_expectation;
+}
+
 // In-world value to the mover of committing to one root candidate (its first
 // move). The world_game is on the mover's turn with both racks and the bag set.
-static double cpeg_eval_root_cand(CpegPreCtx *ctx, const Game *world_game,
-                                  const CpegRootCand *cand) {
-  if (cand->kind == 0) {
-    return cpeg_eval_place(ctx, world_game, &cand->move, /*depth=*/0);
-  }
+static double cpeg_eval_root_scoreless(CpegPreCtx *ctx, const Game *world_game,
+                                       const CpegRootCand *cand) {
   if (cand->kind == 1) {
     return cpeg_eval_scoreless(ctx, world_game, NULL, 0, /*scoreless=*/0,
                                /*depth=*/0);
@@ -608,60 +658,60 @@ static double cpeg_eval_root_cand(CpegPreCtx *ctx, const Game *world_game,
                              /*scoreless=*/0, /*depth=*/0);
 }
 
-// Per-thread worker: evaluates a contiguous slice of the worlds against every
-// candidate, accumulating weight * value into its own `accum` array (one entry
-// per candidate). The slices partition the worlds, so no accumulator is shared
-// and the reduction afterward is a plain sum -- no locks on the hot path.
+// Per-pool-worker scratch. Pool jobs are independent (candidate, world) pairs;
+// worker_idx selects one context and mutable game so no hot-path locking is
+// needed.
 typedef struct CpegWorker {
   CpegPreCtx ctx;
-  const Game *root_game;
   Game *world_game;
-  const CpegMultiset *worlds;
-  int world_start;
-  int world_end;
+} CpegWorker;
+
+typedef struct CpegRootJob {
+  CpegWorker *workers;
+  const Game *source_game;
+  const CpegMultiset *world;
   const int *unseen;
   int ld_size;
   int opp_idx;
-  const CpegRootCand *cands;
-  int n_cands;
-  double *accum;      // size n_cands
-  int64_t weight_sum; // sum of this slice's world weights
-} CpegWorker;
+  const CpegRootCand *cand;
+  double value;
+} CpegRootJob;
 
-static void cpeg_worker_run(CpegWorker *worker) {
-  for (int world_idx = worker->world_start; world_idx < worker->world_end;
-       world_idx++) {
-    const CpegMultiset *world = &worker->worlds[world_idx];
-    game_copy(worker->world_game, worker->root_game);
-    // The world's bag is `world`; the opponent holds the rest of the unseen.
-    bag_set_to_tiles(game_get_bag(worker->world_game), world->tiles, world->n);
-    Rack *opp_rack =
-        player_get_rack(game_get_player(worker->world_game, worker->opp_idx));
-    rack_reset(opp_rack);
-    int remaining[MAX_ALPHABET_SIZE];
-    for (int ml = 0; ml < worker->ld_size; ml++) {
-      remaining[ml] = worker->unseen[ml];
-    }
-    for (int i = 0; i < world->n; i++) {
-      remaining[world->tiles[i]]--;
-    }
-    for (int ml = 0; ml < worker->ld_size; ml++) {
-      for (int i = 0; i < remaining[ml]; i++) {
-        rack_add_letter(opp_rack, (MachineLetter)ml);
-      }
-    }
-    worker->weight_sum += world->weight;
-    for (int cand_idx = 0; cand_idx < worker->n_cands; cand_idx++) {
-      const double value = cpeg_eval_root_cand(&worker->ctx, worker->world_game,
-                                               &worker->cands[cand_idx]);
-      worker->accum[cand_idx] += (double)world->weight * value;
+static void cpeg_set_world(Game *world_game, const Game *source_game,
+                           const CpegMultiset *world, const int *unseen,
+                           int ld_size, int opp_idx) {
+  game_copy(world_game, source_game);
+  // The world's bag is `world`; the opponent holds the rest of the unseen.
+  bag_set_to_tiles(game_get_bag(world_game), world->tiles, world->n);
+  Rack *opp_rack = player_get_rack(game_get_player(world_game, opp_idx));
+  rack_reset(opp_rack);
+  int remaining[MAX_ALPHABET_SIZE];
+  for (int ml = 0; ml < ld_size; ml++) {
+    remaining[ml] = unseen[ml];
+  }
+  for (int tile_idx = 0; tile_idx < world->n; tile_idx++) {
+    remaining[world->tiles[tile_idx]]--;
+  }
+  for (int ml = 0; ml < ld_size; ml++) {
+    for (int tile_idx = 0; tile_idx < remaining[ml]; tile_idx++) {
+      rack_add_letter(opp_rack, (MachineLetter)ml);
     }
   }
 }
 
-static void *cpeg_worker_thread(void *arg) {
-  cpeg_worker_run((CpegWorker *)arg);
-  return NULL;
+static void cpeg_root_job_run(void *arg, int worker_idx) {
+  CpegRootJob *job = (CpegRootJob *)arg;
+  CpegWorker *worker = &job->workers[worker_idx];
+  cpeg_set_world(worker->world_game, job->source_game, job->world, job->unseen,
+                 job->ld_size, job->opp_idx);
+  if (job->cand->kind == 0) {
+    job->value = cpeg_eval_post_place(
+        &worker->ctx, worker->world_game,
+        move_get_tiles_played(&job->cand->move), job->cand->score, /*depth=*/0);
+  } else {
+    job->value = cpeg_eval_root_scoreless(&worker->ctx, worker->world_game,
+                                          job->cand);
+  }
 }
 
 // Descending sort: expected spread, then first-move score, then label order so
@@ -765,52 +815,83 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
   const int n_worlds =
       cpeg_enum_submultisets(unseen, ld_size, bag, worlds, CPEG_WORLD_CAP);
 
-  int n_workers = num_threads < 1 ? 1 : num_threads;
-  if (n_workers > n_worlds) {
-    n_workers = n_worlds < 1 ? 1 : n_worlds;
+  // Build each placement once. These games are immutable after construction
+  // and shared by every (candidate, world) job for that candidate.
+  Game **templates = calloc_or_die((size_t)n_cands, sizeof(*templates));
+  for (int cand_idx = 0; cand_idx < n_cands; cand_idx++) {
+    if (cands[cand_idx].kind == 0) {
+      templates[cand_idx] =
+          cpeg_build_root_template(game, &cands[cand_idx].move);
+    }
   }
-  CpegWorker *workers = malloc_or_die((size_t)n_workers * sizeof(*workers));
-  for (int worker_idx = 0; worker_idx < n_workers; worker_idx++) {
+
+  const int n_threads = num_threads < 1 ? 1 : num_threads;
+  PegPool *pool = n_threads > 1 ? peg_pool_create(n_threads, 0) : NULL;
+  if (pool != NULL) {
+    // A single exact pre-endgame job may legitimately search for longer than
+    // the generic pool watchdog interval on larger bags.
+    peg_pool_set_stuck_timeout_seconds(pool, 0);
+  }
+  // Pool workers use [0, n_threads); the submitting thread helps at index
+  // n_threads. Single-threaded inline execution uses index 0.
+  const int n_scratch = pool != NULL ? n_threads + 1 : 1;
+  CpegWorker *workers = malloc_or_die((size_t)n_scratch * sizeof(*workers));
+  for (int worker_idx = 0; worker_idx < n_scratch; worker_idx++) {
     CpegWorker *worker = &workers[worker_idx];
     cpeg_ctx_init(&worker->ctx, ld, ld_size, mover_idx, allow_exchanges);
-    worker->root_game = game;
     worker->world_game = game_duplicate(game);
-    worker->worlds = worlds;
-    worker->world_start = (int)((int64_t)worker_idx * n_worlds / n_workers);
-    worker->world_end = (int)((int64_t)(worker_idx + 1) * n_worlds / n_workers);
-    worker->unseen = unseen;
-    worker->ld_size = ld_size;
-    worker->opp_idx = opp_idx;
-    worker->cands = cands;
-    worker->n_cands = n_cands;
-    worker->accum = calloc_or_die((size_t)n_cands, sizeof(double));
-    worker->weight_sum = 0;
   }
 
-  if (n_workers == 1) {
-    cpeg_worker_run(&workers[0]);
-  } else {
-    pthread_t *threads =
-        malloc_or_die((size_t)(n_workers - 1) * sizeof(*threads));
-    for (int worker_idx = 1; worker_idx < n_workers; worker_idx++) {
-      cpthread_create_with_stack(&threads[worker_idx - 1], cpeg_worker_thread,
-                                 &workers[worker_idx],
-                                 PEG_POOL_WORKER_STACK_BYTES);
-    }
-    cpeg_worker_run(&workers[0]);
-    for (int worker_idx = 1; worker_idx < n_workers; worker_idx++) {
-      cpthread_join(threads[worker_idx - 1]);
-    }
-    free(threads);
-  }
-
-  // Reduce the per-worker accumulators into the shared candidate totals.
-  int64_t total_world_weight = 0;
-  for (int worker_idx = 0; worker_idx < n_workers; worker_idx++) {
-    const CpegWorker *worker = &workers[worker_idx];
-    total_world_weight += worker->weight_sum;
+  const int n_jobs = n_cands * n_worlds;
+  CpegRootJob *jobs = malloc_or_die((size_t)n_jobs * sizeof(*jobs));
+  void **job_ptrs = malloc_or_die((size_t)n_jobs * sizeof(*job_ptrs));
+  for (int world_idx = 0; world_idx < n_worlds; world_idx++) {
     for (int cand_idx = 0; cand_idx < n_cands; cand_idx++) {
-      cands[cand_idx].weighted_spread += worker->accum[cand_idx];
+      const int job_idx = world_idx * n_cands + cand_idx;
+      CpegRootJob *job = &jobs[job_idx];
+      job->workers = workers;
+      job->source_game = templates[cand_idx] != NULL ? templates[cand_idx] : game;
+      job->world = &worlds[world_idx];
+      job->unseen = unseen;
+      job->ld_size = ld_size;
+      job->opp_idx = opp_idx;
+      job->cand = &cands[cand_idx];
+      job->value = 0.0;
+      job_ptrs[job_idx] = job;
+    }
+  }
+  const int helper_worker_idx = pool != NULL ? n_threads : 0;
+  peg_pool_submit_and_wait(pool, cpeg_root_job_run, job_ptrs, n_jobs,
+                           helper_worker_idx);
+
+  // Preserve the old deterministic floating-point reduction order: accumulate
+  // each former contiguous world slice independently, then add slices in
+  // worker order. Job execution order is deliberately irrelevant.
+  int n_reducers = n_threads;
+  if (n_reducers > n_worlds) {
+    n_reducers = n_worlds < 1 ? 1 : n_worlds;
+  }
+  double *accum = calloc_or_die((size_t)n_reducers * (size_t)n_cands,
+                                sizeof(*accum));
+  int64_t total_world_weight = 0;
+  for (int reducer_idx = 0; reducer_idx < n_reducers; reducer_idx++) {
+    const int world_start =
+        (int)((int64_t)reducer_idx * n_worlds / n_reducers);
+    const int world_end =
+        (int)((int64_t)(reducer_idx + 1) * n_worlds / n_reducers);
+    for (int world_idx = world_start; world_idx < world_end; world_idx++) {
+      total_world_weight += worlds[world_idx].weight;
+      for (int cand_idx = 0; cand_idx < n_cands; cand_idx++) {
+        const int job_idx = world_idx * n_cands + cand_idx;
+        accum[reducer_idx * n_cands + cand_idx] +=
+            (double)worlds[world_idx].weight * jobs[job_idx].value;
+      }
+    }
+  }
+  for (int reducer_idx = 0; reducer_idx < n_reducers; reducer_idx++) {
+    for (int cand_idx = 0; cand_idx < n_cands; cand_idx++) {
+      cands[cand_idx].weighted_spread +=
+          accum[reducer_idx * n_cands + cand_idx];
     }
   }
 
@@ -847,12 +928,21 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
   qsort(out->cands, (size_t)out->count, sizeof(out->cands[0]),
         cpeg_cand_compare);
 
-  for (int worker_idx = 0; worker_idx < n_workers; worker_idx++) {
-    free(workers[worker_idx].accum);
+  free(accum);
+  free(job_ptrs);
+  free(jobs);
+  peg_pool_destroy(pool);
+  for (int worker_idx = 0; worker_idx < n_scratch; worker_idx++) {
     game_destroy(workers[worker_idx].world_game);
     cpeg_ctx_destroy(&workers[worker_idx].ctx);
   }
   free(workers);
+  for (int cand_idx = 0; cand_idx < n_cands; cand_idx++) {
+    if (templates[cand_idx] != NULL) {
+      game_destroy(templates[cand_idx]);
+    }
+  }
+  free(templates);
   free(worlds);
   free(cands);
   move_list_destroy(root_moves);
