@@ -19,6 +19,7 @@
 #include "command_test.h"
 #include "config_test.h"
 #include "convert_test.h"
+#include "cpeg_test.h"
 #include "create_data_test.h"
 #include "cross_set_test.h"
 #include "dawg_packed_test.h"
@@ -134,6 +135,7 @@ static TestEntry test_table[] = {
     {"load", test_load_gcg},
     {"pegpool", test_peg_pool},
     {"peg", test_peg},
+    {"cpeg", test_cpeg},
     {"pegpessdraw", test_peg_pessfull_draw_regression},
     {"pegtopkall", test_peg_pegtopk_all},
     {NULL, NULL} // Sentinel value to mark end of array

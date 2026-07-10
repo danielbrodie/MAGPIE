@@ -63,6 +63,7 @@
 #include "autoplay.h"
 #include "cgp.h"
 #include "convert.h"
+#include "cpeg.h"
 #include "endgame.h"
 #include "gameplay.h"
 #include "gcg.h"
@@ -108,6 +109,7 @@ typedef enum {
   ARG_TOKEN_INFER,
   ARG_TOKEN_ENDGAME,
   ARG_TOKEN_PEG,
+  ARG_TOKEN_CPEG,
   ARG_TOKEN_AUTOPLAY,
   ARG_TOKEN_CONVERT,
   ARG_TOKEN_P1_NAME,
@@ -1132,6 +1134,11 @@ void add_help_arg_to_string_builder(const Config *config, int token,
       text = "Runs the pre-endgame (PEG) solver on the current position (1..4 "
              "tiles in the bag).";
       break;
+    case ARG_TOKEN_CPEG:
+      usages[0] = "";
+      text = "Runs the exact Crossplay endgame solver on the current position "
+             "(bag empty). Emits a machine-readable one-line result.";
+      break;
     case ARG_TOKEN_AUTOPLAY:
       usages[0] = "<type1> <num_games>";
       usages[1] = "<type1>,<type2>,... <num_games>";
@@ -2145,6 +2152,7 @@ char *impl_help(Config *config, ErrorStack *error_stack) {
     static const arg_token_t game_analysis_cmds[] = {
         ARG_TOKEN_MOVES,                /* addmoves */
         ARG_TOKEN_ANALYZE,              /* analyze */
+        ARG_TOKEN_CPEG,                 /* cpeg */
         ARG_TOKEN_ENDGAME,              /* endgame */
         ARG_TOKEN_GEN,                  /* generate */
         ARG_TOKEN_GEN_AND_SIM,          /* gsimulate */
@@ -3334,6 +3342,46 @@ void impl_peg(Config *config, ErrorStack *error_stack) {
   }
   config_init_game(config);
   config_peg(config, error_stack);
+}
+
+// Crossplay endgame (bag empty): exact two-ply solve under Crossplay rules.
+// Emits one machine-readable line the Python solver parses:
+//   cpeg <best_coord> <best_word> <best_score> \
+//        <reply_coord> <reply_word> <reply_score> <swing>
+// with "pass" replacing "<coord> <word>" for a pass and "-" for the reply
+// fields when the opponent has no tiles left to reply with.
+void impl_cpeg(Config *config, ErrorStack *error_stack) {
+  if (!config_has_game_data(config)) {
+    error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+                     string_duplicate("cannot run cpeg without lexicon"));
+    return;
+  }
+  config_init_game(config);
+  Game *game = config->game;
+  if (!bag_is_empty(game_get_bag(game))) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
+        string_duplicate("cpeg requires an empty bag (Crossplay endgame)"));
+    return;
+  }
+  CpegResult result;
+  cpeg_solve_endgame(game, &result);
+
+  StringBuilder *line = string_builder_create();
+  string_builder_add_string(line, "cpeg ");
+  string_builder_add_string(line, result.mover_str);
+  string_builder_add_formatted_string(line, " %d ", result.mover_score);
+  if (result.has_reply) {
+    string_builder_add_string(line, result.reply_str);
+    string_builder_add_formatted_string(line, " %d ", result.reply_score);
+  } else {
+    string_builder_add_string(line, "- - ");
+  }
+  string_builder_add_formatted_string(line, "%d\n", result.swing);
+  char *out = string_builder_dump(line, NULL);
+  string_builder_destroy(line);
+  thread_control_print(config->thread_control, out);
+  free(out);
 }
 
 // Writes the untruncated peg chart to data/pegcharts/outcomes_<ts>.txt, where
@@ -7829,6 +7877,15 @@ char *str_api_peg(Config *config, ErrorStack *error_stack) {
   return empty_string();
 }
 
+void execute_cpeg(Config *config, ErrorStack *error_stack) {
+  impl_cpeg(config, error_stack);
+}
+
+char *str_api_cpeg(Config *config, ErrorStack *error_stack) {
+  impl_cpeg(config, error_stack);
+  return empty_string();
+}
+
 void execute_autoplay(Config *config, ErrorStack *error_stack) {
   impl_autoplay(config, error_stack);
 }
@@ -8239,6 +8296,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_INFER, "infer", 0, 5, infer, generic, false);
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
+  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 0, cpeg, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);
   cmd(ARG_TOKEN_LEAVE_GEN, "leavegen", 2, 2, leave_gen, generic, false);
@@ -8580,6 +8638,7 @@ void config_add_settings_to_string_builder(const Config *config,
     case ARG_TOKEN_INFER:
     case ARG_TOKEN_ENDGAME:
     case ARG_TOKEN_PEG:
+    case ARG_TOKEN_CPEG:
     case ARG_TOKEN_PEG_ONLY:
     case ARG_TOKEN_PEG_NOPRUNE:
     case ARG_TOKEN_PEG_OUTCOMES:
