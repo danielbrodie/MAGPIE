@@ -3,6 +3,7 @@
 #include "../src/impl/cpeg.h"
 #include "test_util.h"
 #include <assert.h>
+#include <math.h>
 #include <string.h>
 
 // A real Crossplay bag-empty position (the endgame_final_turn.png fixture the
@@ -13,7 +14,37 @@ static const char *const CPEG_FINAL_TURN_CGP =
     "4S3L6/4O2FOB5/4LO1OPA5/5C1A1R3T1/5HMM1QI1GOT/6AE1UNLIKE/6ID1EN1TEG/"
     "6D6R1/7GALENAS1 IIEAYSI/?TUUVY 0/0 0";
 
-void test_cpeg(void) {
+// Two real Crossplay pre-endgame positions with the bag holding one tile. The
+// opponent's rack is left empty in the CGP so the solver enumerates the unseen
+// tiles into opponent-rack worlds. Both are cross-checked against the Python
+// reference (its listed candidates match cpeg's values exactly).
+//   IMG_9570: mover BQEEUAT. 15J BEET scores 39 and is worth +43.875, but the
+//   exhaustive search finds 13J TAU (16) worth +44.125 -- a blocker/leave play
+//   that strands the opponent vowelless. (The Python reference, which prunes
+//   low-scoring candidates, does not list TAU.)
+static const char *const CPEG_PRE_9570_CGP =
+    "cgp 13V1/13AG/6DIMLY2SH/7N5TE/3p3VAC4R/3H3O6A/T2O3I6O/I2N3COZEN1ES/"
+    "BRIEFS1E2ROUX1/I3AIRsOME2I1/A4N7L1/L3GEEK3LEIS/5W7A1/1DOTeS1GUARDANT/"
+    "YORE11 BQEEUAT/ 0/0 0";
+//   IMG_9653: mover DPIATSS. Top play 12G I(N)S(I)D(E) scores 25 and is worth
+//   +23.0 -- matches the Python reference's top move and spread exactly.
+static const char *const CPEG_PRE_9653_CGP =
+    "cgp 7KiNIN3/8G1TORN1/7ON6/7YO6/8R2H3/7BE1BO3/4F2OR1ET1J1/2REAVOW2HE1US/"
+    "4TI1SODALITE/4WE1M2V3G/4AD1A1FED2U/CInQS2N1I1E1AE/A2A5L1T1I1/"
+    "R2d2ZEAL1O1R1/P2I5Y1X3 DPIATSS/ 0/0 0";
+
+// Returns the expected spread of the candidate whose label matches, or NAN when
+// no such candidate is present.
+static double cpeg_find_spread(const CpegPreResult *result, const char *label) {
+  for (int cand_idx = 0; cand_idx < result->count; cand_idx++) {
+    if (strcmp(result->cands[cand_idx].label, label) == 0) {
+      return result->cands[cand_idx].expected_spread;
+    }
+  }
+  return NAN;
+}
+
+static void test_cpeg_endgame(void) {
   Config *config = config_create_or_die(
       "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
       "NWL23_crossplay -s1 score -s2 score -threads 1");
@@ -32,4 +63,42 @@ void test_cpeg(void) {
   assert_strings_equal(result.reply_str, "K4 (B)hUT");
 
   config_destroy(config);
+}
+
+static void test_cpeg_pre_endgame(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+
+  // IMG_9570, bag 1, no exchanges: BEET's known value is reproduced exactly, and
+  // the exhaustive search's optimum is the blocker 13J TAU.
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  Game *game = config_get_game(config);
+  CpegPreResult result;
+  cpeg_solve_pre_endgame(game, /*bag=*/1, /*allow_exchanges=*/false,
+                         /*num_threads=*/1, &result);
+  assert(result.count > 0);
+  assert(fabs(cpeg_find_spread(&result, "15J BEET") - 43.875) < 1e-6);
+  assert(fabs(cpeg_find_spread(&result, "15J BEAT") - 39.125) < 1e-6);
+  assert(fabs(cpeg_find_spread(&result, "13J TAU") - 44.125) < 1e-6);
+  // The blocker outranks the high scorer: TAU is the exact optimum here.
+  assert_strings_equal(result.cands[0].label, "13J TAU");
+  assert(fabs(result.cands[0].expected_spread - 44.125) < 1e-6);
+
+  // IMG_9653, bag 1, no exchanges: top move and spread match the reference.
+  load_and_exec_config_or_die(config, CPEG_PRE_9653_CGP);
+  game = config_get_game(config);
+  cpeg_solve_pre_endgame(game, /*bag=*/1, /*allow_exchanges=*/false,
+                         /*num_threads=*/1, &result);
+  assert(result.count > 0);
+  assert_strings_equal(result.cands[0].label, "12G I(N)S(I)D(E)");
+  assert(fabs(result.cands[0].expected_spread - 23.0) < 1e-6);
+  assert(fabs(cpeg_find_spread(&result, "15F PAST(Y)") - 22.25) < 1e-6);
+
+  config_destroy(config);
+}
+
+void test_cpeg(void) {
+  test_cpeg_endgame();
+  test_cpeg_pre_endgame();
 }

@@ -3344,19 +3344,12 @@ void impl_peg(Config *config, ErrorStack *error_stack) {
   config_peg(config, error_stack);
 }
 
-// Crossplay endgame (bag empty): exact two-ply solve under Crossplay rules.
-// Emits one machine-readable line the Python solver parses:
+// Emits the bag-empty Crossplay endgame line the Python solver parses:
 //   cpeg <best_coord> <best_word> <best_score> \
 //        <reply_coord> <reply_word> <reply_score> <swing>
 // with "pass" replacing "<coord> <word>" for a pass and "-" for the reply
 // fields when the opponent has no tiles left to reply with.
-void impl_cpeg(Config *config, ErrorStack *error_stack) {
-  if (!config_has_game_data(config)) {
-    error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
-                     string_duplicate("cannot run cpeg without lexicon"));
-    return;
-  }
-  config_init_game(config);
+static void impl_cpeg_endgame(Config *config, ErrorStack *error_stack) {
   Game *game = config->game;
   if (!bag_is_empty(game_get_bag(game))) {
     error_stack_push(
@@ -3382,6 +3375,75 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   string_builder_destroy(line);
   thread_control_print(config->thread_control, out);
   free(out);
+}
+
+// Emits the ranked pre-endgame (bag 1-4) candidates, one machine-readable row
+// each the Python solver parses:
+//   cpeg-cand <rank> <coord> <word> <score> <expected_spread>
+// with "pass" / "exch:<tiles>" replacing "<coord> <word>" as needed.
+static void impl_cpeg_pre_endgame(Config *config, int bag,
+                                  bool allow_exchanges) {
+  Game *game = config->game;
+  CpegPreResult result;
+  cpeg_solve_pre_endgame(game, bag, allow_exchanges,
+                         config_get_num_threads(config), &result);
+
+  StringBuilder *line = string_builder_create();
+  for (int cand_idx = 0; cand_idx < result.count; cand_idx++) {
+    const CpegPreCand *cand = &result.cands[cand_idx];
+    string_builder_add_formatted_string(line, "cpeg-cand %d %s %d %.4f\n",
+                                        cand_idx + 1, cand->label, cand->score,
+                                        cand->expected_spread);
+  }
+  char *out = string_builder_dump(line, NULL);
+  string_builder_destroy(line);
+  thread_control_print(config->thread_control, out);
+  free(out);
+}
+
+// Crossplay endgame / pre-endgame solver command.
+//   cpeg                 -> bag-empty endgame (both racks known in the CGP).
+//   cpeg <bag>           -> pre-endgame with the given true bag size (1-4); the
+//                           CGP carries the mover's rack with the opponent's
+//                           rack empty, so the unseen tiles are enumerated.
+//   cpeg <bag> noexch    -> pre-endgame with exchanges disabled (matches the
+//                           Python reference solver). Order of the two args is
+//                           free; "noexch" may also appear without a bag.
+void impl_cpeg(Config *config, ErrorStack *error_stack) {
+  if (!config_has_game_data(config)) {
+    error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+                     string_duplicate("cannot run cpeg without lexicon"));
+    return;
+  }
+  config_init_game(config);
+
+  int bag = 0;
+  bool allow_exchanges = true;
+  const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
+  for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
+    const char *value = config_get_parg_value(config, ARG_TOKEN_CPEG, arg_idx);
+    if (value == NULL) {
+      continue;
+    }
+    if (strings_equal(value, "noexch")) {
+      allow_exchanges = false;
+    } else {
+      bag = (int)strtol(value, NULL, 10);
+    }
+  }
+
+  if (bag <= 0) {
+    impl_cpeg_endgame(config, error_stack);
+    return;
+  }
+  if (bag > PEG_MAX_BAG) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
+        get_formatted_string("cpeg pre-endgame supports a bag of 1-%d, got %d",
+                             PEG_MAX_BAG, bag));
+    return;
+  }
+  impl_cpeg_pre_endgame(config, bag, allow_exchanges);
 }
 
 // Writes the untruncated peg chart to data/pegcharts/outcomes_<ts>.txt, where
@@ -8296,7 +8358,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_INFER, "infer", 0, 5, infer, generic, false);
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
-  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 0, cpeg, generic, false);
+  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 2, cpeg, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);
   cmd(ARG_TOKEN_LEAVE_GEN, "leavegen", 2, 2, leave_gen, generic, false);

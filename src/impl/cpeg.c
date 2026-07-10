@@ -1,7 +1,13 @@
 #include "cpeg.h"
 
+#include "../compat/cpthread.h"
 #include "../def/equity_defs.h"
+#include "../def/game_defs.h"
+#include "../def/game_history_defs.h"
+#include "../def/letter_distribution_defs.h"
 #include "../def/move_defs.h"
+#include "../def/peg_defs.h"
+#include "../ent/bag.h"
 #include "../ent/board.h"
 #include "../ent/equity.h"
 #include "../ent/game.h"
@@ -15,7 +21,9 @@
 #include "../util/string_util.h"
 #include "gameplay.h"
 #include "move_gen.h"
+#include "peg_combinatorics.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,6 +32,25 @@ enum {
   // enumerate a few thousand plays at most; this cap has generous headroom so
   // MOVE_RECORD_ALL never silently drops a play.
   CPEG_MOVE_LIST_CAP = 16384,
+  // Max recursion depth of the pre-endgame expectiminimax. The bag strictly
+  // decreases on every placement (bounded by PEG_MAX_BAG = 4) and consecutive
+  // scoreless plies are capped at CPEG_SCORELESS_CAP, so the reachable depth is
+  // far below this; the margin is a robustness guard, not a real limit.
+  CPEG_MAX_DEPTH = 20,
+  // Two consecutive scoreless plies (pass or exchange, either player) make the
+  // position terminal at the current spread. This is a STATED MODELLING CHOICE:
+  // Crossplay has no six-scoreless-turns rule, but exchanges keep the bag size
+  // constant, so without this cap an exchange/pass cycle would never terminate.
+  // See the model note above cpeg_solve_pre_endgame.
+  CPEG_SCORELESS_CAP = 2,
+  // Capacity for a single draw/exchange submultiset enumeration. A draw takes at
+  // most PEG_MAX_BAG (4) tiles from a <=4-tile bag, and an exchange at most 4
+  // tiles from a 7-tile rack (C(7,4) = 35), so 128 is comfortable headroom.
+  CPEG_ENUM_CAP = 128,
+  // Capacity for the opponent-rack world enumeration: the distinct
+  // bag-submultisets of the <=11 unseen tiles. C(11,4) = 330 is the worst case;
+  // 1024 leaves headroom.
+  CPEG_WORLD_CAP = 1024,
 };
 
 // Renders a move as "<coord> <word>" (or "pass") into dest, using board so
@@ -66,7 +93,13 @@ static int cpeg_best_score_move(const MoveList *move_list, Move *best_out) {
   return equity_to_int(best_score);
 }
 
-int cpeg_solve_endgame(Game *game, CpegResult *result) {
+// Exact Crossplay endgame solve reusing caller-owned buffers (mover_moves,
+// reply_moves, undo). Identical semantics to cpeg_solve_endgame; factored out so
+// the pre-endgame recursion can hit thousands of empty-bag leaves without a
+// per-leaf allocation. Fills *result and returns the swing (in points).
+static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
+                             MoveList *reply_moves, MoveUndo *undo,
+                             CpegResult *result) {
   memset(result, 0, sizeof(*result));
 
   const LetterDistribution *ld = game_get_ld(game);
@@ -77,10 +110,6 @@ int cpeg_solve_endgame(Game *game, CpegResult *result) {
     game_gen_all_cross_sets(game);
     board_set_cross_sets_valid(board, true);
   }
-
-  MoveList *mover_moves = move_list_create(CPEG_MOVE_LIST_CAP);
-  MoveList *reply_moves = move_list_create(CPEG_MOVE_LIST_CAP);
-  MoveUndo *undo = malloc_or_die(sizeof(MoveUndo));
 
   const MoveGenArgs mover_args = {
       .game = game,
@@ -109,9 +138,6 @@ int cpeg_solve_endgame(Game *game, CpegResult *result) {
     // move scores below.
     play_move_incremental(mover_move, game, undo);
 
-    // The opponent is now on turn; enumerate their plays and take the best by
-    // raw score (a leave is worth nothing on the final turn). A pass (score 0)
-    // is always among them.
     const MoveGenArgs reply_args = {
         .game = game,
         .move_list = reply_moves,
@@ -156,10 +182,6 @@ int cpeg_solve_endgame(Game *game, CpegResult *result) {
       result->reply_score = reply_score;
       result->swing = swing;
       result->has_reply = opponent_can_reply;
-      // Both renders happen while the mover's play is on the board: the mover
-      // move's own placed tiles come from the move (not the board), and every
-      // played-through marker in either move resolves to a tile that is present
-      // in this post-mover-move board -- so both strings render correctly here.
       cpeg_render_move(result->mover_str, sizeof(result->mover_str), board,
                        &result->best_mover, ld);
       if (opponent_can_reply) {
@@ -175,15 +197,679 @@ int cpeg_solve_endgame(Game *game, CpegResult *result) {
   }
 
   if (!have_best) {
-    // No mover play at all (mover rack empty): value is zero, no moves.
     result->mover_str[0] = '-';
     result->mover_str[1] = '\0';
     result->reply_str[0] = '-';
     result->reply_str[1] = '\0';
   }
 
+  return result->swing;
+}
+
+int cpeg_solve_endgame(Game *game, CpegResult *result) {
+  MoveList *mover_moves = move_list_create(CPEG_MOVE_LIST_CAP);
+  MoveList *reply_moves = move_list_create(CPEG_MOVE_LIST_CAP);
+  MoveUndo *undo = malloc_or_die(sizeof(MoveUndo));
+  const int swing =
+      cpeg_endgame_core(game, mover_moves, reply_moves, undo, result);
   free(undo);
   move_list_destroy(reply_moves);
   move_list_destroy(mover_moves);
-  return result->swing;
+  return swing;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-endgame (bag 1-4): exact Crossplay expectiminimax.
+//
+// The model (every clause is load-bearing):
+//   * Worlds. The opponent's rack is enumerated as a distinct submultiset of
+//     the unseen tiles; each world's bag is the complement. Worlds are weighted
+//     by their multiset count (peg_binomial products).
+//   * Per-world perfect information. Inside a world both racks are known and
+//     both sides play optimally. This is the "exact pre-endgame" objective, NOT
+//     a solution of the imperfect-information game.
+//   * Draws are chance nodes. After placing t tiles a player draws
+//     k = min(t, bag) tiles: the distinct k-submultisets of the bag are
+//     enumerated with their multiset weights and averaged.
+//   * Scoring is Crossplay: value is arithmetic over move scores, from the root
+//     mover's perspective (your points minus theirs). Game player scores are
+//     NEVER read (they carry Scrabble's go-out bonus). Leftover racks count for
+//     no one; there is no go-out bonus and no six-scoreless-turns rule.
+//   * Termination. A placement draws >= 1 tile while the bag is non-empty, so
+//     the bag strictly decreases each ply. When the bag reaches 0 the value is
+//     cpeg_endgame_core from the on-turn player's perspective (the two-ply
+//     Crossplay endgame).
+//   * Exchanges. Modelled by enumerating the mover's rack subsets to swap (an
+//     exchange scores 0, redraws, and keeps the bag size constant). Because a
+//     swap does not shrink the bag, CONSECUTIVE scoreless plies (pass or
+//     exchange) are capped at CPEG_SCORELESS_CAP: two in a row make the
+//     position terminal at the current spread. This cap is a stated modelling
+//     choice with no analogue in the real game; it is the only thing that keeps
+//     the exchange search finite. Pass is searched only when there is no legal
+//     placement.
+// ---------------------------------------------------------------------------
+
+// A distinct submultiset produced by cpeg_enum_submultisets, with its
+// combinatorial weight (product of peg_binomial(counts[l], take[l])).
+typedef struct CpegMultiset {
+  MachineLetter tiles[RACK_SIZE + PEG_MAX_BAG];
+  int n;
+  int64_t weight;
+} CpegMultiset;
+
+// Recursive worker for cpeg_enum_submultisets.
+static void cpeg_enum_rec(const int *counts, int ld_size, int start_ml,
+                          int k_left, int64_t weight, MachineLetter *chosen,
+                          int n_chosen, CpegMultiset *out, int *out_n, int cap) {
+  if (k_left == 0) {
+    if (*out_n < cap) {
+      CpegMultiset *entry = &out[*out_n];
+      for (int i = 0; i < n_chosen; i++) {
+        entry->tiles[i] = chosen[i];
+      }
+      entry->n = n_chosen;
+      entry->weight = weight;
+      (*out_n)++;
+    }
+    return;
+  }
+  for (int ml = start_ml; ml < ld_size; ml++) {
+    const int avail = counts[ml];
+    if (avail == 0) {
+      continue;
+    }
+    const int max_take = avail < k_left ? avail : k_left;
+    for (int take = 1; take <= max_take; take++) {
+      const int64_t next_weight = weight * peg_binomial(avail, take);
+      for (int i = 0; i < take; i++) {
+        chosen[n_chosen + i] = (MachineLetter)ml;
+      }
+      cpeg_enum_rec(counts, ld_size, ml + 1, k_left - take, next_weight, chosen,
+                    n_chosen + take, out, out_n, cap);
+    }
+  }
+}
+
+// Enumerate every distinct k-submultiset of counts[0..ld_size) into out (up to
+// cap), each carrying its multiset weight. Returns the number produced. Letters
+// are emitted in increasing order so each multiset appears exactly once.
+static int cpeg_enum_submultisets(const int *counts, int ld_size, int k,
+                                  CpegMultiset *out, int cap) {
+  int out_n = 0;
+  MachineLetter chosen[RACK_SIZE + PEG_MAX_BAG];
+  cpeg_enum_rec(counts, ld_size, 0, k, 1, chosen, 0, out, &out_n, cap);
+  return out_n;
+}
+
+// Solver-wide scratch, carried through the recursion so nothing is allocated
+// per node. Games and move lists are indexed by recursion depth; a node at
+// depth d builds its children into scratch[d] and generates its moves into
+// movelists[d], while its child recursion uses depth d+1 -- so a depth's slots
+// stay stable across the child's whole subtree.
+typedef struct CpegPreCtx {
+  const LetterDistribution *ld;
+  int ld_size;
+  int mover_idx;
+  bool allow_exchanges;
+  MoveList *movelists[CPEG_MAX_DEPTH];
+  Game *scratch[CPEG_MAX_DEPTH];
+  // Shared empty-bag-leaf endgame buffers (leaves never nest, so one set is
+  // reused across every leaf).
+  MoveList *eg_mover;
+  MoveList *eg_reply;
+  MoveUndo *eg_undo;
+} CpegPreCtx;
+
+static MoveList *cpeg_get_movelist(CpegPreCtx *ctx, int depth) {
+  if (ctx->movelists[depth] == NULL) {
+    ctx->movelists[depth] = move_list_create(CPEG_MOVE_LIST_CAP);
+  }
+  return ctx->movelists[depth];
+}
+
+// Copy src into the depth-indexed scratch game (allocating it on first use) and
+// return it.
+static Game *cpeg_child_game(CpegPreCtx *ctx, int depth, const Game *src) {
+  if (ctx->scratch[depth] == NULL) {
+    ctx->scratch[depth] = game_duplicate(src);
+  } else {
+    game_copy(ctx->scratch[depth], src);
+  }
+  return ctx->scratch[depth];
+}
+
+static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless, int depth);
+
+// Value to the on-turn player of committing to placement `move`: its score
+// minus the draw-averaged value of the resulting opponent-to-move position
+// (negamax -- the child value is from the opponent's perspective).
+static double cpeg_eval_place(CpegPreCtx *ctx, const Game *game,
+                              const Move *move, int depth) {
+  const int on_turn = game_get_player_on_turn_index(game);
+  const Bag *bag = game_get_bag(game);
+  const int bag_count = bag_get_letters(bag);
+  const int tiles_played = move_get_tiles_played(move);
+  const int k_drawn = tiles_played < bag_count ? tiles_played : bag_count;
+  const int score = equity_to_int(move_get_score(move));
+
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  const int n_draws =
+      cpeg_enum_submultisets(counts, ctx->ld_size, k_drawn, draws, CPEG_ENUM_CAP);
+
+  double weighted_sum = 0.0;
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    const CpegMultiset *draw = &draws[draw_idx];
+    Game *child = cpeg_child_game(ctx, depth, game);
+    play_move_without_drawing_tiles(move, child);
+    Bag *child_bag = game_get_bag(child);
+    Rack *mover_rack = player_get_rack(game_get_player(child, on_turn));
+    for (int i = 0; i < draw->n; i++) {
+      bag_draw_letter(child_bag, draw->tiles[i], on_turn);
+      rack_add_letter(mover_rack, draw->tiles[i]);
+    }
+    game_set_consecutive_scoreless_turns(child, 0);
+    game_set_game_end_reason(child, GAME_END_REASON_NONE);
+    weighted_sum += (double)draw->weight * cpeg_value(ctx, child, 0, depth + 1);
+    weight_total += draw->weight;
+  }
+  const double child_expectation =
+      weight_total > 0 ? weighted_sum / (double)weight_total : 0.0;
+  return (double)score - child_expectation;
+}
+
+// Value to the on-turn player of a scoreless move: a pass (exch_n == 0, no
+// draw) or an exchange of exch_tiles[0..exch_n) (draw exch_n from the bag, then
+// return the exchanged tiles to the bag). Scores 0; the child value is negated
+// (negamax). Two consecutive scoreless plies terminate the game at the current
+// spread, so this returns 0 when it would be the second in a row.
+static double cpeg_eval_scoreless(CpegPreCtx *ctx, const Game *game,
+                                  const MachineLetter *exch_tiles, int exch_n,
+                                  int scoreless, int depth) {
+  if (scoreless + 1 >= CPEG_SCORELESS_CAP) {
+    return 0.0;
+  }
+  const int on_turn = game_get_player_on_turn_index(game);
+
+  if (exch_n == 0) {
+    Game *child = cpeg_child_game(ctx, depth, game);
+    game_start_next_player_turn(child);
+    game_set_consecutive_scoreless_turns(child, 0);
+    game_set_game_end_reason(child, GAME_END_REASON_NONE);
+    return 0.0 - cpeg_value(ctx, child, scoreless + 1, depth + 1);
+  }
+
+  const Bag *bag = game_get_bag(game);
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  const int n_draws =
+      cpeg_enum_submultisets(counts, ctx->ld_size, exch_n, draws, CPEG_ENUM_CAP);
+
+  double weighted_sum = 0.0;
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    const CpegMultiset *draw = &draws[draw_idx];
+    Game *child = cpeg_child_game(ctx, depth, game);
+    Bag *child_bag = game_get_bag(child);
+    Rack *mover_rack = player_get_rack(game_get_player(child, on_turn));
+    for (int i = 0; i < draw->n; i++) {
+      bag_draw_letter(child_bag, draw->tiles[i], on_turn);
+      rack_add_letter(mover_rack, draw->tiles[i]);
+    }
+    for (int i = 0; i < exch_n; i++) {
+      rack_take_letter(mover_rack, exch_tiles[i]);
+      bag_add_letter(child_bag, exch_tiles[i], on_turn);
+    }
+    game_start_next_player_turn(child);
+    game_set_consecutive_scoreless_turns(child, 0);
+    game_set_game_end_reason(child, GAME_END_REASON_NONE);
+    weighted_sum +=
+        (double)draw->weight * cpeg_value(ctx, child, scoreless + 1, depth + 1);
+    weight_total += draw->weight;
+  }
+  const double child_expectation =
+      weight_total > 0 ? weighted_sum / (double)weight_total : 0.0;
+  return 0.0 - child_expectation;
+}
+
+// Enumerate the mover's distinct exchange multisets (1..min(rack, bag) tiles)
+// into out; returns the count. Shared by the recursion and the root candidate
+// list so both search the same exchange set.
+static int cpeg_enum_exchanges(int ld_size, const Rack *rack, int bag_count,
+                               CpegMultiset *out, int cap) {
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ld_size; ml++) {
+    counts[ml] = rack_get_letter(rack, (MachineLetter)ml);
+  }
+  const int rack_size = rack_get_total_letters(rack);
+  const int max_swap = rack_size < bag_count ? rack_size : bag_count;
+  int total = 0;
+  for (int swap = 1; swap <= max_swap && total < cap; swap++) {
+    total += cpeg_enum_submultisets(counts, ld_size, swap, out + total,
+                                    cap - total);
+  }
+  return total;
+}
+
+// Expectiminimax value for the on-turn player: their optimal expected spread
+// (their points minus the opponent's) over the remaining game, in points. The
+// bag is known here (both racks fixed inside a world); when it is empty the
+// value is the two-ply Crossplay endgame.
+static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless, int depth) {
+  const Bag *bag = game_get_bag(game);
+  const int bag_count = bag_get_letters(bag);
+  if (bag_count == 0) {
+    CpegResult leaf;
+    return (double)cpeg_endgame_core(game, ctx->eg_mover, ctx->eg_reply,
+                                     ctx->eg_undo, &leaf);
+  }
+  if (depth >= CPEG_MAX_DEPTH - 1) {
+    // Unreachable given the scoreless cap and the monotone bag; a safety net.
+    return 0.0;
+  }
+
+  MoveList *move_list = cpeg_get_movelist(ctx, depth);
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = move_list,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&args);
+
+  double best = 0.0;
+  bool have_best = false;
+  bool any_placement = false;
+  const int count = move_list_get_count(move_list);
+  for (int move_idx = 0; move_idx < count; move_idx++) {
+    const Move *move = move_list_get_move(move_list, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    any_placement = true;
+    const double value = cpeg_eval_place(ctx, game, move, depth);
+    if (!have_best || value > best) {
+      best = value;
+      have_best = true;
+    }
+  }
+
+  // Pass is searched only when there is no legal placement.
+  if (!any_placement) {
+    const double value =
+        cpeg_eval_scoreless(ctx, game, NULL, 0, scoreless, depth);
+    if (!have_best || value > best) {
+      best = value;
+      have_best = true;
+    }
+  }
+
+  if (ctx->allow_exchanges) {
+    const Rack *mover_rack = player_get_rack(
+        game_get_player(game, game_get_player_on_turn_index(game)));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    const int n_exch = cpeg_enum_exchanges(ctx->ld_size, mover_rack, bag_count,
+                                           exchanges, CPEG_ENUM_CAP);
+    for (int exch_idx = 0; exch_idx < n_exch; exch_idx++) {
+      const double value = cpeg_eval_scoreless(
+          ctx, game, exchanges[exch_idx].tiles, exchanges[exch_idx].n, scoreless,
+          depth);
+      if (!have_best || value > best) {
+        best = value;
+        have_best = true;
+      }
+    }
+  }
+
+  return have_best ? best : 0.0;
+}
+
+// Tiles not visible to the mover: full distribution minus mover's rack minus the
+// board. Returns the total count.
+static int cpeg_compute_unseen(const Game *game, int mover_idx,
+                               int unseen[MAX_ALPHABET_SIZE]) {
+  const LetterDistribution *ld = game_get_ld(game);
+  const int ld_size = ld_get_size(ld);
+  for (int ml = 0; ml < ld_size; ml++) {
+    unseen[ml] = ld_get_dist(ld, (MachineLetter)ml);
+  }
+  const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
+  for (int ml = 0; ml < ld_size; ml++) {
+    unseen[ml] -= rack_get_letter(mover_rack, (MachineLetter)ml);
+  }
+  const Board *board = game_get_board(game);
+  for (int row = 0; row < BOARD_DIM; row++) {
+    for (int col = 0; col < BOARD_DIM; col++) {
+      if (board_is_empty(board, row, col)) {
+        continue;
+      }
+      const MachineLetter ml = board_get_letter(board, row, col);
+      if (get_is_blanked(ml)) {
+        if (unseen[BLANK_MACHINE_LETTER] > 0) {
+          unseen[BLANK_MACHINE_LETTER]--;
+        }
+      } else if (unseen[ml] > 0) {
+        unseen[ml]--;
+      }
+    }
+  }
+  int total = 0;
+  for (int ml = 0; ml < ld_size; ml++) {
+    total += unseen[ml];
+  }
+  return total;
+}
+
+static void cpeg_ctx_init(CpegPreCtx *ctx, const LetterDistribution *ld,
+                          int ld_size, int mover_idx, bool allow_exchanges) {
+  memset(ctx, 0, sizeof(*ctx));
+  ctx->ld = ld;
+  ctx->ld_size = ld_size;
+  ctx->mover_idx = mover_idx;
+  ctx->allow_exchanges = allow_exchanges;
+  ctx->eg_mover = move_list_create(CPEG_MOVE_LIST_CAP);
+  ctx->eg_reply = move_list_create(CPEG_MOVE_LIST_CAP);
+  ctx->eg_undo = malloc_or_die(sizeof(MoveUndo));
+}
+
+static void cpeg_ctx_destroy(CpegPreCtx *ctx) {
+  for (int depth = 0; depth < CPEG_MAX_DEPTH; depth++) {
+    if (ctx->movelists[depth] != NULL) {
+      move_list_destroy(ctx->movelists[depth]);
+    }
+    if (ctx->scratch[depth] != NULL) {
+      game_destroy(ctx->scratch[depth]);
+    }
+  }
+  free(ctx->eg_undo);
+  move_list_destroy(ctx->eg_reply);
+  move_list_destroy(ctx->eg_mover);
+}
+
+// A root candidate (the mover's fixed first move) with its expected-spread
+// accumulator over the enumerated worlds.
+typedef struct CpegRootCand {
+  int kind; // 0 = placement, 1 = pass, 2 = exchange
+  Move move;
+  MachineLetter exch_tiles[RACK_SIZE];
+  int exch_n;
+  int score;
+  double weighted_spread; // sum over worlds of world_weight * in-world value
+} CpegRootCand;
+
+// In-world value to the mover of committing to one root candidate (its first
+// move). The world_game is on the mover's turn with both racks and the bag set.
+static double cpeg_eval_root_cand(CpegPreCtx *ctx, const Game *world_game,
+                                  const CpegRootCand *cand) {
+  if (cand->kind == 0) {
+    return cpeg_eval_place(ctx, world_game, &cand->move, /*depth=*/0);
+  }
+  if (cand->kind == 1) {
+    return cpeg_eval_scoreless(ctx, world_game, NULL, 0, /*scoreless=*/0,
+                               /*depth=*/0);
+  }
+  return cpeg_eval_scoreless(ctx, world_game, cand->exch_tiles, cand->exch_n,
+                             /*scoreless=*/0, /*depth=*/0);
+}
+
+// Per-thread worker: evaluates a contiguous slice of the worlds against every
+// candidate, accumulating weight * value into its own `accum` array (one entry
+// per candidate). The slices partition the worlds, so no accumulator is shared
+// and the reduction afterward is a plain sum -- no locks on the hot path.
+typedef struct CpegWorker {
+  CpegPreCtx ctx;
+  const Game *root_game;
+  Game *world_game;
+  const CpegMultiset *worlds;
+  int world_start;
+  int world_end;
+  const int *unseen;
+  int ld_size;
+  int opp_idx;
+  const CpegRootCand *cands;
+  int n_cands;
+  double *accum;      // size n_cands
+  int64_t weight_sum; // sum of this slice's world weights
+} CpegWorker;
+
+static void cpeg_worker_run(CpegWorker *worker) {
+  for (int world_idx = worker->world_start; world_idx < worker->world_end;
+       world_idx++) {
+    const CpegMultiset *world = &worker->worlds[world_idx];
+    game_copy(worker->world_game, worker->root_game);
+    // The world's bag is `world`; the opponent holds the rest of the unseen.
+    bag_set_to_tiles(game_get_bag(worker->world_game), world->tiles, world->n);
+    Rack *opp_rack =
+        player_get_rack(game_get_player(worker->world_game, worker->opp_idx));
+    rack_reset(opp_rack);
+    int remaining[MAX_ALPHABET_SIZE];
+    for (int ml = 0; ml < worker->ld_size; ml++) {
+      remaining[ml] = worker->unseen[ml];
+    }
+    for (int i = 0; i < world->n; i++) {
+      remaining[world->tiles[i]]--;
+    }
+    for (int ml = 0; ml < worker->ld_size; ml++) {
+      for (int i = 0; i < remaining[ml]; i++) {
+        rack_add_letter(opp_rack, (MachineLetter)ml);
+      }
+    }
+    worker->weight_sum += world->weight;
+    for (int cand_idx = 0; cand_idx < worker->n_cands; cand_idx++) {
+      const double value = cpeg_eval_root_cand(&worker->ctx, worker->world_game,
+                                               &worker->cands[cand_idx]);
+      worker->accum[cand_idx] += (double)world->weight * value;
+    }
+  }
+}
+
+static void *cpeg_worker_thread(void *arg) {
+  cpeg_worker_run((CpegWorker *)arg);
+  return NULL;
+}
+
+// Descending sort: expected spread, then first-move score, then label order so
+// the ranking is deterministic. Ties on all three keep insertion order.
+static int cpeg_cand_compare(const void *lhs, const void *rhs) {
+  const CpegPreCand *a = lhs;
+  const CpegPreCand *b = rhs;
+  if (a->expected_spread > b->expected_spread) {
+    return -1;
+  }
+  if (a->expected_spread < b->expected_spread) {
+    return 1;
+  }
+  if (a->score != b->score) {
+    return a->score > b->score ? -1 : 1;
+  }
+  return strcmp(a->label, b->label);
+}
+
+int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
+                           int num_threads, CpegPreResult *out) {
+  memset(out, 0, sizeof(*out));
+
+  const LetterDistribution *ld = game_get_ld(game);
+  const int ld_size = ld_get_size(ld);
+  Board *board = game_get_board(game);
+  game_gen_all_cross_sets(game);
+  board_set_cross_sets_valid(board, true);
+
+  const int mover_idx = game_get_player_on_turn_index(game);
+  const int opp_idx = 1 - mover_idx;
+
+  int unseen[MAX_ALPHABET_SIZE];
+  const int total_unseen = cpeg_compute_unseen(game, mover_idx, unseen);
+  const int opp_size = total_unseen - bag;
+  if (opp_size < 0) {
+    return 0; // inconsistent position; nothing to rank
+  }
+
+  // Root candidates (the mover's fixed first moves). Placements come from
+  // move generation on the root board+rack; pass and exchanges are synthesized.
+  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP);
+  const MoveGenArgs root_args = {
+      .game = game,
+      .move_list = root_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&root_args);
+
+  const int root_count = move_list_get_count(root_moves);
+  CpegRootCand *cands =
+      malloc_or_die((size_t)(root_count + 1 + CPEG_ENUM_CAP) * sizeof(*cands));
+  int n_cands = 0;
+  bool any_placement = false;
+  for (int move_idx = 0; move_idx < root_count; move_idx++) {
+    const Move *move = move_list_get_move(root_moves, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    any_placement = true;
+    CpegRootCand *cand = &cands[n_cands++];
+    cand->kind = 0;
+    move_copy(&cand->move, move);
+    cand->exch_n = 0;
+    cand->score = equity_to_int(move_get_score(move));
+    cand->weighted_spread = 0.0;
+  }
+  if (!any_placement) {
+    CpegRootCand *cand = &cands[n_cands++];
+    cand->kind = 1;
+    cand->exch_n = 0;
+    cand->score = 0;
+    cand->weighted_spread = 0.0;
+  }
+  if (allow_exchanges) {
+    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    const int n_exch =
+        cpeg_enum_exchanges(ld_size, mover_rack, bag, exchanges, CPEG_ENUM_CAP);
+    for (int exch_idx = 0; exch_idx < n_exch; exch_idx++) {
+      CpegRootCand *cand = &cands[n_cands++];
+      cand->kind = 2;
+      cand->exch_n = exchanges[exch_idx].n;
+      for (int i = 0; i < cand->exch_n; i++) {
+        cand->exch_tiles[i] = exchanges[exch_idx].tiles[i];
+      }
+      cand->score = 0;
+      cand->weighted_spread = 0.0;
+    }
+  }
+
+  // Enumerate the opponent-rack worlds (distinct bag submultisets of the unseen
+  // tiles). Each world is a perfect-information position; the workers evaluate
+  // every candidate in every world and average by world weight.
+  CpegMultiset *worlds = malloc_or_die(CPEG_WORLD_CAP * sizeof(*worlds));
+  const int n_worlds =
+      cpeg_enum_submultisets(unseen, ld_size, bag, worlds, CPEG_WORLD_CAP);
+
+  int n_workers = num_threads < 1 ? 1 : num_threads;
+  if (n_workers > n_worlds) {
+    n_workers = n_worlds < 1 ? 1 : n_worlds;
+  }
+  CpegWorker *workers = malloc_or_die((size_t)n_workers * sizeof(*workers));
+  for (int worker_idx = 0; worker_idx < n_workers; worker_idx++) {
+    CpegWorker *worker = &workers[worker_idx];
+    cpeg_ctx_init(&worker->ctx, ld, ld_size, mover_idx, allow_exchanges);
+    worker->root_game = game;
+    worker->world_game = game_duplicate(game);
+    worker->worlds = worlds;
+    worker->world_start = (int)((int64_t)worker_idx * n_worlds / n_workers);
+    worker->world_end = (int)((int64_t)(worker_idx + 1) * n_worlds / n_workers);
+    worker->unseen = unseen;
+    worker->ld_size = ld_size;
+    worker->opp_idx = opp_idx;
+    worker->cands = cands;
+    worker->n_cands = n_cands;
+    worker->accum = calloc_or_die((size_t)n_cands, sizeof(double));
+    worker->weight_sum = 0;
+  }
+
+  if (n_workers == 1) {
+    cpeg_worker_run(&workers[0]);
+  } else {
+    pthread_t *threads =
+        malloc_or_die((size_t)(n_workers - 1) * sizeof(*threads));
+    for (int worker_idx = 1; worker_idx < n_workers; worker_idx++) {
+      cpthread_create_with_stack(&threads[worker_idx - 1], cpeg_worker_thread,
+                                 &workers[worker_idx],
+                                 PEG_POOL_WORKER_STACK_BYTES);
+    }
+    cpeg_worker_run(&workers[0]);
+    for (int worker_idx = 1; worker_idx < n_workers; worker_idx++) {
+      cpthread_join(threads[worker_idx - 1]);
+    }
+    free(threads);
+  }
+
+  // Reduce the per-worker accumulators into the shared candidate totals.
+  int64_t total_world_weight = 0;
+  for (int worker_idx = 0; worker_idx < n_workers; worker_idx++) {
+    const CpegWorker *worker = &workers[worker_idx];
+    total_world_weight += worker->weight_sum;
+    for (int cand_idx = 0; cand_idx < n_cands; cand_idx++) {
+      cands[cand_idx].weighted_spread += worker->accum[cand_idx];
+    }
+  }
+
+  // Materialize ranked output.
+  const double weight_denom =
+      total_world_weight > 0 ? (double)total_world_weight : 1.0;
+  int emitted = 0;
+  for (int cand_idx = 0; cand_idx < n_cands && emitted < CPEG_MAX_PRE_CANDS;
+       cand_idx++) {
+    const CpegRootCand *cand = &cands[cand_idx];
+    CpegPreCand *slot = &out->cands[emitted++];
+    slot->score = cand->score;
+    slot->expected_spread = cand->weighted_spread / weight_denom;
+    if (cand->kind == 0) {
+      cpeg_render_move(slot->label, sizeof(slot->label), board, &cand->move, ld);
+    } else if (cand->kind == 1) {
+      memcpy(slot->label, "pass", sizeof("pass"));
+    } else {
+      StringBuilder *builder = string_builder_create();
+      string_builder_add_string(builder, "exch:");
+      for (int i = 0; i < cand->exch_n; i++) {
+        string_builder_add_string(builder, ld->ld_ml_to_hl[cand->exch_tiles[i]]);
+      }
+      const char *rendered = string_builder_peek(builder);
+      const size_t len = string_length(rendered);
+      const size_t copy_len =
+          len < sizeof(slot->label) - 1 ? len : sizeof(slot->label) - 1;
+      memcpy(slot->label, rendered, copy_len);
+      slot->label[copy_len] = '\0';
+      string_builder_destroy(builder);
+    }
+  }
+  out->count = emitted;
+  qsort(out->cands, (size_t)out->count, sizeof(out->cands[0]),
+        cpeg_cand_compare);
+
+  for (int worker_idx = 0; worker_idx < n_workers; worker_idx++) {
+    free(workers[worker_idx].accum);
+    game_destroy(workers[worker_idx].world_game);
+    cpeg_ctx_destroy(&workers[worker_idx].ctx);
+  }
+  free(workers);
+  free(worlds);
+  free(cands);
+  move_list_destroy(root_moves);
+  return out->count;
 }
