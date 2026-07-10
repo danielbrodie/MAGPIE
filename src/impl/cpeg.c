@@ -68,31 +68,6 @@ static void cpeg_render_move(char *dest, size_t dest_size, const Board *board,
   string_builder_destroy(builder);
 }
 
-// Scans a fully-enumerated move list for the highest raw-score move, returning
-// it via *best_out. Ties are broken deterministically by
-// compare_moves_without_equity so the same reply is chosen every run.
-static int cpeg_best_score_move(const MoveList *move_list, Move *best_out) {
-  Equity best_score = EQUITY_MIN_VALUE;
-  const int count = move_list_get_count(move_list);
-  for (int move_idx = 0; move_idx < count; move_idx++) {
-    const Move *candidate = move_list_get_move(move_list, move_idx);
-    const Equity candidate_score = move_get_score(candidate);
-    bool take = false;
-    if (candidate_score > best_score) {
-      take = true;
-    } else if (candidate_score == best_score &&
-               compare_moves_without_equity(candidate, best_out,
-                                            /*allow_duplicates=*/true) == 1) {
-      take = true;
-    }
-    if (take) {
-      best_score = candidate_score;
-      move_copy(best_out, candidate);
-    }
-  }
-  return equity_to_int(best_score);
-}
-
 // Exact Crossplay endgame solve reusing caller-owned buffers (mover_moves,
 // reply_moves, undo). Identical semantics to cpeg_solve_endgame; factored out so
 // the pre-endgame recursion can hit thousands of empty-bag leaves without a
@@ -122,6 +97,7 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves(&mover_args);
+  move_list_sort_moves(mover_moves);
 
   int best_swing = 0;
   int best_mover_score = 0;
@@ -132,6 +108,15 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
     const Move *mover_move = move_list_get_move(mover_moves, mover_idx);
     const int mover_score = equity_to_int(move_get_score(mover_move));
 
+    // Replies have non-negative raw scores, so this move's swing cannot exceed
+    // its own score. The mover list is sorted by the same full move comparator
+    // used by the tie-break below, making the cutoff exact even when the score
+    // equals the incumbent swing: any equal-score move that could win the final
+    // tie-break was already searched.
+    if (have_best && mover_score <= best_swing) {
+      break;
+    }
+
     // Apply the mover's play. play_move_incremental switches the turn to the
     // opponent and (harmlessly, for us) may add the go-out bonus to the mover's
     // Game score; we never read that score -- the swing is computed purely from
@@ -141,7 +126,7 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
     const MoveGenArgs reply_args = {
         .game = game,
         .move_list = reply_moves,
-        .move_record_type = MOVE_RECORD_ALL,
+        .move_record_type = MOVE_RECORD_BEST,
         .move_sort_type = MOVE_SORT_SCORE,
         .override_kwg = NULL,
         .eq_margin_movegen = 0,
@@ -155,8 +140,8 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
         player_get_rack(game_get_player(game, opponent_index));
     const bool opponent_can_reply = !rack_is_empty(opponent_rack);
 
-    Move reply_move;
-    const int reply_score = cpeg_best_score_move(reply_moves, &reply_move);
+    const Move *reply_move = move_list_get_move(reply_moves, 0);
+    const int reply_score = equity_to_int(move_get_score(reply_move));
     const int swing = mover_score - reply_score;
 
     bool take = false;
@@ -177,7 +162,7 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
       best_swing = swing;
       best_mover_score = mover_score;
       move_copy(&result->best_mover, mover_move);
-      move_copy(&result->best_reply, &reply_move);
+      move_copy(&result->best_reply, reply_move);
       result->mover_score = mover_score;
       result->reply_score = reply_score;
       result->swing = swing;
