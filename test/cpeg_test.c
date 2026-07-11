@@ -335,6 +335,33 @@ static void test_cpeg_endgame(void) {
   config_destroy(config);
 }
 
+static void test_cpeg_interval_contains_scalar(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+
+  load_and_exec_config_or_die(config, CPEG_FINAL_TURN_CGP);
+  Game *game = config_get_game(config);
+  CpegResult leaf_result;
+  const int leaf_swing = cpeg_solve_endgame(game, &leaf_result);
+  const CpegInterval leaf_interval = cpeg_solve_endgame_interval(game);
+  assert(leaf_interval.lo == leaf_interval.hi);
+  assert(leaf_interval.lo == (double)leaf_swing);
+
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  game = config_get_game(config);
+  CpegIntervalRecursionStats stats;
+  const int pair_count = cpeg_measure_interval_recursion(
+      game, /*bag=*/1, /*allow_exchanges=*/true, &stats);
+  assert(pair_count > 0);
+  assert(pair_count == stats.candidate_count * stats.world_count);
+  assert(stats.all_contained);
+  assert(stats.maximum_width < 1e-8);
+  assert(stats.total_width / (double)stats.pair_count < 1e-9);
+
+  config_destroy(config);
+}
+
 static void test_cpeg_pre_endgame(void) {
   Config *config = config_create_or_die(
       "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
@@ -793,6 +820,7 @@ static void test_cpeg_coordinator(void) {
 
 void test_cpeg(void) {
   test_cpeg_endgame();
+  test_cpeg_interval_contains_scalar();
   test_cpeg_pre_endgame();
   test_cpeg_candidate_legality();
   test_cpeg_score_upper_bound();

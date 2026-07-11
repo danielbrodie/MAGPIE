@@ -206,6 +206,12 @@ int cpeg_solve_endgame(Game *game, CpegResult *result) {
   return swing;
 }
 
+CpegInterval cpeg_solve_endgame_interval(Game *game) {
+  CpegResult result;
+  const int swing = cpeg_solve_endgame(game, &result);
+  return (CpegInterval){.lo = (double)swing, .hi = (double)swing};
+}
+
 typedef struct CpegBoundSquare {
   uint64_t letter_multiplier;
   uint64_t word_multiplier;
@@ -823,6 +829,8 @@ static Game *cpeg_child_game(CpegPreCtx *ctx, int depth, const Game *src) {
 }
 
 static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless, int depth);
+static CpegInterval cpeg_value_interval(CpegPreCtx *ctx, Game *game,
+                                        int scoreless, int depth);
 
 // Value to the on-turn player of committing to placement `move`: its score
 // minus the draw-averaged value of the resulting opponent-to-move position
@@ -874,6 +882,71 @@ static double cpeg_eval_place(CpegPreCtx *ctx, Game *game, const Move *move,
   const double child_expectation =
       weight_total > 0 ? weighted_sum / (double)weight_total : 0.0;
   return (double)score - child_expectation;
+}
+
+static CpegInterval cpeg_eval_place_interval(CpegPreCtx *ctx, Game *game,
+                                             const Move *move, int depth) {
+  const int on_turn = game_get_player_on_turn_index(game);
+  const Bag *bag = game_get_bag(game);
+  const int bag_count = bag_get_letters(bag);
+  const int tiles_played = move_get_tiles_played(move);
+  const int k_drawn = tiles_played < bag_count ? tiles_played : bag_count;
+  const int score = equity_to_int(move_get_score(move));
+
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  bool overflow = false;
+  const int n_draws = cpeg_enum_submultisets(counts, ctx->ld_size, k_drawn,
+                                             draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow) {
+    ctx->capacity_exceeded = true;
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+
+  MoveUndo *move_undo = cpeg_get_move_undo(ctx, depth);
+  play_move_incremental(move, game, move_undo);
+  CpegBranchUndo branch_undo;
+  cpeg_save_branch(ctx, game, on_turn, depth, &branch_undo);
+
+  double weighted_lower_sum = 0.0;
+  double weighted_upper_sum = 0.0;
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    const CpegMultiset *draw = &draws[draw_idx];
+    Bag *child_bag = game_get_bag(game);
+    Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
+    for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+      bag_draw_letter(child_bag, draw->tiles[tile_idx], on_turn);
+      rack_add_letter(mover_rack, draw->tiles[tile_idx]);
+    }
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    const CpegInterval child =
+        cpeg_value_interval(ctx, game, 0, depth + 1);
+    const double weight = (double)draw->weight;
+    weighted_lower_sum = cpeg_down_add(
+        weighted_lower_sum, cpeg_down_mul(weight, child.lo));
+    weighted_upper_sum = cpeg_up_add(
+        weighted_upper_sum, cpeg_up_mul(weight, child.hi));
+    weight_total += draw->weight;
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+  }
+  unplay_move_incremental(game, move_undo);
+  if (weight_total == 0) {
+    return (CpegInterval){.lo = (double)score, .hi = (double)score};
+  }
+  const double denominator = (double)weight_total;
+  const CpegInterval child_expectation = {
+      .lo = cpeg_down_div(weighted_lower_sum, denominator),
+      .hi = cpeg_up_div(weighted_upper_sum, denominator),
+  };
+  return (CpegInterval){
+      .lo = cpeg_down_add((double)score, -child_expectation.hi),
+      .hi = cpeg_up_add((double)score, -child_expectation.lo),
+  };
 }
 
 // Value to the on-turn player of a scoreless move: a pass (exch_n == 0, no
@@ -940,6 +1013,81 @@ static double cpeg_eval_scoreless(CpegPreCtx *ctx, Game *game,
   const double child_expectation =
       weight_total > 0 ? weighted_sum / (double)weight_total : 0.0;
   return 0.0 - child_expectation;
+}
+
+static CpegInterval cpeg_eval_scoreless_interval(
+    CpegPreCtx *ctx, Game *game, const MachineLetter *exch_tiles, int exch_n,
+    int scoreless, int depth) {
+  if (scoreless + 1 >= CPEG_SCORELESS_CAP) {
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+  const int on_turn = game_get_player_on_turn_index(game);
+  CpegBranchUndo branch_undo;
+  cpeg_save_branch(ctx, game, on_turn, depth, &branch_undo);
+
+  if (exch_n == 0) {
+    game_start_next_player_turn(game);
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    const CpegInterval child =
+        cpeg_value_interval(ctx, game, scoreless + 1, depth + 1);
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+    return (CpegInterval){.lo = -child.hi, .hi = -child.lo};
+  }
+
+  const Bag *bag = game_get_bag(game);
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  bool overflow = false;
+  const int n_draws = cpeg_enum_submultisets(counts, ctx->ld_size, exch_n,
+                                             draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow) {
+    ctx->capacity_exceeded = true;
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+
+  double weighted_lower_sum = 0.0;
+  double weighted_upper_sum = 0.0;
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    const CpegMultiset *draw = &draws[draw_idx];
+    Bag *child_bag = game_get_bag(game);
+    Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
+    for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+      bag_draw_letter(child_bag, draw->tiles[tile_idx], on_turn);
+      rack_add_letter(mover_rack, draw->tiles[tile_idx]);
+    }
+    for (int tile_idx = 0; tile_idx < exch_n; tile_idx++) {
+      rack_take_letter(mover_rack, exch_tiles[tile_idx]);
+      bag_add_letter(child_bag, exch_tiles[tile_idx], on_turn);
+    }
+    game_start_next_player_turn(game);
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    const CpegInterval child = cpeg_value_interval(
+        ctx, game, scoreless + 1, depth + 1);
+    const double weight = (double)draw->weight;
+    weighted_lower_sum = cpeg_down_add(
+        weighted_lower_sum, cpeg_down_mul(weight, child.lo));
+    weighted_upper_sum = cpeg_up_add(
+        weighted_upper_sum, cpeg_up_mul(weight, child.hi));
+    weight_total += draw->weight;
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+  }
+  if (weight_total == 0) {
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+  const double denominator = (double)weight_total;
+  const CpegInterval child_expectation = {
+      .lo = cpeg_down_div(weighted_lower_sum, denominator),
+      .hi = cpeg_up_div(weighted_upper_sum, denominator),
+  };
+  return (CpegInterval){.lo = -child_expectation.hi,
+                        .hi = -child_expectation.lo};
 }
 
 // Enumerate the mover's distinct exchange multisets (1..min(rack, bag) tiles)
@@ -1051,6 +1199,97 @@ static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless,
   }
 
   return have_best ? best : 0.0;
+}
+
+static CpegInterval cpeg_value_interval(CpegPreCtx *ctx, Game *game,
+                                        int scoreless, int depth) {
+  if (ctx->capacity_exceeded) {
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+  const Bag *bag = game_get_bag(game);
+  const int bag_count = bag_get_letters(bag);
+  if (bag_count == 0) {
+    CpegResult leaf;
+    const int swing = cpeg_endgame_core(game, ctx->eg_mover, ctx->eg_reply,
+                                        ctx->eg_undo, &leaf);
+    return (CpegInterval){.lo = (double)swing, .hi = (double)swing};
+  }
+  if (depth >= CPEG_MAX_DEPTH - 1) {
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+
+  MoveList *move_list = cpeg_get_movelist(ctx, depth);
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = move_list,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&args);
+
+  CpegInterval best = {.lo = 0.0, .hi = 0.0};
+  bool have_best = false;
+  bool any_placement = false;
+  const int count = move_list_get_count(move_list);
+  for (int move_idx = 0; move_idx < count; move_idx++) {
+    const Move *move = move_list_get_move(move_list, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    any_placement = true;
+    const CpegInterval value =
+        cpeg_eval_place_interval(ctx, game, move, depth);
+    if (!have_best || value.lo > best.lo) {
+      best.lo = value.lo;
+    }
+    if (!have_best || value.hi > best.hi) {
+      best.hi = value.hi;
+    }
+    have_best = true;
+  }
+
+  if (!any_placement) {
+    const CpegInterval value = cpeg_eval_scoreless_interval(
+        ctx, game, NULL, 0, scoreless, depth);
+    if (!have_best || value.lo > best.lo) {
+      best.lo = value.lo;
+    }
+    if (!have_best || value.hi > best.hi) {
+      best.hi = value.hi;
+    }
+    have_best = true;
+  }
+
+  if (ctx->allow_exchanges) {
+    const Rack *mover_rack = player_get_rack(
+        game_get_player(game, game_get_player_on_turn_index(game)));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    bool overflow = false;
+    const int n_exch = cpeg_enum_exchanges(ctx->ld_size, mover_rack, bag_count,
+                                           exchanges, CPEG_ENUM_CAP, &overflow);
+    if (overflow) {
+      ctx->capacity_exceeded = true;
+      return (CpegInterval){.lo = 0.0, .hi = 0.0};
+    }
+    for (int exch_idx = 0; exch_idx < n_exch; exch_idx++) {
+      const CpegInterval value = cpeg_eval_scoreless_interval(
+          ctx, game, exchanges[exch_idx].tiles, exchanges[exch_idx].n,
+          scoreless, depth);
+      if (!have_best || value.lo > best.lo) {
+        best.lo = value.lo;
+      }
+      if (!have_best || value.hi > best.hi) {
+        best.hi = value.hi;
+      }
+      have_best = true;
+    }
+  }
+
+  return have_best ? best : (CpegInterval){.lo = 0.0, .hi = 0.0};
 }
 
 // Tiles not visible to the mover: full distribution minus mover's rack minus
@@ -1185,6 +1424,63 @@ static double cpeg_eval_post_place(CpegPreCtx *ctx, const Game *post_place_game,
   return (double)score - child_expectation;
 }
 
+static CpegInterval cpeg_eval_post_place_interval(
+    CpegPreCtx *ctx, const Game *post_place_game, int tiles_played, int score,
+    int depth) {
+  const Bag *bag = game_get_bag(post_place_game);
+  const int bag_count = bag_get_letters(bag);
+  const int k_drawn = tiles_played < bag_count ? tiles_played : bag_count;
+
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  bool overflow = false;
+  const int n_draws = cpeg_enum_submultisets(counts, ctx->ld_size, k_drawn,
+                                             draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow) {
+    ctx->capacity_exceeded = true;
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+
+  double weighted_lower_sum = 0.0;
+  double weighted_upper_sum = 0.0;
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    const CpegMultiset *draw = &draws[draw_idx];
+    Game *child = cpeg_child_game(ctx, depth, post_place_game);
+    Bag *child_bag = game_get_bag(child);
+    Rack *mover_rack = player_get_rack(game_get_player(child, ctx->mover_idx));
+    for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+      bag_draw_letter(child_bag, draw->tiles[tile_idx], ctx->mover_idx);
+      rack_add_letter(mover_rack, draw->tiles[tile_idx]);
+    }
+    game_set_consecutive_scoreless_turns(child, 0);
+    game_set_game_end_reason(child, GAME_END_REASON_NONE);
+    const CpegInterval child_value =
+        cpeg_value_interval(ctx, child, 0, depth + 1);
+    const double weight = (double)draw->weight;
+    weighted_lower_sum = cpeg_down_add(
+        weighted_lower_sum, cpeg_down_mul(weight, child_value.lo));
+    weighted_upper_sum = cpeg_up_add(
+        weighted_upper_sum, cpeg_up_mul(weight, child_value.hi));
+    weight_total += draw->weight;
+  }
+  if (weight_total == 0) {
+    return (CpegInterval){.lo = (double)score, .hi = (double)score};
+  }
+  const double denominator = (double)weight_total;
+  const CpegInterval child_expectation = {
+      .lo = cpeg_down_div(weighted_lower_sum, denominator),
+      .hi = cpeg_up_div(weighted_upper_sum, denominator),
+  };
+  return (CpegInterval){
+      .lo = cpeg_down_add((double)score, -child_expectation.hi),
+      .hi = cpeg_up_add((double)score, -child_expectation.lo),
+  };
+}
+
 // In-world value to the mover of committing to one root candidate (its first
 // move). The world_game is on the mover's turn with both racks and the bag set.
 static double cpeg_eval_root_scoreless(CpegPreCtx *ctx, Game *world_game,
@@ -1195,6 +1491,17 @@ static double cpeg_eval_root_scoreless(CpegPreCtx *ctx, Game *world_game,
   }
   return cpeg_eval_scoreless(ctx, world_game, cand->exch_tiles, cand->exch_n,
                              /*scoreless=*/0, /*depth=*/0);
+}
+
+static CpegInterval cpeg_eval_root_scoreless_interval(
+    CpegPreCtx *ctx, Game *world_game, const CpegRootCand *cand) {
+  if (cand->kind == 1) {
+    return cpeg_eval_scoreless_interval(ctx, world_game, NULL, 0,
+                                        /*scoreless=*/0, /*depth=*/0);
+  }
+  return cpeg_eval_scoreless_interval(
+      ctx, world_game, cand->exch_tiles, cand->exch_n, /*scoreless=*/0,
+      /*depth=*/0);
 }
 
 // Per-pool-worker scratch. Pool jobs are independent (candidate, world) pairs;
@@ -1520,4 +1827,181 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
   free(cands);
   move_list_destroy(root_moves);
   return search_capacity_exceeded ? -1 : out->count;
+}
+
+int cpeg_measure_interval_recursion(Game *game, int bag, bool allow_exchanges,
+                                    CpegIntervalRecursionStats *stats) {
+  memset(stats, 0, sizeof(*stats));
+  stats->all_contained = true;
+  stats->failing_candidate_index = -1;
+  stats->failing_world_index = -1;
+
+  const LetterDistribution *ld = game_get_ld(game);
+  const int ld_size = ld_get_size(ld);
+  Board *board = game_get_board(game);
+  game_gen_all_cross_sets(game);
+  board_set_cross_sets_valid(board, true);
+
+  const int mover_idx = game_get_player_on_turn_index(game);
+  const int opp_idx = 1 - mover_idx;
+  int unseen[MAX_ALPHABET_SIZE];
+  const int total_unseen = cpeg_compute_unseen(game, mover_idx, unseen);
+  const int opp_size = total_unseen - bag;
+  if (bag < 1 || bag > PEG_MAX_BAG || opp_size < 0 || opp_size > RACK_SIZE) {
+    return -1;
+  }
+
+  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
+  const MoveGenArgs root_args = {
+      .game = game,
+      .move_list = root_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&root_args);
+
+  const int root_count = move_list_get_count(root_moves);
+  if (root_count > CPEG_MOVE_LIST_CAP) {
+    move_list_destroy(root_moves);
+    return -1;
+  }
+  CpegRootCand *cands =
+      malloc_or_die((size_t)(root_count + 1 + CPEG_ENUM_CAP) * sizeof(*cands));
+  int candidate_count = 0;
+  bool any_placement = false;
+  for (int move_idx = 0; move_idx < root_count; move_idx++) {
+    const Move *move = move_list_get_move(root_moves, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    any_placement = true;
+    CpegRootCand *cand = &cands[candidate_count++];
+    cand->kind = 0;
+    move_copy(&cand->move, move);
+    cand->exch_n = 0;
+    cand->score = equity_to_int(move_get_score(move));
+  }
+  if (!any_placement) {
+    CpegRootCand *cand = &cands[candidate_count++];
+    cand->kind = 1;
+    cand->exch_n = 0;
+    cand->score = 0;
+  }
+  if (allow_exchanges) {
+    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    bool overflow = false;
+    const int exchange_count = cpeg_enum_exchanges(
+        ld_size, mover_rack, bag, exchanges, CPEG_ENUM_CAP, &overflow);
+    if (overflow) {
+      free(cands);
+      move_list_destroy(root_moves);
+      return -1;
+    }
+    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
+      CpegRootCand *cand = &cands[candidate_count++];
+      cand->kind = 2;
+      cand->exch_n = exchanges[exchange_idx].n;
+      for (int tile_idx = 0; tile_idx < cand->exch_n; tile_idx++) {
+        cand->exch_tiles[tile_idx] = exchanges[exchange_idx].tiles[tile_idx];
+      }
+      cand->score = 0;
+    }
+  }
+  if (candidate_count > CPEG_MAX_PRE_CANDS) {
+    free(cands);
+    move_list_destroy(root_moves);
+    return -1;
+  }
+
+  CpegMultiset *worlds = malloc_or_die(CPEG_WORLD_CAP * sizeof(*worlds));
+  bool world_overflow = false;
+  const int world_count = cpeg_enum_submultisets(
+      unseen, ld_size, bag, worlds, CPEG_WORLD_CAP, &world_overflow);
+  if (world_overflow) {
+    free(worlds);
+    free(cands);
+    move_list_destroy(root_moves);
+    return -1;
+  }
+
+  Game **templates = calloc_or_die((size_t)candidate_count, sizeof(*templates));
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (cands[candidate_idx].kind == 0) {
+      templates[candidate_idx] =
+          cpeg_build_root_template(game, &cands[candidate_idx].move);
+    }
+  }
+
+  CpegPreCtx ctx;
+  cpeg_ctx_init(&ctx, ld, ld_size, mover_idx, allow_exchanges);
+  Game *world_game = game_duplicate(game);
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      const CpegRootCand *cand = &cands[candidate_idx];
+      const Game *source_game = templates[candidate_idx] != NULL
+                                    ? templates[candidate_idx]
+                                    : game;
+      cpeg_set_world(world_game, source_game, &worlds[world_idx], unseen,
+                     ld_size, opp_idx);
+      double scalar;
+      if (cand->kind == 0) {
+        scalar = cpeg_eval_post_place(&ctx, world_game,
+                                      move_get_tiles_played(&cand->move),
+                                      cand->score, /*depth=*/0);
+      } else {
+        scalar = cpeg_eval_root_scoreless(&ctx, world_game, cand);
+      }
+
+      cpeg_set_world(world_game, source_game, &worlds[world_idx], unseen,
+                     ld_size, opp_idx);
+      CpegInterval interval;
+      if (cand->kind == 0) {
+        interval = cpeg_eval_post_place_interval(
+            &ctx, world_game, move_get_tiles_played(&cand->move), cand->score,
+            /*depth=*/0);
+      } else {
+        interval =
+            cpeg_eval_root_scoreless_interval(&ctx, world_game, cand);
+      }
+
+      const double width = interval.hi - interval.lo;
+      stats->pair_count++;
+      stats->total_width += width;
+      if (width > stats->maximum_width) {
+        stats->maximum_width = width;
+      }
+      if (stats->all_contained &&
+          (scalar < interval.lo || scalar > interval.hi)) {
+        stats->all_contained = false;
+        stats->failing_candidate_index = candidate_idx;
+        stats->failing_world_index = world_idx;
+        stats->failing_scalar = scalar;
+        stats->failing_interval = interval;
+      }
+    }
+  }
+  stats->candidate_count = candidate_count;
+  stats->world_count = world_count;
+
+  const bool capacity_exceeded = ctx.capacity_exceeded;
+  game_destroy(world_game);
+  cpeg_ctx_destroy(&ctx);
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (templates[candidate_idx] != NULL) {
+      game_destroy(templates[candidate_idx]);
+    }
+  }
+  free(templates);
+  free(worlds);
+  free(cands);
+  move_list_destroy(root_moves);
+  return capacity_exceeded ? -1 : stats->pair_count;
 }

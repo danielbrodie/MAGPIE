@@ -70,6 +70,19 @@ typedef struct CpegInterval {
   double hi;
 } CpegInterval;
 
+typedef struct CpegIntervalRecursionStats {
+  int candidate_count;
+  int world_count;
+  int pair_count;
+  double total_width;
+  double maximum_width;
+  bool all_contained;
+  int failing_candidate_index;
+  int failing_world_index;
+  double failing_scalar;
+  CpegInterval failing_interval;
+} CpegIntervalRecursionStats;
+
 typedef enum CpegCandKind {
   CPEG_CAND_PLACEMENT,
   CPEG_CAND_EXCHANGE,
@@ -185,5 +198,14 @@ typedef struct CpegPreResult {
 // invalid.
 int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
                            int num_threads, CpegPreResult *out);
+
+// Evaluate the scalar and certified interval recursions for every root
+// (candidate, world) pair without changing the normal solver path. Returns -1
+// on invalid input or an enumeration-capacity failure.
+int cpeg_measure_interval_recursion(Game *game, int bag, bool allow_exchanges,
+                                    CpegIntervalRecursionStats *stats);
+
+// The certified recursion's empty-bag leaf: the integer endgame swing is exact.
+CpegInterval cpeg_solve_endgame_interval(Game *game);
 
 #endif
