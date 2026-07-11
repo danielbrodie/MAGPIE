@@ -18,12 +18,12 @@ enum { CPEG_MOVE_STR_LEN = 64 };
 // rack is emptied) cannot contaminate the Crossplay value -- Crossplay counts
 // neither a go-out bonus nor a leftover-rack deduction.
 typedef struct CpegResult {
-  Move best_mover;  // The mover's swing-maximizing move.
-  Move best_reply;  // Opponent's best raw-score reply to best_mover.
-  int mover_score;  // Points scored by best_mover.
-  int reply_score;  // Points scored by best_reply (0 when has_reply is false).
-  int swing;        // mover_score - reply_score (the two-ply value to the mover).
-  bool has_reply;   // False when the opponent has no tiles left to reply with.
+  Move best_mover; // The mover's swing-maximizing move.
+  Move best_reply; // Opponent's best raw-score reply to best_mover.
+  int mover_score; // Points scored by best_mover.
+  int reply_score; // Points scored by best_reply (0 when has_reply is false).
+  int swing;      // mover_score - reply_score (the two-ply value to the mover).
+  bool has_reply; // False when the opponent has no tiles left to reply with.
   // Rendered "<coord> <word>" (or "pass") for each move, produced at the exact
   // board state that makes played-through tiles resolve correctly.
   char mover_str[CPEG_MOVE_STR_LEN];
@@ -42,6 +42,20 @@ typedef struct CpegResult {
 // Fills *result and returns the swing (in points).
 int cpeg_solve_endgame(Game *game, CpegResult *result);
 
+// Maximum absolute raw point value of any tile in the distribution.
+int cpeg_max_future_tile_score(const LetterDistribution *ld);
+
+// A sound upper bound, in raw points, on the score of any single legal move
+// on board. The bound depends only on board geometry, remaining premiums, the
+// loaded letter distribution, and the game's bingo bonus. It is therefore
+// also valid when called on an immutable post-placement template game.
+int cpeg_score_upper_bound(const Board *board, const Game *game);
+
+// Returns true when enumerating the distinct k-submultisets would require more
+// than cap entries. Exposed so capacity assumptions can be tested directly.
+bool cpeg_submultiset_capacity_overflows(const int *counts, int ld_size, int k,
+                                         int cap);
+
 // ---------------------------------------------------------------------------
 // Pre-endgame (bag 1-4): exact expectiminimax under Crossplay rules.
 // ---------------------------------------------------------------------------
@@ -57,8 +71,8 @@ enum { CPEG_MAX_PRE_CANDS = 1024 };
 typedef struct CpegPreCand {
   // Rendered first move: "<coord> <word>", or "pass", or "exch:<tiles>".
   char label[CPEG_MOVE_STR_LEN];
-  int score;               // Points scored by this first move (0 for pass/exch).
-  double expected_spread;  // Your points minus theirs over the remaining game.
+  int score;              // Points scored by this first move (0 for pass/exch).
+  double expected_spread; // Your points minus theirs over the remaining game.
 } CpegPreCand;
 
 // Result of an exact Crossplay pre-endgame solve: candidates ranked by expected
@@ -84,7 +98,9 @@ typedef struct CpegPreResult {
 // placement.
 //
 // num_threads (>= 1) parallelizes the per-world evaluation. Fills *out with the
-// ranked candidates and returns out->count.
+// ranked candidates and returns out->count. Returns -1, with out empty, if an
+// enumeration/output capacity is exceeded or the implied opponent rack is
+// invalid.
 int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
                            int num_threads, CpegPreResult *out);
 

@@ -456,9 +456,103 @@ static void test_cpeg_candidate_legality(void) {
   config_destroy(config);
 }
 
+static void cpeg_assert_score_bound_sound(Game *game) {
+  enum { SCORE_BOUND_MOVE_CAP = 16384 };
+  MoveList *moves = move_list_create(SCORE_BOUND_MOVE_CAP);
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&args);
+
+  const int score_bound = cpeg_score_upper_bound(game_get_board(game), game);
+  const int move_count = move_list_get_count(moves);
+  assert(move_count < SCORE_BOUND_MOVE_CAP);
+  for (int move_idx = 0; move_idx < move_count; move_idx++) {
+    const Move *move = move_list_get_move(moves, move_idx);
+    const int score = equity_to_int(move_get_score(move));
+    assert(score <= score_bound);
+  }
+  move_list_destroy(moves);
+}
+
+static void test_cpeg_score_upper_bound(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  const char *const positions[] = {
+      CPEG_FINAL_TURN_CGP,
+      CPEG_PRE_9570_CGP,
+      CPEG_PRE_9653_CGP,
+  };
+  for (size_t position_idx = 0;
+       position_idx < sizeof(positions) / sizeof(positions[0]);
+       position_idx++) {
+    load_and_exec_config_or_die(config, positions[position_idx]);
+    cpeg_assert_score_bound_sound(config_get_game(config));
+  }
+
+  // Exercise the same API on an immutable-style post-placement template: the
+  // newly occupied squares can no longer consume their premiums.
+  load_and_exec_config_or_die(config, CPEG_FINAL_TURN_CGP);
+  Game *root_game = config_get_game(config);
+  MoveList *root_moves = move_list_create(CPEG_UNDO_MOVE_CAP);
+  const MoveGenArgs args = {
+      .game = root_game,
+      .move_list = root_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&args);
+  Move template_move;
+  bool found_placement = false;
+  const int root_move_count = move_list_get_count(root_moves);
+  for (int move_idx = 0; move_idx < root_move_count; move_idx++) {
+    const Move *move = move_list_get_move(root_moves, move_idx);
+    if (move_get_type(move) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      move_copy(&template_move, move);
+      found_placement = true;
+      break;
+    }
+  }
+  assert(found_placement);
+  Game *template_game = game_duplicate(root_game);
+  play_move_without_drawing_tiles(&template_move, template_game);
+  game_gen_all_cross_sets(template_game);
+  cpeg_assert_score_bound_sound(template_game);
+  game_destroy(template_game);
+  move_list_destroy(root_moves);
+
+  config_destroy(config);
+}
+
+static void test_cpeg_enumeration_capacity_guard(void) {
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  counts[1] = 2;
+  counts[2] = 2;
+
+  // The distinct 2-submultisets are {1,1}, {1,2}, and {2,2}. Exactly three
+  // entries fit without overflow; a deliberately tiny capacity of two must
+  // report that the third entry would otherwise have been silently dropped.
+  assert(cpeg_submultiset_capacity_overflows(counts, 3, 2, 2));
+  assert(!cpeg_submultiset_capacity_overflows(counts, 3, 2, 3));
+}
+
 void test_cpeg(void) {
   test_cpeg_endgame();
   test_cpeg_pre_endgame();
   test_cpeg_candidate_legality();
+  test_cpeg_score_upper_bound();
+  test_cpeg_enumeration_capacity_guard();
   test_cpeg_incremental_round_trip();
 }
