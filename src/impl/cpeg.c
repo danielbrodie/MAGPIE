@@ -54,6 +54,9 @@ enum {
   // bag-submultisets of the <=11 unseen tiles. C(11,4) = 330 is the worst case;
   // 1024 leaves headroom.
   CPEG_WORLD_CAP = 1024,
+  // Default scheduler barrier size. It is deliberately independent of the
+  // thread count so changing only parallelism cannot change a committed batch.
+  CPEG_CERT_DEFAULT_BATCH_SIZE = 16,
 };
 
 // Renders a move as "<coord> <word>" (or "pass") into dest, using board so
@@ -1521,6 +1524,7 @@ typedef struct CpegRootJob {
   int opp_idx;
   const CpegRootCand *cand;
   double value;
+  CpegInterval interval;
 } CpegRootJob;
 
 static void cpeg_set_world(Game *world_game, const Game *source_game,
@@ -1557,6 +1561,21 @@ static void cpeg_root_job_run(void *arg, int worker_idx) {
   } else {
     job->value =
         cpeg_eval_root_scoreless(&worker->ctx, worker->world_game, job->cand);
+  }
+}
+
+static void cpeg_root_interval_job_run(void *arg, int worker_idx) {
+  CpegRootJob *job = (CpegRootJob *)arg;
+  CpegWorker *worker = &job->workers[worker_idx];
+  cpeg_set_world(worker->world_game, job->source_game, job->world, job->unseen,
+                 job->ld_size, job->opp_idx);
+  if (job->cand->kind == 0) {
+    job->interval = cpeg_eval_post_place_interval(
+        &worker->ctx, worker->world_game,
+        move_get_tiles_played(&job->cand->move), job->cand->score, /*depth=*/0);
+  } else {
+    job->interval = cpeg_eval_root_scoreless_interval(
+        &worker->ctx, worker->world_game, job->cand);
   }
 }
 
@@ -1827,6 +1846,572 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
   free(cands);
   move_list_destroy(root_moves);
   return search_capacity_exceeded ? -1 : out->count;
+}
+
+typedef struct CpegScheduledWorld {
+  CpegMultiset multiset;
+  int generation_index;
+} CpegScheduledWorld;
+
+typedef struct CpegScheduledPair {
+  int candidate_idx;
+  int world_idx;
+} CpegScheduledPair;
+
+static void cpeg_render_root_candidate(char dest[CPEG_MOVE_STR_LEN],
+                                       const CpegRootCand *candidate,
+                                       const Board *board,
+                                       const LetterDistribution *ld) {
+  if (candidate->kind == 0) {
+    cpeg_render_move(dest, CPEG_MOVE_STR_LEN, board, &candidate->move, ld);
+    return;
+  }
+  if (candidate->kind == 1) {
+    memcpy(dest, "pass", sizeof("pass"));
+    return;
+  }
+
+  StringBuilder *builder = string_builder_create();
+  string_builder_add_string(builder, "exch:");
+  for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
+    string_builder_add_string(builder,
+                              ld->ld_ml_to_hl[candidate->exch_tiles[tile_idx]]);
+  }
+  const char *rendered = string_builder_peek(builder);
+  const size_t len = string_length(rendered);
+  const size_t copy_len =
+      len < CPEG_MOVE_STR_LEN - 1 ? len : CPEG_MOVE_STR_LEN - 1;
+  memcpy(dest, rendered, copy_len);
+  dest[copy_len] = '\0';
+  string_builder_destroy(builder);
+}
+
+static CpegCandKind cpeg_root_candidate_kind(const CpegRootCand *candidate) {
+  if (candidate->kind == 0) {
+    return CPEG_CAND_PLACEMENT;
+  }
+  if (candidate->kind == 2) {
+    return CPEG_CAND_EXCHANGE;
+  }
+  return CPEG_CAND_PASS;
+}
+
+static bool cpeg_world_precedes(const CpegScheduledWorld *lhs,
+                                const CpegScheduledWorld *rhs) {
+  if (lhs->multiset.weight != rhs->multiset.weight) {
+    return lhs->multiset.weight > rhs->multiset.weight;
+  }
+  for (int tile_idx = 0; tile_idx < lhs->multiset.n; tile_idx++) {
+    if (lhs->multiset.tiles[tile_idx] != rhs->multiset.tiles[tile_idx]) {
+      return lhs->multiset.tiles[tile_idx] < rhs->multiset.tiles[tile_idx];
+    }
+  }
+  return lhs->generation_index < rhs->generation_index;
+}
+
+static void cpeg_sort_scheduled_worlds(CpegScheduledWorld *worlds,
+                                       int world_count) {
+  for (int world_idx = 1; world_idx < world_count; world_idx++) {
+    const CpegScheduledWorld current = worlds[world_idx];
+    int insertion_idx = world_idx;
+    while (insertion_idx > 0 &&
+           cpeg_world_precedes(&current, &worlds[insertion_idx - 1])) {
+      worlds[insertion_idx] = worlds[insertion_idx - 1];
+      insertion_idx--;
+    }
+    worlds[insertion_idx] = current;
+  }
+}
+
+static void cpeg_sort_candidate_order(const CpegCandState *states, int *order,
+                                      int candidate_count) {
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    order[candidate_idx] = candidate_idx;
+  }
+  for (int order_idx = 1; order_idx < candidate_count; order_idx++) {
+    const int current = order[order_idx];
+    int insertion_idx = order_idx;
+    while (insertion_idx > 0 &&
+           cpeg_rank_precedes(&states[current],
+                              &states[order[insertion_idx - 1]])) {
+      order[insertion_idx] = order[insertion_idx - 1];
+      insertion_idx--;
+    }
+    order[insertion_idx] = current;
+  }
+}
+
+static bool cpeg_better_upper(const CpegCandState *states, int candidate_idx,
+                              int best_idx) {
+  return best_idx < 0 ||
+         states[candidate_idx].expectation.hi >
+             states[best_idx].expectation.hi ||
+         (states[candidate_idx].expectation.hi ==
+              states[best_idx].expectation.hi &&
+          cpeg_rank_precedes(&states[candidate_idx], &states[best_idx]));
+}
+
+static int cpeg_sort_active_by_upper(const CpegCandState *states,
+                                     const int *stable_order, int *order,
+                                     int candidate_count) {
+  int count = 0;
+  for (int order_idx = 0; order_idx < candidate_count; order_idx++) {
+    const int candidate_idx = stable_order[order_idx];
+    if (!states[candidate_idx].eliminated) {
+      order[count++] = candidate_idx;
+    }
+  }
+  for (int order_idx = 1; order_idx < count; order_idx++) {
+    const int current = order[order_idx];
+    int insertion_idx = order_idx;
+    while (insertion_idx > 0 &&
+           cpeg_better_upper(states, current, order[insertion_idx - 1])) {
+      order[insertion_idx] = order[insertion_idx - 1];
+      insertion_idx--;
+    }
+    order[insertion_idx] = current;
+  }
+  return count;
+}
+
+static bool cpeg_pair_is_selected(const CpegScheduledPair *pairs,
+                                  int pair_count, int candidate_idx,
+                                  int world_idx) {
+  for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+    if (pairs[pair_idx].candidate_idx == candidate_idx &&
+        pairs[pair_idx].world_idx == world_idx) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static int cpeg_next_unresolved_world(const CpegWorldEval *evaluations,
+                                      int world_count,
+                                      const CpegScheduledPair *pairs,
+                                      int pair_count, int candidate_idx) {
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    const CpegWorldEval *evaluation =
+        &evaluations[candidate_idx * world_count + world_idx];
+    if (!evaluation->resolved &&
+        !cpeg_pair_is_selected(pairs, pair_count, candidate_idx, world_idx)) {
+      return world_idx;
+    }
+  }
+  return -1;
+}
+
+static bool cpeg_run_certified_batch(
+    PegPool *pool, CpegWorker *workers, int helper_worker_idx,
+    CpegRootJob *jobs, void **job_ptrs, const CpegScheduledPair *pairs,
+    int pair_count, const CpegRootCand *candidates, Game *const *templates,
+    const Game *game, const CpegScheduledWorld *worlds, const int *unseen,
+    int ld_size, int opp_idx, int scratch_count, CpegWorldEval *evaluations,
+    int world_count) {
+  for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+    const int candidate_idx = pairs[pair_idx].candidate_idx;
+    const int world_idx = pairs[pair_idx].world_idx;
+    CpegRootJob *job = &jobs[pair_idx];
+    job->workers = workers;
+    job->source_game =
+        templates[candidate_idx] != NULL ? templates[candidate_idx] : game;
+    job->world = &worlds[world_idx].multiset;
+    job->unseen = unseen;
+    job->ld_size = ld_size;
+    job->opp_idx = opp_idx;
+    job->cand = &candidates[candidate_idx];
+    job->interval = (CpegInterval){.lo = 0.0, .hi = 0.0};
+    job_ptrs[pair_idx] = job;
+  }
+
+  peg_pool_submit_and_wait(pool, cpeg_root_interval_job_run, job_ptrs,
+                           pair_count, helper_worker_idx);
+  for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+    if (workers[worker_idx].ctx.capacity_exceeded) {
+      return false;
+    }
+  }
+  // Results become visible only after the barrier, in scheduler order.
+  for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+    const int candidate_idx = pairs[pair_idx].candidate_idx;
+    const int world_idx = pairs[pair_idx].world_idx;
+    evaluations[candidate_idx * world_count + world_idx] =
+        (CpegWorldEval){.value = jobs[pair_idx].interval, .resolved = true};
+  }
+  return true;
+}
+
+static int cpeg_fill_lucb_priority(const CpegCandState *states,
+                                   const int *stable_order, int *priority,
+                                   int *upper_order, int candidate_count) {
+  int leader_idx = -1;
+  int incumbent_idx = -1;
+  for (int order_idx = 0; order_idx < candidate_count; order_idx++) {
+    const int candidate_idx = stable_order[order_idx];
+    if (states[candidate_idx].eliminated) {
+      continue;
+    }
+    if (cpeg_better_midpoint(states, candidate_idx, leader_idx)) {
+      leader_idx = candidate_idx;
+    }
+    if (cpeg_better_lower(states, candidate_idx, incumbent_idx)) {
+      incumbent_idx = candidate_idx;
+    }
+  }
+
+  int challenger_idx = -1;
+  for (int order_idx = 0; order_idx < candidate_count; order_idx++) {
+    const int candidate_idx = stable_order[order_idx];
+    if (!states[candidate_idx].eliminated && candidate_idx != leader_idx &&
+        cpeg_better_upper(states, candidate_idx, challenger_idx)) {
+      challenger_idx = candidate_idx;
+    }
+  }
+
+  int priority_count = 0;
+  priority[priority_count++] = leader_idx;
+  if (incumbent_idx != leader_idx) {
+    priority[priority_count++] = incumbent_idx;
+  }
+  if (challenger_idx >= 0 && challenger_idx != incumbent_idx) {
+    priority[priority_count++] = challenger_idx;
+  }
+
+  const int upper_count = cpeg_sort_active_by_upper(
+      states, stable_order, upper_order, candidate_count);
+  for (int upper_idx = 0; upper_idx < upper_count; upper_idx++) {
+    const int candidate_idx = upper_order[upper_idx];
+    bool already_present = false;
+    for (int priority_idx = 0; priority_idx < priority_count; priority_idx++) {
+      if (priority[priority_idx] == candidate_idx) {
+        already_present = true;
+        break;
+      }
+    }
+    if (!already_present) {
+      priority[priority_count++] = candidate_idx;
+    }
+  }
+  return priority_count;
+}
+
+int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
+                                     CpegCertifiedResult *out) {
+  if (out == NULL) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  out->best_index = -1;
+  if (game == NULL || args == NULL || args->bag < 1 ||
+      args->bag > PEG_MAX_BAG) {
+    return -1;
+  }
+
+  const LetterDistribution *ld = game_get_ld(game);
+  const int ld_size = ld_get_size(ld);
+  Board *board = game_get_board(game);
+  game_gen_all_cross_sets(game);
+  board_set_cross_sets_valid(board, true);
+  const int mover_idx = game_get_player_on_turn_index(game);
+  const int opp_idx = 1 - mover_idx;
+  int unseen[MAX_ALPHABET_SIZE];
+  const int total_unseen = cpeg_compute_unseen(game, mover_idx, unseen);
+  const int opp_size = total_unseen - args->bag;
+  if (opp_size < 0 || opp_size > RACK_SIZE) {
+    return -1;
+  }
+
+  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
+  const MoveGenArgs root_args = {
+      .game = game,
+      .move_list = root_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&root_args);
+  const int root_count = move_list_get_count(root_moves);
+  if (root_count > CPEG_MOVE_LIST_CAP) {
+    move_list_destroy(root_moves);
+    return -1;
+  }
+
+  CpegRootCand *candidates = calloc_or_die(
+      (size_t)(root_count + 1 + CPEG_ENUM_CAP), sizeof(*candidates));
+  int candidate_count = 0;
+  bool any_placement = false;
+  for (int move_idx = 0; move_idx < root_count; move_idx++) {
+    const Move *move = move_list_get_move(root_moves, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    any_placement = true;
+    CpegRootCand *candidate = &candidates[candidate_count++];
+    candidate->kind = 0;
+    move_copy(&candidate->move, move);
+    candidate->score = equity_to_int(move_get_score(move));
+  }
+  if (!any_placement) {
+    candidates[candidate_count++].kind = 1;
+  }
+  if (args->allow_exchanges) {
+    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    bool exchange_overflow = false;
+    const int exchange_count =
+        cpeg_enum_exchanges(ld_size, mover_rack, args->bag, exchanges,
+                            CPEG_ENUM_CAP, &exchange_overflow);
+    if (exchange_overflow) {
+      free(candidates);
+      move_list_destroy(root_moves);
+      return -1;
+    }
+    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
+      CpegRootCand *candidate = &candidates[candidate_count++];
+      candidate->kind = 2;
+      candidate->exch_n = exchanges[exchange_idx].n;
+      for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
+        candidate->exch_tiles[tile_idx] =
+            exchanges[exchange_idx].tiles[tile_idx];
+      }
+    }
+  }
+  if (candidate_count < 1 || candidate_count > CPEG_MAX_PRE_CANDS) {
+    free(candidates);
+    move_list_destroy(root_moves);
+    return -1;
+  }
+
+  CpegMultiset *enumerated_worlds =
+      malloc_or_die(CPEG_WORLD_CAP * sizeof(*enumerated_worlds));
+  bool world_overflow = false;
+  const int world_count =
+      cpeg_enum_submultisets(unseen, ld_size, args->bag, enumerated_worlds,
+                             CPEG_WORLD_CAP, &world_overflow);
+  if (world_overflow || world_count < 1) {
+    free(enumerated_worlds);
+    free(candidates);
+    move_list_destroy(root_moves);
+    return -1;
+  }
+  CpegScheduledWorld *worlds =
+      malloc_or_die((size_t)world_count * sizeof(*worlds));
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    worlds[world_idx].multiset = enumerated_worlds[world_idx];
+    worlds[world_idx].generation_index = world_idx;
+  }
+  free(enumerated_worlds);
+  cpeg_sort_scheduled_worlds(worlds, world_count);
+
+  Game **templates = calloc_or_die((size_t)candidate_count, sizeof(*templates));
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidates[candidate_idx].kind == 0) {
+      templates[candidate_idx] =
+          cpeg_build_root_template(game, &candidates[candidate_idx].move);
+    }
+  }
+
+  CpegCandState *states =
+      malloc_or_die((size_t)candidate_count * sizeof(*states));
+  int *stable_order =
+      malloc_or_die((size_t)candidate_count * sizeof(*stable_order));
+  const int root_score_bound = cpeg_score_upper_bound(board, game);
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    CpegStableRank rank = {
+        .immediate_score = candidates[candidate_idx].score,
+        .kind = cpeg_root_candidate_kind(&candidates[candidate_idx]),
+        .generation_index = candidate_idx,
+    };
+    cpeg_render_root_candidate(rank.label, &candidates[candidate_idx], board,
+                               ld);
+    CpegInterval prior;
+    if (candidates[candidate_idx].kind == 0) {
+      const int score_bound = cpeg_score_upper_bound(
+          game_get_board(templates[candidate_idx]), templates[candidate_idx]);
+      prior = cpeg_placement_prior(
+          candidates[candidate_idx].score, args->bag,
+          move_get_tiles_played(&candidates[candidate_idx].move), score_bound);
+    } else {
+      prior = cpeg_scoreless_prior(args->bag, root_score_bound);
+    }
+    cpeg_cand_state_init(&states[candidate_idx], prior, &rank);
+  }
+  cpeg_sort_candidate_order(states, stable_order, candidate_count);
+
+  int64_t *world_weights =
+      malloc_or_die((size_t)world_count * sizeof(*world_weights));
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    world_weights[world_idx] = worlds[world_idx].multiset.weight;
+  }
+  CpegWorldEval *evaluations = calloc_or_die(
+      (size_t)candidate_count * (size_t)world_count, sizeof(*evaluations));
+
+  const int thread_count = args->num_threads < 1 ? 1 : args->num_threads;
+  PegPool *pool = thread_count > 1 ? peg_pool_create(thread_count, 0) : NULL;
+  if (pool != NULL) {
+    peg_pool_set_stuck_timeout_seconds(pool, 0);
+  }
+  const int scratch_count = pool != NULL ? thread_count + 1 : 1;
+  CpegWorker *workers = malloc_or_die((size_t)scratch_count * sizeof(*workers));
+  for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+    cpeg_ctx_init(&workers[worker_idx].ctx, ld, ld_size, mover_idx,
+                  args->allow_exchanges);
+    workers[worker_idx].world_game = game_duplicate(game);
+  }
+
+  int batch_size =
+      args->batch_size > 0 ? args->batch_size : CPEG_CERT_DEFAULT_BATCH_SIZE;
+  const int pair_total = candidate_count * world_count;
+  if (batch_size > pair_total) {
+    batch_size = pair_total;
+  }
+  CpegScheduledPair *pairs = malloc_or_die((size_t)batch_size * sizeof(*pairs));
+  CpegRootJob *jobs = malloc_or_die((size_t)batch_size * sizeof(*jobs));
+  void **job_ptrs = malloc_or_die((size_t)batch_size * sizeof(*job_ptrs));
+  int *priority = malloc_or_die((size_t)candidate_count * sizeof(*priority));
+  int *upper_order =
+      malloc_or_die((size_t)candidate_count * sizeof(*upper_order));
+  const int helper_worker_idx = pool != NULL ? thread_count : 0;
+  CpegCoordinatorResult coordinator = {
+      .status = CPEG_COORDINATOR_PENDING,
+      .best_index = stable_order[0],
+  };
+  bool search_ok = true;
+
+  // Phase A: every candidate's highest-weight world is scheduled in stable
+  // candidate order. A barrier and proof check end each fixed-size batch.
+  for (int pilot_idx = 0; pilot_idx < candidate_count &&
+                          coordinator.status == CPEG_COORDINATOR_PENDING;
+       pilot_idx += batch_size) {
+    int pair_count = candidate_count - pilot_idx;
+    if (pair_count > batch_size) {
+      pair_count = batch_size;
+    }
+    for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+      pairs[pair_idx] = (CpegScheduledPair){
+          .candidate_idx = stable_order[pilot_idx + pair_idx],
+          .world_idx = 0,
+      };
+    }
+    search_ok = cpeg_run_certified_batch(
+        pool, workers, helper_worker_idx, jobs, job_ptrs, pairs, pair_count,
+        candidates, templates, game, worlds, unseen, ld_size, opp_idx,
+        scratch_count, evaluations, world_count);
+    if (!search_ok) {
+      break;
+    }
+    out->jobs_completed += pair_count;
+    cpeg_coordinator_recompute(states, candidate_count, evaluations,
+                               world_weights, world_count, &coordinator);
+  }
+
+  // Phase B: LUCB-style contraction. Priority candidates and then the other
+  // active candidates contribute one maximum-impact unresolved world per
+  // round until the next deterministic batch is full.
+  while (coordinator.status == CPEG_COORDINATOR_PENDING) {
+    const int priority_count = cpeg_fill_lucb_priority(
+        states, stable_order, priority, upper_order, candidate_count);
+    int pair_count = 0;
+    bool added = true;
+    while (pair_count < batch_size && added) {
+      added = false;
+      for (int priority_idx = 0;
+           priority_idx < priority_count && pair_count < batch_size;
+           priority_idx++) {
+        const int candidate_idx = priority[priority_idx];
+        const int world_idx = cpeg_next_unresolved_world(
+            evaluations, world_count, pairs, pair_count, candidate_idx);
+        if (world_idx >= 0) {
+          pairs[pair_count++] = (CpegScheduledPair){
+              .candidate_idx = candidate_idx,
+              .world_idx = world_idx,
+          };
+          added = true;
+        }
+      }
+    }
+    if (pair_count == 0) {
+      search_ok = false;
+      break;
+    }
+    search_ok = cpeg_run_certified_batch(
+        pool, workers, helper_worker_idx, jobs, job_ptrs, pairs, pair_count,
+        candidates, templates, game, worlds, unseen, ld_size, opp_idx,
+        scratch_count, evaluations, world_count);
+    if (!search_ok) {
+      break;
+    }
+    out->jobs_completed += pair_count;
+    cpeg_coordinator_recompute(states, candidate_count, evaluations,
+                               world_weights, world_count, &coordinator);
+  }
+
+  if (search_ok) {
+    out->status = coordinator.status == CPEG_COORDINATOR_EXACT_VALUES
+                      ? CPEG_PRE_EXACT_VALUES
+                      : CPEG_PRE_CERTIFIED;
+    out->count = candidate_count;
+    out->best_index = coordinator.best_index;
+    out->worlds_total = world_count;
+    out->unique_best = coordinator.unique_best;
+    out->decision_regret_bound = coordinator.decision_regret_bound;
+    out->optimum_lower = -INFINITY;
+    out->optimum_upper = -INFINITY;
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      const CpegCandState *state = &states[candidate_idx];
+      CpegCertifiedCand *result_candidate = &out->cands[candidate_idx];
+      memcpy(result_candidate->label, state->rank.label,
+             sizeof(result_candidate->label));
+      result_candidate->score = candidates[candidate_idx].score;
+      result_candidate->lower = state->expectation.lo;
+      result_candidate->upper = state->expectation.hi;
+      result_candidate->estimate = cpeg_interval_midpoint(state->expectation);
+      result_candidate->value_error_bound =
+          (state->expectation.hi - state->expectation.lo) / 2.0;
+      result_candidate->worlds_resolved = state->worlds_resolved;
+      result_candidate->eliminated = state->eliminated;
+      if (state->expectation.lo > out->optimum_lower) {
+        out->optimum_lower = state->expectation.lo;
+      }
+      if (state->expectation.hi > out->optimum_upper) {
+        out->optimum_upper = state->expectation.hi;
+      }
+    }
+  }
+
+  free(upper_order);
+  free(priority);
+  free(job_ptrs);
+  free(jobs);
+  free(pairs);
+  peg_pool_destroy(pool);
+  for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+    game_destroy(workers[worker_idx].world_game);
+    cpeg_ctx_destroy(&workers[worker_idx].ctx);
+  }
+  free(workers);
+  free(evaluations);
+  free(world_weights);
+  free(stable_order);
+  free(states);
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (templates[candidate_idx] != NULL) {
+      game_destroy(templates[candidate_idx]);
+    }
+  }
+  free(templates);
+  free(worlds);
+  free(candidates);
+  move_list_destroy(root_moves);
+  return search_ok ? out->count : -1;
 }
 
 int cpeg_measure_interval_recursion(Game *game, int bag, bool allow_exchanges,

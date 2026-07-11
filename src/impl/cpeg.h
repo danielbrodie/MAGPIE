@@ -177,6 +177,44 @@ typedef struct CpegPreResult {
   int count;
 } CpegPreResult;
 
+typedef enum CpegPreStatus {
+  CPEG_PRE_CERTIFIED,
+  CPEG_PRE_EXACT_VALUES,
+  CPEG_PRE_ESTIMATED,
+} CpegPreStatus;
+
+typedef struct CpegCertifiedArgs {
+  int bag;
+  bool allow_exchanges;
+  int num_threads;
+  double budget_seconds;
+  int batch_size;
+} CpegCertifiedArgs;
+
+typedef struct CpegCertifiedCand {
+  char label[CPEG_MOVE_STR_LEN];
+  int score;
+  double estimate;
+  double lower;
+  double upper;
+  double value_error_bound;
+  int worlds_resolved;
+  bool eliminated;
+} CpegCertifiedCand;
+
+typedef struct CpegCertifiedResult {
+  CpegPreStatus status;
+  CpegCertifiedCand cands[CPEG_MAX_PRE_CANDS];
+  int count;
+  int best_index;
+  int worlds_total;
+  int jobs_completed;
+  double optimum_lower;
+  double optimum_upper;
+  double decision_regret_bound;
+  bool unique_best;
+} CpegCertifiedResult;
+
 // Exact Crossplay pre-endgame value for the player on turn (the "mover").
 //
 // `bag` is the true number of tiles in the bag (1..4). The position's CGP is
@@ -198,6 +236,11 @@ typedef struct CpegPreResult {
 // invalid.
 int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
                            int num_threads, CpegPreResult *out);
+
+// Deterministic batched certified solve. budget_seconds is reserved for the
+// budgeted stage; zero runs until CERTIFIED or EXACT_VALUES.
+int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
+                                     CpegCertifiedResult *out);
 
 // Evaluate the scalar and certified interval recursions for every root
 // (candidate, world) pair without changing the normal solver path. Returns -1
