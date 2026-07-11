@@ -9,7 +9,7 @@
 // Maximum rendered length of a single move string ("<coord> <word>") plus its
 // terminator. A move spans at most BOARD_DIM tiles with a two-character coord,
 // so 64 bytes is comfortably sufficient.
-enum { CPEG_MOVE_STR_LEN = 64 };
+enum { CPEG_MOVE_STR_LEN = 64, CPEG_MAX_WORLDS = 1024 };
 
 // Result of an exact Crossplay endgame solve.
 //
@@ -181,6 +181,7 @@ typedef enum CpegPreStatus {
   CPEG_PRE_CERTIFIED,
   CPEG_PRE_EXACT_VALUES,
   CPEG_PRE_ESTIMATED,
+  CPEG_PRE_STATISTICAL,
 } CpegPreStatus;
 
 typedef struct CpegCertifiedArgs {
@@ -247,6 +248,59 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
 // certified move cannot change except among exact co-optima.
 int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
                                      CpegCertifiedResult *out);
+
+typedef struct CpegStatisticalArgs {
+  int bag;
+  bool allow_exchanges;
+  int num_threads;
+  double budget_seconds;
+  uint64_t seed;
+  double confidence;
+  // Internal/test-only deterministic sample budget; zero samples every world.
+  int max_worlds;
+} CpegStatisticalArgs;
+
+typedef struct CpegStatisticalCand {
+  char label[CPEG_MOVE_STR_LEN];
+  int score;
+  double estimate;
+  double lower;
+  double upper;
+  double sample_variance;
+  int worlds_sampled;
+  bool eliminated;
+  int elimination_round;
+} CpegStatisticalCand;
+
+typedef struct CpegStatisticalResult {
+  CpegPreStatus status;
+  CpegStatisticalCand cands[CPEG_MAX_PRE_CANDS];
+  int count;
+  int best_index;
+  int worlds_sampled;
+  int worlds_total;
+  int jobs_completed;
+  int rounds_completed;
+  double confidence;
+  uint64_t seed;
+  int sampled_world_indices[CPEG_MAX_WORLDS];
+  int64_t sampled_world_weights[CPEG_MAX_WORLDS];
+} CpegStatisticalResult;
+
+// Seeded, paired sampling of outer opponent-rack worlds. Inner draws are still
+// enumerated exactly. A zero wall-clock budget is unbounded; max_worlds is a
+// deterministic test/replay cap. Incomplete paired rounds are discarded.
+int cpeg_solve_pre_endgame_statistical(Game *game,
+                                       const CpegStatisticalArgs *args,
+                                       CpegStatisticalResult *out);
+
+// Pure sampling/CI core, exposed for finite-population coverage tests. Values
+// and positive hypergeometric weights describe the complete outer population.
+int cpeg_statistical_resample_values(const double *values,
+                                     const int64_t *weights, int world_count,
+                                     int sample_count, uint64_t seed,
+                                     double confidence,
+                                     CpegStatisticalCand *out);
 
 // Evaluate the scalar and certified interval recursions for every root
 // (candidate, world) pair without changing the normal solver path. Returns -1

@@ -17,6 +17,7 @@
 #include "../ent/move_undo.h"
 #include "../ent/player.h"
 #include "../ent/rack.h"
+#include "../ent/xoshiro.h"
 #include "../str/move_string.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
@@ -54,7 +55,7 @@ enum {
   // Capacity for the opponent-rack world enumeration: the distinct
   // bag-submultisets of the <=11 unseen tiles. C(11,4) = 330 is the worst case;
   // 1024 leaves headroom.
-  CPEG_WORLD_CAP = 1024,
+  CPEG_WORLD_CAP = CPEG_MAX_WORLDS,
   // Default scheduler barrier size. It is deliberately independent of the
   // thread count so changing only parallelism cannot change a committed batch.
   CPEG_CERT_DEFAULT_BATCH_SIZE = 16,
@@ -882,6 +883,10 @@ static double cpeg_eval_place(CpegPreCtx *ctx, Game *game, const Move *move,
   double weighted_sum = 0.0;
   int64_t weight_total = 0;
   for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    if (cpeg_interval_should_cancel(ctx)) {
+      unplay_move_incremental(game, move_undo);
+      return 0.0;
+    }
     const CpegMultiset *draw = &draws[draw_idx];
     Bag *child_bag = game_get_bag(game);
     Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
@@ -891,7 +896,13 @@ static double cpeg_eval_place(CpegPreCtx *ctx, Game *game, const Move *move,
     }
     game_set_consecutive_scoreless_turns(game, 0);
     game_set_game_end_reason(game, GAME_END_REASON_NONE);
-    weighted_sum += (double)draw->weight * cpeg_value(ctx, game, 0, depth + 1);
+    const double child_value = cpeg_value(ctx, game, 0, depth + 1);
+    if (!ctx->complete) {
+      cpeg_restore_branch(ctx, game, depth, &branch_undo);
+      unplay_move_incremental(game, move_undo);
+      return 0.0;
+    }
+    weighted_sum += (double)draw->weight * child_value;
     weight_total += draw->weight;
     cpeg_restore_branch(ctx, game, depth, &branch_undo);
   }
@@ -995,6 +1006,9 @@ static double cpeg_eval_scoreless(CpegPreCtx *ctx, Game *game,
     game_set_game_end_reason(game, GAME_END_REASON_NONE);
     const double value = cpeg_value(ctx, game, scoreless + 1, depth + 1);
     cpeg_restore_branch(ctx, game, depth, &branch_undo);
+    if (!ctx->complete) {
+      return 0.0;
+    }
     return 0.0 - value;
   }
 
@@ -1016,6 +1030,10 @@ static double cpeg_eval_scoreless(CpegPreCtx *ctx, Game *game,
   double weighted_sum = 0.0;
   int64_t weight_total = 0;
   for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    if (cpeg_interval_should_cancel(ctx)) {
+      cpeg_restore_branch(ctx, game, depth, &branch_undo);
+      return 0.0;
+    }
     const CpegMultiset *draw = &draws[draw_idx];
     Bag *child_bag = game_get_bag(game);
     Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
@@ -1030,8 +1048,12 @@ static double cpeg_eval_scoreless(CpegPreCtx *ctx, Game *game,
     game_start_next_player_turn(game);
     game_set_consecutive_scoreless_turns(game, 0);
     game_set_game_end_reason(game, GAME_END_REASON_NONE);
-    weighted_sum +=
-        (double)draw->weight * cpeg_value(ctx, game, scoreless + 1, depth + 1);
+    const double child_value = cpeg_value(ctx, game, scoreless + 1, depth + 1);
+    if (!ctx->complete) {
+      cpeg_restore_branch(ctx, game, depth, &branch_undo);
+      return 0.0;
+    }
+    weighted_sum += (double)draw->weight * child_value;
     weight_total += draw->weight;
     cpeg_restore_branch(ctx, game, depth, &branch_undo);
   }
@@ -1158,6 +1180,9 @@ static int cpeg_enum_exchanges(int ld_size, const Rack *rack, int bag_count,
 // value is the two-ply Crossplay endgame.
 static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless,
                          int depth) {
+  if (cpeg_interval_should_cancel(ctx)) {
+    return 0.0;
+  }
   if (ctx->capacity_exceeded) {
     return 0.0;
   }
@@ -1165,8 +1190,9 @@ static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless,
   const int bag_count = bag_get_letters(bag);
   if (bag_count == 0) {
     CpegResult leaf;
-    return (double)cpeg_endgame_core(game, ctx->eg_mover, ctx->eg_reply,
-                                     ctx->eg_undo, &leaf);
+    const double value = (double)cpeg_endgame_core(
+        game, ctx->eg_mover, ctx->eg_reply, ctx->eg_undo, &leaf);
+    return cpeg_interval_should_cancel(ctx) ? 0.0 : value;
   }
   if (depth >= CPEG_MAX_DEPTH - 1) {
     // Unreachable given the scoreless cap and the monotone bag; a safety net.
@@ -1195,8 +1221,14 @@ static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless,
     if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
       continue;
     }
+    if (cpeg_interval_should_cancel(ctx)) {
+      return 0.0;
+    }
     any_placement = true;
     const double value = cpeg_eval_place(ctx, game, move, depth);
+    if (!ctx->complete) {
+      return 0.0;
+    }
     if (!have_best || value > best) {
       best = value;
       have_best = true;
@@ -1207,6 +1239,9 @@ static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless,
   if (!any_placement) {
     const double value =
         cpeg_eval_scoreless(ctx, game, NULL, 0, scoreless, depth);
+    if (!ctx->complete) {
+      return 0.0;
+    }
     if (!have_best || value > best) {
       best = value;
       have_best = true;
@@ -1225,9 +1260,15 @@ static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless,
       return 0.0;
     }
     for (int exch_idx = 0; exch_idx < n_exch; exch_idx++) {
+      if (cpeg_interval_should_cancel(ctx)) {
+        return 0.0;
+      }
       const double value =
           cpeg_eval_scoreless(ctx, game, exchanges[exch_idx].tiles,
                               exchanges[exch_idx].n, scoreless, depth);
+      if (!ctx->complete) {
+        return 0.0;
+      }
       if (!have_best || value > best) {
         best = value;
         have_best = true;
@@ -1469,6 +1510,9 @@ static double cpeg_eval_post_place(CpegPreCtx *ctx, const Game *post_place_game,
   double weighted_sum = 0.0;
   int64_t weight_total = 0;
   for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    if (cpeg_interval_should_cancel(ctx)) {
+      return 0.0;
+    }
     const CpegMultiset *draw = &draws[draw_idx];
     Game *child = cpeg_child_game(ctx, depth, post_place_game);
     Bag *child_bag = game_get_bag(child);
@@ -1479,7 +1523,11 @@ static double cpeg_eval_post_place(CpegPreCtx *ctx, const Game *post_place_game,
     }
     game_set_consecutive_scoreless_turns(child, 0);
     game_set_game_end_reason(child, GAME_END_REASON_NONE);
-    weighted_sum += (double)draw->weight * cpeg_value(ctx, child, 0, depth + 1);
+    const double child_value = cpeg_value(ctx, child, 0, depth + 1);
+    if (!ctx->complete) {
+      return 0.0;
+    }
+    weighted_sum += (double)draw->weight * child_value;
     weight_total += draw->weight;
   }
   const double child_expectation =
@@ -1621,6 +1669,7 @@ static void cpeg_set_world(Game *world_game, const Game *source_game,
 static void cpeg_root_job_run(void *arg, int worker_idx) {
   CpegRootJob *job = (CpegRootJob *)arg;
   CpegWorker *worker = &job->workers[worker_idx];
+  worker->ctx.complete = true;
   cpeg_set_world(worker->world_game, job->source_game, job->world, job->unseen,
                  job->ld_size, job->opp_idx);
   if (job->cand->kind == 0) {
@@ -1631,6 +1680,7 @@ static void cpeg_root_job_run(void *arg, int worker_idx) {
     job->value =
         cpeg_eval_root_scoreless(&worker->ctx, worker->world_game, job->cand);
   }
+  job->complete = worker->ctx.complete;
 }
 
 static void cpeg_root_interval_job_run(void *arg, int worker_idx) {
@@ -2122,6 +2172,55 @@ static bool cpeg_run_certified_batch(
   return true;
 }
 
+static bool cpeg_run_statistical_batch(
+    PegPool *pool, CpegWorker *workers, int helper_worker_idx,
+    CpegRootJob *jobs, void **job_ptrs, const CpegScheduledPair *pairs,
+    int pair_count, const CpegRootCand *candidates, Game *const *templates,
+    const Game *game, const CpegScheduledWorld *worlds, const int *unseen,
+    int ld_size, int opp_idx, int scratch_count, CpegWorldEval *evaluations,
+    int world_count, bool *batch_complete) {
+  *batch_complete = false;
+  for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+    const int candidate_idx = pairs[pair_idx].candidate_idx;
+    const int world_idx = pairs[pair_idx].world_idx;
+    CpegRootJob *job = &jobs[pair_idx];
+    job->workers = workers;
+    job->source_game =
+        templates[candidate_idx] != NULL ? templates[candidate_idx] : game;
+    job->world = &worlds[world_idx].multiset;
+    job->unseen = unseen;
+    job->ld_size = ld_size;
+    job->opp_idx = opp_idx;
+    job->cand = &candidates[candidate_idx];
+    job->value = 0.0;
+    job->complete = false;
+    job_ptrs[pair_idx] = job;
+  }
+
+  peg_pool_submit_and_wait(pool, cpeg_root_job_run, job_ptrs, pair_count,
+                           helper_worker_idx);
+  for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+    if (workers[worker_idx].ctx.capacity_exceeded) {
+      return false;
+    }
+  }
+  for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+    if (!jobs[pair_idx].complete) {
+      return true;
+    }
+  }
+  for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+    const int candidate_idx = pairs[pair_idx].candidate_idx;
+    const int world_idx = pairs[pair_idx].world_idx;
+    evaluations[candidate_idx * world_count + world_idx] = (CpegWorldEval){
+        .value = {.lo = jobs[pair_idx].value, .hi = jobs[pair_idx].value},
+        .resolved = true,
+    };
+  }
+  *batch_complete = true;
+  return true;
+}
+
 static int64_t cpeg_certified_deadline_ns(double budget_seconds) {
   if (budget_seconds <= 0.0) {
     return 0;
@@ -2522,6 +2621,536 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
   }
   free(workers);
   free(evaluations);
+  free(world_weights);
+  free(stable_order);
+  free(states);
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (templates[candidate_idx] != NULL) {
+      game_destroy(templates[candidate_idx]);
+    }
+  }
+  free(templates);
+  free(worlds);
+  free(candidates);
+  move_list_destroy(root_moves);
+  return out->count > 0 ? out->count : -1;
+}
+
+static void cpeg_statistical_sample_order(const CpegScheduledWorld *worlds,
+                                          int world_count, uint64_t seed,
+                                          int *sample_order) {
+  bool selected[CPEG_WORLD_CAP] = {false};
+  int64_t remaining_weight = 0;
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    remaining_weight += worlds[world_idx].multiset.weight;
+  }
+
+  XoshiroPRNG *prng = prng_create(seed);
+  for (int sample_idx = 0; sample_idx < world_count; sample_idx++) {
+    const int64_t draw =
+        (int64_t)prng_get_random_number(prng, (uint64_t)remaining_weight);
+    int64_t cumulative_weight = 0;
+    // Positive remaining_weight guarantees that one unselected interval
+    // contains draw. Initialize to a valid index so static analysis can see
+    // that the subsequent array access is in bounds as well.
+    int selected_world_idx = 0;
+    for (int world_idx = 0; world_idx < world_count; world_idx++) {
+      if (selected[world_idx]) {
+        continue;
+      }
+      cumulative_weight += worlds[world_idx].multiset.weight;
+      if (draw < cumulative_weight) {
+        selected_world_idx = world_idx;
+        break;
+      }
+    }
+    sample_order[sample_idx] = selected_world_idx;
+    selected[selected_world_idx] = true;
+    remaining_weight -= worlds[selected_world_idx].multiset.weight;
+  }
+  prng_destroy(prng);
+}
+
+typedef struct CpegStatisticalSummary {
+  double mean;
+  double variance;
+  double lower;
+  double upper;
+} CpegStatisticalSummary;
+
+// Weighted empirical-Bernstein/Serfling interval used by statistical mode.
+// rho=(N-n)/(N-1), and
+//   h=sqrt(2*rho*s_w^2*log(3/delta)/n)
+//       +3*rho*R_s*log(3/delta)/n.
+// Here s_w^2 is the reliability-weighted sample variance and R_s is the
+// observed sample range. A census is exact by construction. With only one
+// observation there is no empirical scale, so the candidate's certified prior
+// is retained until a second world resolves.
+static CpegStatisticalSummary
+cpeg_statistical_summary(const CpegWorldEval *candidate_evaluations,
+                         const int *sample_order, int sample_count,
+                         const int64_t *world_weights, int world_count,
+                         CpegInterval prior, double delta) {
+  CpegStatisticalSummary summary = {
+      .mean = cpeg_interval_midpoint(prior),
+      .variance = 0.0,
+      .lower = prior.lo,
+      .upper = prior.hi,
+  };
+  if (sample_count < 1) {
+    return summary;
+  }
+
+  double weight_sum = 0.0;
+  double squared_weight_sum = 0.0;
+  double weighted_value_sum = 0.0;
+  double sample_minimum = INFINITY;
+  double sample_maximum = -INFINITY;
+  for (int sample_idx = 0; sample_idx < sample_count; sample_idx++) {
+    const int world_idx = sample_order[sample_idx];
+    const double weight = (double)world_weights[world_idx];
+    const double value =
+        cpeg_interval_midpoint(candidate_evaluations[world_idx].value);
+    weight_sum += weight;
+    squared_weight_sum += weight * weight;
+    weighted_value_sum += weight * value;
+    if (value < sample_minimum) {
+      sample_minimum = value;
+    }
+    if (value > sample_maximum) {
+      sample_maximum = value;
+    }
+  }
+  summary.mean = weighted_value_sum / weight_sum;
+  if (sample_count == 1) {
+    return summary;
+  }
+
+  double weighted_squared_deviation_sum = 0.0;
+  for (int sample_idx = 0; sample_idx < sample_count; sample_idx++) {
+    const int world_idx = sample_order[sample_idx];
+    const double weight = (double)world_weights[world_idx];
+    const double value =
+        cpeg_interval_midpoint(candidate_evaluations[world_idx].value);
+    const double deviation = value - summary.mean;
+    weighted_squared_deviation_sum += weight * deviation * deviation;
+  }
+  const double variance_denominator =
+      weight_sum - squared_weight_sum / weight_sum;
+  if (variance_denominator > 0.0) {
+    summary.variance = weighted_squared_deviation_sum / variance_denominator;
+  }
+  if (sample_count == world_count) {
+    summary.lower = summary.mean;
+    summary.upper = summary.mean;
+    return summary;
+  }
+
+  const double rho =
+      (double)(world_count - sample_count) / (double)(world_count - 1);
+  const double log_term = log(3.0 / delta);
+  const double sample_range = sample_maximum - sample_minimum;
+  const double half_width =
+      sqrt(2.0 * rho * summary.variance * log_term / (double)sample_count) +
+      3.0 * rho * sample_range * log_term / (double)sample_count;
+  summary.lower = summary.mean - half_width;
+  summary.upper = summary.mean + half_width;
+  return summary;
+}
+
+int cpeg_statistical_resample_values(const double *values,
+                                     const int64_t *weights, int world_count,
+                                     int sample_count, uint64_t seed,
+                                     double confidence,
+                                     CpegStatisticalCand *out) {
+  if (values == NULL || weights == NULL || out == NULL || world_count < 1 ||
+      world_count > CPEG_WORLD_CAP || sample_count < 1 ||
+      sample_count > world_count || !isfinite(confidence) ||
+      confidence <= 0.0 || confidence >= 1.0) {
+    return -1;
+  }
+  CpegScheduledWorld worlds[CPEG_WORLD_CAP] = {0};
+  CpegWorldEval evaluations[CPEG_WORLD_CAP] = {0};
+  double population_minimum = INFINITY;
+  double population_maximum = -INFINITY;
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    if (weights[world_idx] <= 0 || !isfinite(values[world_idx])) {
+      return -1;
+    }
+    worlds[world_idx].multiset.weight = weights[world_idx];
+    worlds[world_idx].generation_index = world_idx;
+    evaluations[world_idx] = (CpegWorldEval){
+        .value = {.lo = values[world_idx], .hi = values[world_idx]},
+        .resolved = true,
+    };
+    if (values[world_idx] < population_minimum) {
+      population_minimum = values[world_idx];
+    }
+    if (values[world_idx] > population_maximum) {
+      population_maximum = values[world_idx];
+    }
+  }
+  int sample_order[CPEG_WORLD_CAP];
+  cpeg_statistical_sample_order(worlds, world_count, seed, sample_order);
+  const CpegStatisticalSummary summary = cpeg_statistical_summary(
+      evaluations, sample_order, sample_count, weights, world_count,
+      (CpegInterval){.lo = population_minimum, .hi = population_maximum},
+      1.0 - confidence);
+  memset(out, 0, sizeof(*out));
+  out->estimate = summary.mean;
+  out->lower = summary.lower;
+  out->upper = summary.upper;
+  out->sample_variance = summary.variance;
+  out->worlds_sampled = sample_count;
+  return 1;
+}
+
+static CpegStatisticalSummary cpeg_statistical_gap_summary(
+    const CpegWorldEval *evaluations, int world_count, int candidate_idx,
+    int leader_idx, const int *sample_order, int sample_count,
+    const int64_t *world_weights, CpegInterval candidate_prior,
+    CpegInterval leader_prior, double delta) {
+  CpegWorldEval gap_evaluations[CPEG_WORLD_CAP] = {0};
+  for (int sample_idx = 0; sample_idx < sample_count; sample_idx++) {
+    const int world_idx = sample_order[sample_idx];
+    const CpegInterval candidate_value =
+        evaluations[candidate_idx * world_count + world_idx].value;
+    const CpegInterval leader_value =
+        evaluations[leader_idx * world_count + world_idx].value;
+    const double gap = cpeg_interval_midpoint(candidate_value) -
+                       cpeg_interval_midpoint(leader_value);
+    gap_evaluations[world_idx] =
+        (CpegWorldEval){.value = {.lo = gap, .hi = gap}, .resolved = true};
+  }
+  const CpegInterval gap_prior = {
+      .lo = candidate_prior.lo - leader_prior.hi,
+      .hi = candidate_prior.hi - leader_prior.lo,
+  };
+  return cpeg_statistical_summary(gap_evaluations, sample_order, sample_count,
+                                  world_weights, world_count, gap_prior, delta);
+}
+
+static int cpeg_statistical_best(const CpegCandState *states,
+                                 const CpegStatisticalSummary *summaries,
+                                 int candidate_count, bool include_eliminated) {
+  int best_idx = -1;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (!include_eliminated && states[candidate_idx].eliminated) {
+      continue;
+    }
+    if (best_idx < 0 ||
+        summaries[candidate_idx].mean > summaries[best_idx].mean ||
+        (summaries[candidate_idx].mean == summaries[best_idx].mean &&
+         cpeg_rank_precedes(&states[candidate_idx], &states[best_idx]))) {
+      best_idx = candidate_idx;
+    }
+  }
+  return best_idx;
+}
+
+int cpeg_solve_pre_endgame_statistical(Game *game,
+                                       const CpegStatisticalArgs *args,
+                                       CpegStatisticalResult *out) {
+  if (out == NULL) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  out->best_index = -1;
+  if (game == NULL || args == NULL || args->bag < 1 ||
+      args->bag > PEG_MAX_BAG || !isfinite(args->budget_seconds) ||
+      args->budget_seconds < 0.0 || !isfinite(args->confidence) ||
+      args->confidence <= 0.0 || args->confidence >= 1.0 ||
+      args->max_worlds < 0) {
+    return -1;
+  }
+  const int64_t deadline_ns = cpeg_certified_deadline_ns(args->budget_seconds);
+
+  const LetterDistribution *ld = game_get_ld(game);
+  const int ld_size = ld_get_size(ld);
+  Board *board = game_get_board(game);
+  game_gen_all_cross_sets(game);
+  board_set_cross_sets_valid(board, true);
+  const int mover_idx = game_get_player_on_turn_index(game);
+  const int opp_idx = 1 - mover_idx;
+  int unseen[MAX_ALPHABET_SIZE];
+  const int total_unseen = cpeg_compute_unseen(game, mover_idx, unseen);
+  const int opp_size = total_unseen - args->bag;
+  if (opp_size < 0 || opp_size > RACK_SIZE) {
+    return -1;
+  }
+
+  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
+  const MoveGenArgs root_args = {
+      .game = game,
+      .move_list = root_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&root_args);
+  const int root_count = move_list_get_count(root_moves);
+  if (root_count > CPEG_MOVE_LIST_CAP) {
+    move_list_destroy(root_moves);
+    return -1;
+  }
+
+  CpegRootCand *candidates = calloc_or_die(
+      (size_t)(root_count + 1 + CPEG_ENUM_CAP), sizeof(*candidates));
+  int candidate_count = 0;
+  bool any_placement = false;
+  for (int move_idx = 0; move_idx < root_count; move_idx++) {
+    const Move *move = move_list_get_move(root_moves, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    any_placement = true;
+    CpegRootCand *candidate = &candidates[candidate_count++];
+    candidate->kind = 0;
+    move_copy(&candidate->move, move);
+    candidate->score = equity_to_int(move_get_score(move));
+  }
+  if (!any_placement) {
+    candidates[candidate_count++].kind = 1;
+  }
+  if (args->allow_exchanges) {
+    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    bool exchange_overflow = false;
+    const int exchange_count =
+        cpeg_enum_exchanges(ld_size, mover_rack, args->bag, exchanges,
+                            CPEG_ENUM_CAP, &exchange_overflow);
+    if (exchange_overflow) {
+      free(candidates);
+      move_list_destroy(root_moves);
+      return -1;
+    }
+    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
+      CpegRootCand *candidate = &candidates[candidate_count++];
+      candidate->kind = 2;
+      candidate->exch_n = exchanges[exchange_idx].n;
+      for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
+        candidate->exch_tiles[tile_idx] =
+            exchanges[exchange_idx].tiles[tile_idx];
+      }
+    }
+  }
+  if (candidate_count < 1 || candidate_count > CPEG_MAX_PRE_CANDS) {
+    free(candidates);
+    move_list_destroy(root_moves);
+    return -1;
+  }
+
+  CpegMultiset *enumerated_worlds =
+      malloc_or_die(CPEG_WORLD_CAP * sizeof(*enumerated_worlds));
+  bool world_overflow = false;
+  const int world_count =
+      cpeg_enum_submultisets(unseen, ld_size, args->bag, enumerated_worlds,
+                             CPEG_WORLD_CAP, &world_overflow);
+  if (world_overflow || world_count < 1) {
+    free(enumerated_worlds);
+    free(candidates);
+    move_list_destroy(root_moves);
+    return -1;
+  }
+  CpegScheduledWorld *worlds =
+      malloc_or_die((size_t)world_count * sizeof(*worlds));
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    worlds[world_idx] = (CpegScheduledWorld){
+        .multiset = enumerated_worlds[world_idx],
+        .generation_index = world_idx,
+    };
+  }
+  free(enumerated_worlds);
+  cpeg_sort_scheduled_worlds(worlds, world_count);
+
+  Game **templates = calloc_or_die((size_t)candidate_count, sizeof(*templates));
+  CpegCandState *states =
+      malloc_or_die((size_t)candidate_count * sizeof(*states));
+  int *stable_order =
+      malloc_or_die((size_t)candidate_count * sizeof(*stable_order));
+  const int root_score_bound = cpeg_score_upper_bound(board, game);
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidates[candidate_idx].kind == 0) {
+      templates[candidate_idx] =
+          cpeg_build_root_template(game, &candidates[candidate_idx].move);
+    }
+    CpegStableRank rank = {
+        .immediate_score = candidates[candidate_idx].score,
+        .kind = cpeg_root_candidate_kind(&candidates[candidate_idx]),
+        .generation_index = candidate_idx,
+    };
+    cpeg_render_root_candidate(rank.label, &candidates[candidate_idx], board,
+                               ld);
+    CpegInterval prior;
+    if (candidates[candidate_idx].kind == 0) {
+      const int score_bound = cpeg_score_upper_bound(
+          game_get_board(templates[candidate_idx]), templates[candidate_idx]);
+      prior = cpeg_placement_prior(
+          candidates[candidate_idx].score, args->bag,
+          move_get_tiles_played(&candidates[candidate_idx].move), score_bound);
+    } else {
+      prior = cpeg_scoreless_prior(args->bag, root_score_bound);
+    }
+    cpeg_cand_state_init(&states[candidate_idx], prior, &rank);
+  }
+  cpeg_sort_candidate_order(states, stable_order, candidate_count);
+
+  int64_t *world_weights =
+      malloc_or_die((size_t)world_count * sizeof(*world_weights));
+  int *sample_order =
+      malloc_or_die((size_t)world_count * sizeof(*sample_order));
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    world_weights[world_idx] = worlds[world_idx].multiset.weight;
+  }
+  cpeg_statistical_sample_order(worlds, world_count, args->seed, sample_order);
+  CpegWorldEval *evaluations = calloc_or_die(
+      (size_t)candidate_count * (size_t)world_count, sizeof(*evaluations));
+  CpegStatisticalSummary *summaries =
+      malloc_or_die((size_t)candidate_count * sizeof(*summaries));
+  int *candidate_sample_counts =
+      calloc_or_die((size_t)candidate_count, sizeof(*candidate_sample_counts));
+
+  const int thread_count = args->num_threads < 1 ? 1 : args->num_threads;
+  PegPool *pool = thread_count > 1 ? peg_pool_create(thread_count, 0) : NULL;
+  if (pool != NULL) {
+    peg_pool_set_stuck_timeout_seconds(pool, 0);
+  }
+  const int scratch_count = pool != NULL ? thread_count + 1 : 1;
+  CpegWorker *workers = malloc_or_die((size_t)scratch_count * sizeof(*workers));
+  for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+    cpeg_ctx_init(&workers[worker_idx].ctx, ld, ld_size, mover_idx,
+                  args->allow_exchanges, deadline_ns);
+    workers[worker_idx].world_game = game_duplicate(game);
+  }
+
+  CpegScheduledPair *pairs =
+      malloc_or_die((size_t)candidate_count * sizeof(*pairs));
+  CpegRootJob *jobs = malloc_or_die((size_t)candidate_count * sizeof(*jobs));
+  void **job_ptrs = malloc_or_die((size_t)candidate_count * sizeof(*job_ptrs));
+  const int helper_worker_idx = pool != NULL ? thread_count : 0;
+  bool search_ok = true;
+  const int sample_limit =
+      args->max_worlds > 0 && args->max_worlds < world_count ? args->max_worlds
+                                                             : world_count;
+
+  for (int sample_idx = 0; sample_idx < sample_limit; sample_idx++) {
+    if (deadline_ns != 0 && ctimer_monotonic_ns() >= deadline_ns) {
+      break;
+    }
+    int pair_count = 0;
+    for (int order_idx = 0; order_idx < candidate_count; order_idx++) {
+      const int candidate_idx = stable_order[order_idx];
+      if (!states[candidate_idx].eliminated) {
+        pairs[pair_count++] = (CpegScheduledPair){
+            .candidate_idx = candidate_idx,
+            .world_idx = sample_order[sample_idx],
+        };
+      }
+    }
+    bool round_complete = false;
+    search_ok = cpeg_run_statistical_batch(
+        pool, workers, helper_worker_idx, jobs, job_ptrs, pairs, pair_count,
+        candidates, templates, game, worlds, unseen, ld_size, opp_idx,
+        scratch_count, evaluations, world_count, &round_complete);
+    if (!search_ok || !round_complete) {
+      break;
+    }
+    out->jobs_completed += pair_count;
+    out->sampled_world_indices[out->worlds_sampled] = sample_order[sample_idx];
+    out->sampled_world_weights[out->worlds_sampled] =
+        world_weights[sample_order[sample_idx]];
+    for (int pair_idx = 0; pair_idx < pair_count; pair_idx++) {
+      candidate_sample_counts[pairs[pair_idx].candidate_idx]++;
+    }
+    out->rounds_completed++;
+    out->worlds_sampled++;
+
+    const double failure_probability = 1.0 - args->confidence;
+    const double round = (double)out->rounds_completed;
+    const double round_delta =
+        6.0 * failure_probability / (9.86960440108935861883 * round * round);
+    const double interval_delta = round_delta / (2.0 * candidate_count);
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      summaries[candidate_idx] = cpeg_statistical_summary(
+          &evaluations[candidate_idx * world_count], sample_order,
+          candidate_sample_counts[candidate_idx], world_weights, world_count,
+          states[candidate_idx].prior, interval_delta);
+    }
+    const int leader_idx = cpeg_statistical_best(
+        states, summaries, candidate_count, /*include_eliminated=*/false);
+    if (out->worlds_sampled < world_count && out->worlds_sampled >= 2) {
+      for (int candidate_idx = 0; candidate_idx < candidate_count;
+           candidate_idx++) {
+        if (candidate_idx == leader_idx || states[candidate_idx].eliminated) {
+          continue;
+        }
+        const CpegStatisticalSummary gap = cpeg_statistical_gap_summary(
+            evaluations, world_count, candidate_idx, leader_idx, sample_order,
+            out->worlds_sampled, world_weights, states[candidate_idx].prior,
+            states[leader_idx].prior, interval_delta);
+        if (gap.upper < 0.0) {
+          states[candidate_idx].eliminated = true;
+          out->cands[candidate_idx].elimination_round = out->rounds_completed;
+        }
+      }
+    }
+  }
+
+  if (search_ok && out->worlds_sampled > 0) {
+    const double failure_probability = 1.0 - args->confidence;
+    const double round = (double)out->rounds_completed;
+    const double round_delta =
+        6.0 * failure_probability / (9.86960440108935861883 * round * round);
+    const double interval_delta = round_delta / (2.0 * candidate_count);
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      summaries[candidate_idx] = cpeg_statistical_summary(
+          &evaluations[candidate_idx * world_count], sample_order,
+          candidate_sample_counts[candidate_idx], world_weights, world_count,
+          states[candidate_idx].prior, interval_delta);
+    }
+    out->status = CPEG_PRE_STATISTICAL;
+    out->count = candidate_count;
+    out->best_index = cpeg_statistical_best(states, summaries, candidate_count,
+                                            /*include_eliminated=*/false);
+    out->worlds_total = world_count;
+    out->confidence = args->confidence;
+    out->seed = args->seed;
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      CpegStatisticalCand *result_candidate = &out->cands[candidate_idx];
+      memcpy(result_candidate->label, states[candidate_idx].rank.label,
+             sizeof(result_candidate->label));
+      result_candidate->score = candidates[candidate_idx].score;
+      result_candidate->estimate = summaries[candidate_idx].mean;
+      result_candidate->lower = summaries[candidate_idx].lower;
+      result_candidate->upper = summaries[candidate_idx].upper;
+      result_candidate->sample_variance = summaries[candidate_idx].variance;
+      result_candidate->worlds_sampled = candidate_sample_counts[candidate_idx];
+      result_candidate->eliminated = states[candidate_idx].eliminated;
+    }
+  }
+
+  free(job_ptrs);
+  free(jobs);
+  free(pairs);
+  peg_pool_destroy(pool);
+  for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+    game_destroy(workers[worker_idx].world_game);
+    cpeg_ctx_destroy(&workers[worker_idx].ctx);
+  }
+  free(workers);
+  free(candidate_sample_counts);
+  free(summaries);
+  free(evaluations);
+  free(sample_order);
   free(world_weights);
   free(stable_order);
   free(states);

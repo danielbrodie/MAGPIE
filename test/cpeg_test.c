@@ -953,6 +953,166 @@ void test_cpeg_certified_bag1(void) {
   config_destroy(config);
 }
 
+static void
+cpeg_assert_statistical_results_equal(const CpegStatisticalResult *lhs,
+                                      const CpegStatisticalResult *rhs) {
+  assert(lhs->status == rhs->status);
+  assert(lhs->count == rhs->count);
+  assert(lhs->best_index == rhs->best_index);
+  assert(lhs->worlds_sampled == rhs->worlds_sampled);
+  assert(lhs->worlds_total == rhs->worlds_total);
+  assert(lhs->jobs_completed == rhs->jobs_completed);
+  assert(lhs->rounds_completed == rhs->rounds_completed);
+  assert(lhs->confidence == rhs->confidence);
+  assert(lhs->seed == rhs->seed);
+  for (int sample_idx = 0; sample_idx < lhs->worlds_sampled; sample_idx++) {
+    assert(lhs->sampled_world_indices[sample_idx] ==
+           rhs->sampled_world_indices[sample_idx]);
+    assert(lhs->sampled_world_weights[sample_idx] ==
+           rhs->sampled_world_weights[sample_idx]);
+  }
+  for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
+    const CpegStatisticalCand *lhs_candidate = &lhs->cands[candidate_idx];
+    const CpegStatisticalCand *rhs_candidate = &rhs->cands[candidate_idx];
+    assert_strings_equal(lhs_candidate->label, rhs_candidate->label);
+    assert(lhs_candidate->score == rhs_candidate->score);
+    assert(lhs_candidate->estimate == rhs_candidate->estimate);
+    assert(lhs_candidate->lower == rhs_candidate->lower);
+    assert(lhs_candidate->upper == rhs_candidate->upper);
+    assert(lhs_candidate->sample_variance == rhs_candidate->sample_variance);
+    assert(lhs_candidate->worlds_sampled == rhs_candidate->worlds_sampled);
+    assert(lhs_candidate->eliminated == rhs_candidate->eliminated);
+    assert(lhs_candidate->elimination_round ==
+           rhs_candidate->elimination_round);
+  }
+}
+
+void test_cpeg_statistical_bag1(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  const CpegStatisticalArgs full_args = {
+      .bag = 1,
+      .allow_exchanges = false,
+      .num_threads = 4,
+      .budget_seconds = 60.0,
+      .seed = 42,
+      .confidence = 0.95,
+      .max_worlds = 0,
+  };
+  CpegStatisticalResult full;
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  assert(cpeg_solve_pre_endgame_statistical(config_get_game(config), &full_args,
+                                            &full) > 0);
+  assert(full.status == CPEG_PRE_STATISTICAL);
+  assert(full.worlds_sampled == 7);
+  assert(full.worlds_total == 7);
+  assert_strings_equal(full.cands[full.best_index].label, "13J TAU");
+  int full_tau_idx = -1;
+  for (int candidate_idx = 0; candidate_idx < full.count; candidate_idx++) {
+    if (strcmp(full.cands[candidate_idx].label, "13J TAU") == 0) {
+      full_tau_idx = candidate_idx;
+      break;
+    }
+  }
+  assert(full_tau_idx >= 0);
+  assert(fabs(full.cands[full_tau_idx].estimate - 44.125) < 1e-12);
+  assert(fabs(full.cands[full_tau_idx].upper - full.cands[full_tau_idx].lower) <
+         1e-12);
+  assert(!full.cands[full_tau_idx].eliminated);
+
+  CpegStatisticalArgs subset_args = full_args;
+  subset_args.max_worlds = 4;
+  CpegStatisticalResult deterministic_one;
+  CpegStatisticalResult deterministic_two;
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  assert(cpeg_solve_pre_endgame_statistical(
+             config_get_game(config), &subset_args, &deterministic_one) > 0);
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  assert(cpeg_solve_pre_endgame_statistical(
+             config_get_game(config), &subset_args, &deterministic_two) > 0);
+  cpeg_assert_statistical_results_equal(&deterministic_one, &deterministic_two);
+
+  // Recover TAU's seven exact in-world values once from deterministic prefixes.
+  // The 500-seed coverage loop below then exercises only the sampling/CI core,
+  // rather than re-solving the same perfect-information worlds 500 times.
+  double tau_values[7] = {0};
+  int64_t tau_weights[7] = {0};
+  double prior_weighted_sum = 0.0;
+  int64_t prior_weight_sum = 0;
+  for (int prefix = 1; prefix <= 7; prefix++) {
+    CpegStatisticalArgs prefix_args = full_args;
+    prefix_args.max_worlds = prefix;
+    CpegStatisticalResult prefix_result;
+    load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+    assert(cpeg_solve_pre_endgame_statistical(
+               config_get_game(config), &prefix_args, &prefix_result) > 0);
+    int tau_idx = -1;
+    for (int candidate_idx = 0; candidate_idx < prefix_result.count;
+         candidate_idx++) {
+      if (strcmp(prefix_result.cands[candidate_idx].label, "13J TAU") == 0) {
+        tau_idx = candidate_idx;
+        break;
+      }
+    }
+    assert(tau_idx >= 0);
+    const int sample_idx = prefix - 1;
+    const int world_idx = prefix_result.sampled_world_indices[sample_idx];
+    const int64_t weight = prefix_result.sampled_world_weights[sample_idx];
+    const int64_t weight_sum = prior_weight_sum + weight;
+    const double weighted_sum =
+        prefix_result.cands[tau_idx].estimate * (double)weight_sum;
+    tau_values[world_idx] =
+        (weighted_sum - prior_weighted_sum) / (double)weight;
+    tau_weights[world_idx] = weight;
+    prior_weighted_sum = weighted_sum;
+    prior_weight_sum = weight_sum;
+  }
+
+  int covered = 0;
+  const int coverage_seeds = 500;
+  for (int seed = 0; seed < coverage_seeds; seed++) {
+    CpegStatisticalCand estimate;
+    assert(cpeg_statistical_resample_values(tau_values, tau_weights, 7, 4,
+                                            (uint64_t)seed, 0.95,
+                                            &estimate) > 0);
+    if (estimate.lower <= 44.125 && 44.125 <= estimate.upper) {
+      covered++;
+    }
+  }
+  assert(covered >= 475);
+
+  int tau_chosen = 0;
+  const int best_arm_seeds = 8;
+  for (int seed = 0; seed < best_arm_seeds; seed++) {
+    CpegStatisticalArgs best_args = full_args;
+    best_args.seed = (uint64_t)seed;
+    best_args.max_worlds = 7;
+    CpegStatisticalResult result;
+    load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+    assert(cpeg_solve_pre_endgame_statistical(config_get_game(config),
+                                              &best_args, &result) > 0);
+    int tau_idx = -1;
+    for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
+      if (strcmp(result.cands[candidate_idx].label, "13J TAU") == 0) {
+        tau_idx = candidate_idx;
+        break;
+      }
+    }
+    assert(tau_idx >= 0);
+    assert(!result.cands[tau_idx].eliminated);
+    if (result.best_index == tau_idx) {
+      tau_chosen++;
+    }
+  }
+  assert(tau_chosen == best_arm_seeds);
+  printf("cpegstat coverage=%d/%d (%.1f%%), best=%d/%d, tau_eliminated=0\n",
+         covered, coverage_seeds,
+         100.0 * (double)covered / (double)coverage_seeds, tau_chosen,
+         best_arm_seeds);
+  config_destroy(config);
+}
+
 void test_cpeg(void) {
   test_cpeg_endgame();
   test_cpeg_interval_contains_scalar();

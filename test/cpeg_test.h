@@ -3,5 +3,6 @@
 
 void test_cpeg(void);
 void test_cpeg_certified_bag1(void);
+void test_cpeg_statistical_bag1(void);
 
 #endif

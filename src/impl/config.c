@@ -3410,6 +3410,8 @@ static const char *cpeg_certified_status_name(CpegPreStatus status) {
     return "EXACT_VALUES";
   case CPEG_PRE_ESTIMATED:
     return "ESTIMATED";
+  case CPEG_PRE_STATISTICAL:
+    return "STATISTICAL";
   }
   return "UNKNOWN";
 }
@@ -3500,6 +3502,88 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
   free(out);
 }
 
+static bool
+cpeg_statistical_candidate_precedes(const CpegStatisticalResult *result,
+                                    int lhs_idx, int rhs_idx) {
+  if (lhs_idx == result->best_index || rhs_idx == result->best_index) {
+    return lhs_idx == result->best_index;
+  }
+  const CpegStatisticalCand *lhs = &result->cands[lhs_idx];
+  const CpegStatisticalCand *rhs = &result->cands[rhs_idx];
+  if (lhs->estimate != rhs->estimate) {
+    return lhs->estimate > rhs->estimate;
+  }
+  if (lhs->score != rhs->score) {
+    return lhs->score > rhs->score;
+  }
+  return strcmp(lhs->label, rhs->label) < 0;
+}
+
+// Stable, greppable statistical output. The confidence interval covers only
+// outer-world sampling uncertainty; every sampled world's inner draws are
+// enumerated exactly.
+static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
+                                  double budget_seconds,
+                                  ErrorStack *error_stack) {
+  CpegStatisticalResult result;
+  const CpegStatisticalArgs args = {
+      .bag = bag,
+      .allow_exchanges = allow_exchanges,
+      .num_threads = config_get_num_threads(config),
+      .budget_seconds = budget_seconds,
+      .seed = config_get_seed(config),
+      .confidence = 0.95,
+      .max_worlds = 0,
+  };
+  if (cpeg_solve_pre_endgame_statistical(config->game, &args, &result) < 1) {
+    error_stack_push(error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
+                     string_duplicate("cpeg statistical solve failed"));
+    return;
+  }
+
+  const CpegStatisticalCand *best = &result.cands[result.best_index];
+  StringBuilder *lines = string_builder_create();
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-stat status=STATISTICAL best=%s score=%d est=%.9f lo=%.9f "
+      "hi=%.9f confidence=%.6f seed=%llu jobs=%d rounds=%d worlds=%d/%d\n",
+      best->label, best->score, best->estimate, best->lower, best->upper,
+      result.confidence, (unsigned long long)result.seed, result.jobs_completed,
+      result.rounds_completed, result.worlds_sampled, result.worlds_total);
+
+  int order[CPEG_MAX_PRE_CANDS];
+  for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
+    order[candidate_idx] = candidate_idx;
+    int insertion_idx = candidate_idx;
+    while (insertion_idx > 0 &&
+           cpeg_statistical_candidate_precedes(&result, order[insertion_idx],
+                                               order[insertion_idx - 1])) {
+      const int previous = order[insertion_idx - 1];
+      order[insertion_idx - 1] = order[insertion_idx];
+      order[insertion_idx] = previous;
+      insertion_idx--;
+    }
+  }
+  const int output_count = result.count < CONFIG_CPEG_CERT_TOP_K
+                               ? result.count
+                               : CONFIG_CPEG_CERT_TOP_K;
+  for (int rank_idx = 0; rank_idx < output_count; rank_idx++) {
+    const CpegStatisticalCand *candidate = &result.cands[order[rank_idx]];
+    string_builder_add_formatted_string(
+        lines,
+        "cpeg-stat-cand %d %s %d est=%.9f lo=%.9f hi=%.9f variance=%.9f "
+        "sampled=%d eliminated=%d elimination_round=%d\n",
+        rank_idx + 1, candidate->label, candidate->score, candidate->estimate,
+        candidate->lower, candidate->upper, candidate->sample_variance,
+        candidate->worlds_sampled, candidate->eliminated ? 1 : 0,
+        candidate->elimination_round);
+  }
+  char *out = string_builder_dump(lines, NULL);
+  string_builder_destroy(lines);
+  thread_control_print(config->thread_control, out);
+  free(out);
+}
+
 // Crossplay endgame / pre-endgame solver command.
 //   cpeg                 -> bag-empty endgame (both racks known in the CGP).
 //   cpeg <bag>           -> pre-endgame with the given true bag size (1-4); the
@@ -3510,6 +3594,7 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
 //                           free; "noexch" may also appear without a bag.
 //   cpeg <bag> [noexch] budget <seconds> -> budgeted certified solver. The
 //                           options are order-free; budget's value follows it.
+//   cpeg <bag> [noexch] estimate <seconds> -> seeded 95% statistical estimate.
 void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (!config_has_game_data(config)) {
     error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
@@ -3521,6 +3606,7 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   int bag = 0;
   bool allow_exchanges = true;
   bool use_certified = false;
+  bool use_statistical = false;
   double budget_seconds = 0.0;
   const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
   for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
@@ -3530,14 +3616,17 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
     if (strings_equal(value, "noexch")) {
       allow_exchanges = false;
-    } else if (strings_equal(value, "budget")) {
-      if (use_certified || arg_idx + 1 >= n_args) {
+    } else if (strings_equal(value, "budget") ||
+               strings_equal(value, "estimate")) {
+      if (use_certified || use_statistical || arg_idx + 1 >= n_args) {
         error_stack_push(
             error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_DOUBLE_ARG,
-            string_duplicate("cpeg budget requires one positive finite value"));
+            string_duplicate(
+                "cpeg budget/estimate requires one positive finite value"));
         return;
       }
-      use_certified = true;
+      use_certified = strings_equal(value, "budget");
+      use_statistical = !use_certified;
       const char *budget_value =
           config_get_parg_value(config, ARG_TOKEN_CPEG, ++arg_idx);
       budget_seconds = string_to_double(budget_value, error_stack);
@@ -3546,7 +3635,8 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
         if (error_stack_is_empty(error_stack)) {
           error_stack_push(
               error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_DOUBLE_ARG,
-              string_duplicate("cpeg budget must be positive and finite"));
+              string_duplicate(
+                  "cpeg budget/estimate must be positive and finite"));
         }
         return;
       }
@@ -3559,9 +3649,10 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   }
 
   if (bag <= 0) {
-    if (use_certified) {
-      error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
-                       string_duplicate("cpeg budget requires a bag size"));
+    if (use_certified || use_statistical) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+          string_duplicate("cpeg budget/estimate requires a bag size"));
       return;
     }
     impl_cpeg_endgame(config, error_stack);
@@ -3577,6 +3668,11 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (use_certified) {
     impl_cpeg_certified(config, bag, allow_exchanges, budget_seconds,
                         error_stack);
+    return;
+  }
+  if (use_statistical) {
+    impl_cpeg_statistical(config, bag, allow_exchanges, budget_seconds,
+                          error_stack);
     return;
   }
   impl_cpeg_pre_endgame(config, bag, allow_exchanges);
