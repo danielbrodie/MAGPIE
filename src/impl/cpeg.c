@@ -23,6 +23,7 @@
 #include "move_gen.h"
 #include "peg_combinatorics.h"
 #include "peg_pool.h"
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -415,6 +416,226 @@ int cpeg_score_upper_bound(const Board *board, const Game *game) {
     }
   }
   return (int)best;
+}
+
+static double cpeg_down_add(double lhs, double rhs) {
+  return nextafter(lhs + rhs, -INFINITY);
+}
+
+static double cpeg_up_add(double lhs, double rhs) {
+  return nextafter(lhs + rhs, INFINITY);
+}
+
+static double cpeg_down_mul(double lhs, double rhs) {
+  return nextafter(lhs * rhs, -INFINITY);
+}
+
+static double cpeg_up_mul(double lhs, double rhs) {
+  return nextafter(lhs * rhs, INFINITY);
+}
+
+static double cpeg_down_div(double numerator, double denominator) {
+  return nextafter(numerator / denominator, -INFINITY);
+}
+
+static double cpeg_up_div(double numerator, double denominator) {
+  return nextafter(numerator / denominator, INFINITY);
+}
+
+CpegInterval cpeg_placement_prior(int score, int bag, int tiles_played,
+                                  int score_upper_bound) {
+  const int tiles_drawn = tiles_played < bag ? tiles_played : bag;
+  const int remaining_bag = bag - tiles_drawn;
+  const double radius = (double)(remaining_bag + 2) * (double)score_upper_bound;
+  const CpegInterval prior = {
+      .lo = (double)score - radius,
+      .hi = (double)score + radius,
+  };
+  return prior;
+}
+
+CpegInterval cpeg_scoreless_prior(int bag, int score_upper_bound) {
+  const double radius = (double)(bag + 2) * (double)score_upper_bound;
+  const CpegInterval prior = {.lo = -radius, .hi = radius};
+  return prior;
+}
+
+void cpeg_cand_state_init(CpegCandState *state, CpegInterval prior,
+                          const CpegStableRank *rank) {
+  memset(state, 0, sizeof(*state));
+  state->prior = prior;
+  state->prior_magnitude = fmax(fabs(prior.lo), fabs(prior.hi));
+  state->rank = *rank;
+  state->expectation = prior;
+}
+
+static bool cpeg_rank_precedes(const CpegCandState *lhs,
+                               const CpegCandState *rhs) {
+  if (lhs->rank.immediate_score != rhs->rank.immediate_score) {
+    return lhs->rank.immediate_score > rhs->rank.immediate_score;
+  }
+  if (lhs->rank.kind != rhs->rank.kind) {
+    return lhs->rank.kind < rhs->rank.kind;
+  }
+  const int label_comparison = strcmp(lhs->rank.label, rhs->rank.label);
+  if (label_comparison != 0) {
+    return label_comparison < 0;
+  }
+  return lhs->rank.generation_index < rhs->rank.generation_index;
+}
+
+static bool cpeg_better_lower(const CpegCandState *states, int candidate_idx,
+                              int best_idx) {
+  return best_idx < 0 ||
+         states[candidate_idx].expectation.lo >
+             states[best_idx].expectation.lo ||
+         (states[candidate_idx].expectation.lo ==
+              states[best_idx].expectation.lo &&
+          cpeg_rank_precedes(&states[candidate_idx], &states[best_idx]));
+}
+
+static double cpeg_interval_midpoint(CpegInterval interval) {
+  return interval.lo / 2.0 + interval.hi / 2.0;
+}
+
+static bool cpeg_better_midpoint(const CpegCandState *states, int candidate_idx,
+                                 int best_idx) {
+  if (best_idx < 0) {
+    return true;
+  }
+  const double midpoint =
+      cpeg_interval_midpoint(states[candidate_idx].expectation);
+  const double best_midpoint =
+      cpeg_interval_midpoint(states[best_idx].expectation);
+  return midpoint > best_midpoint ||
+         (midpoint == best_midpoint &&
+          cpeg_rank_precedes(&states[candidate_idx], &states[best_idx]));
+}
+
+void cpeg_coordinator_recompute(CpegCandState *states, int candidate_count,
+                                const CpegWorldEval *evaluations,
+                                const int64_t *world_weights, int world_count,
+                                CpegCoordinatorResult *result) {
+  int64_t total_weight = 0;
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    total_weight += world_weights[world_idx];
+  }
+
+  bool all_resolved = true;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    CpegCandState *state = &states[candidate_idx];
+    state->worlds_resolved = 0;
+    state->resolved_weight = 0;
+    state->weighted_lower_sum = 0.0;
+    state->weighted_upper_sum = 0.0;
+    for (int world_idx = 0; world_idx < world_count; world_idx++) {
+      const CpegWorldEval *evaluation =
+          &evaluations[candidate_idx * world_count + world_idx];
+      if (!evaluation->resolved) {
+        all_resolved = false;
+        continue;
+      }
+      const double weight = (double)world_weights[world_idx];
+      state->worlds_resolved++;
+      state->resolved_weight += world_weights[world_idx];
+      state->weighted_lower_sum =
+          cpeg_down_add(state->weighted_lower_sum,
+                        cpeg_down_mul(weight, evaluation->value.lo));
+      state->weighted_upper_sum = cpeg_up_add(
+          state->weighted_upper_sum, cpeg_up_mul(weight, evaluation->value.hi));
+    }
+
+    const int64_t unresolved_weight = total_weight - state->resolved_weight;
+    double lower_numerator = state->weighted_lower_sum;
+    double upper_numerator = state->weighted_upper_sum;
+    if (unresolved_weight > 0) {
+      lower_numerator = cpeg_down_add(
+          lower_numerator,
+          cpeg_down_mul((double)unresolved_weight, state->prior.lo));
+      upper_numerator =
+          cpeg_up_add(upper_numerator,
+                      cpeg_up_mul((double)unresolved_weight, state->prior.hi));
+    }
+    state->expectation.lo =
+        cpeg_down_div(lower_numerator, (double)total_weight);
+    state->expectation.hi = cpeg_up_div(upper_numerator, (double)total_weight);
+  }
+
+  int incumbent_idx = -1;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (!states[candidate_idx].eliminated &&
+        cpeg_better_lower(states, candidate_idx, incumbent_idx)) {
+      incumbent_idx = candidate_idx;
+    }
+  }
+  const double best_active_lower = states[incumbent_idx].expectation.lo;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (!states[candidate_idx].eliminated &&
+        states[candidate_idx].expectation.hi < best_active_lower) {
+      states[candidate_idx].eliminated = true;
+    }
+  }
+
+  int lower_best_idx = -1;
+  int midpoint_best_idx = -1;
+  double maximum_upper = -INFINITY;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (cpeg_better_lower(states, candidate_idx, lower_best_idx)) {
+      lower_best_idx = candidate_idx;
+    }
+    if (!states[candidate_idx].eliminated &&
+        cpeg_better_midpoint(states, candidate_idx, midpoint_best_idx)) {
+      midpoint_best_idx = candidate_idx;
+    }
+    if (states[candidate_idx].expectation.hi > maximum_upper) {
+      maximum_upper = states[candidate_idx].expectation.hi;
+    }
+  }
+
+  double other_maximum_upper = -INFINITY;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx != lower_best_idx &&
+        states[candidate_idx].expectation.hi > other_maximum_upper) {
+      other_maximum_upper = states[candidate_idx].expectation.hi;
+    }
+  }
+  const bool certified =
+      candidate_count == 1 ||
+      states[lower_best_idx].expectation.lo >= other_maximum_upper;
+
+  if (all_resolved) {
+    result->status = CPEG_COORDINATOR_EXACT_VALUES;
+    result->best_index = midpoint_best_idx;
+  } else if (certified) {
+    result->status = CPEG_COORDINATOR_CERTIFIED;
+    result->best_index = lower_best_idx;
+  } else {
+    result->status = CPEG_COORDINATOR_PENDING;
+    result->best_index = midpoint_best_idx;
+  }
+
+  double selected_other_maximum_upper = -INFINITY;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx != result->best_index &&
+        states[candidate_idx].expectation.hi > selected_other_maximum_upper) {
+      selected_other_maximum_upper = states[candidate_idx].expectation.hi;
+    }
+  }
+  const CpegInterval best = states[result->best_index].expectation;
+  result->unique_best =
+      result->status != CPEG_COORDINATOR_PENDING &&
+      (candidate_count == 1 || best.lo > selected_other_maximum_upper);
+  result->value_error_bound = (best.hi - best.lo) / 2.0;
+  result->decision_regret_bound = maximum_upper - best.lo;
+  if (result->decision_regret_bound < 0.0) {
+    result->decision_regret_bound = 0.0;
+  }
 }
 
 // ---------------------------------------------------------------------------

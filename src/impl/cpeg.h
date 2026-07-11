@@ -4,6 +4,7 @@
 #include "../ent/game.h"
 #include "../ent/move.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 // Maximum rendered length of a single move string ("<coord> <word>") plus its
 // terminator. A move spans at most BOARD_DIM tiles with a two-character coord,
@@ -55,6 +56,87 @@ int cpeg_score_upper_bound(const Board *board, const Game *game);
 // than cap entries. Exposed so capacity assumptions can be tested directly.
 bool cpeg_submultiset_capacity_overflows(const int *counts, int ld_size, int k,
                                          int cap);
+
+// ---------------------------------------------------------------------------
+// Certified pre-endgame coordinator.
+//
+// This layer is deliberately independent of the solver and scheduler. A later
+// stage supplies one evaluated interval for each (candidate, world) pair; the
+// coordinator only aggregates those intervals and applies the proof rules.
+// ---------------------------------------------------------------------------
+
+typedef struct CpegInterval {
+  double lo;
+  double hi;
+} CpegInterval;
+
+typedef enum CpegCandKind {
+  CPEG_CAND_PLACEMENT,
+  CPEG_CAND_EXCHANGE,
+  CPEG_CAND_PASS,
+} CpegCandKind;
+
+// The deterministic candidate ordering, in priority order. immediate_score is
+// descending; kind, label, and generation_index are ascending.
+typedef struct CpegStableRank {
+  int immediate_score;
+  CpegCandKind kind;
+  char label[CPEG_MOVE_STR_LEN];
+  int generation_index;
+} CpegStableRank;
+
+typedef struct CpegCandState {
+  CpegInterval prior;
+  // Symmetric magnitude retained for diagnostics; aggregation uses the tighter
+  // asymmetric prior.lo/prior.hi endpoints.
+  double prior_magnitude;
+  CpegStableRank rank;
+
+  int worlds_resolved;
+  int64_t resolved_weight;
+  double weighted_lower_sum;
+  double weighted_upper_sum;
+  CpegInterval expectation;
+  bool eliminated;
+} CpegCandState;
+
+typedef struct CpegWorldEval {
+  CpegInterval value;
+  bool resolved;
+} CpegWorldEval;
+
+typedef enum CpegCoordinatorStatus {
+  CPEG_COORDINATOR_PENDING,
+  CPEG_COORDINATOR_CERTIFIED,
+  CPEG_COORDINATOR_EXACT_VALUES,
+} CpegCoordinatorStatus;
+
+typedef struct CpegCoordinatorResult {
+  CpegCoordinatorStatus status;
+  int best_index;
+  bool unique_best;
+  double value_error_bound;
+  double decision_regret_bound;
+} CpegCoordinatorResult;
+
+// Safe prior bounds derived from Stage 2's single-move score upper bound.
+CpegInterval cpeg_placement_prior(int score, int bag, int tiles_played,
+                                  int score_upper_bound);
+CpegInterval cpeg_scoreless_prior(int bag, int score_upper_bound);
+
+void cpeg_cand_state_init(CpegCandState *state, CpegInterval prior,
+                          const CpegStableRank *rank);
+
+// Recompute every candidate interval from a candidate-major evaluations array:
+// evaluations[candidate_index * world_count + world_index]. Existing
+// elimination flags are sticky. All weights must be positive and counts must
+// be nonzero. EXACT_VALUES takes precedence over CERTIFIED; when the result is
+// PENDING, best_index is the stable argmax of interval midpoint for an
+// ESTIMATED result chosen by the caller.
+void cpeg_coordinator_recompute(CpegCandState *states, int candidate_count,
+                                const CpegWorldEval *evaluations,
+                                const int64_t *world_weights, int world_count,
+                                CpegCoordinatorResult *result);
 
 // ---------------------------------------------------------------------------
 // Pre-endgame (bag 1-4): exact expectiminimax under Crossplay rules.

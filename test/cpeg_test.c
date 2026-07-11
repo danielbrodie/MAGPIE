@@ -28,6 +28,8 @@ enum {
   CPEG_UNDO_MOVE_CAP = 16384,
   CPEG_UNDO_MAX_DEPTH = 3,
   CPEG_UNDO_TRIALS = 1000,
+  CPEG_COORDINATOR_RANDOM_TRIALS = 1000,
+  CPEG_COORDINATOR_RANDOM_WORLDS = 7,
 };
 
 // A real Crossplay bag-empty position (the endgame_final_turn.png fixture the
@@ -548,11 +550,253 @@ static void test_cpeg_enumeration_capacity_guard(void) {
   assert(!cpeg_submultiset_capacity_overflows(counts, 3, 2, 3));
 }
 
+static void cpeg_test_init_states(CpegCandState *states,
+                                  const CpegInterval *priors,
+                                  const CpegStableRank *ranks,
+                                  int candidate_count) {
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    cpeg_cand_state_init(&states[candidate_idx], priors[candidate_idx],
+                         &ranks[candidate_idx]);
+  }
+}
+
+static void test_cpeg_coordinator_aggregation(void) {
+  const int64_t weights[] = {1, 3};
+  const CpegInterval priors[] = {{.lo = 0.0, .hi = 20.0},
+                                 {.lo = -10.0, .hi = 10.0}};
+  const CpegStableRank ranks[] = {
+      {.immediate_score = 20,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "first",
+       .generation_index = 0},
+      {.immediate_score = 10,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "second",
+       .generation_index = 1},
+  };
+  CpegCandState states[2];
+  cpeg_test_init_states(states, priors, ranks, 2);
+  CpegWorldEval evaluations[4] = {
+      {.value = {.lo = 4.0, .hi = 6.0}, .resolved = true},
+      {.value = {.lo = 0.0, .hi = 0.0}, .resolved = false},
+      {.value = {.lo = 0.0, .hi = 0.0}, .resolved = false},
+      {.value = {.lo = 0.0, .hi = 0.0}, .resolved = false},
+  };
+  CpegCoordinatorResult result;
+  cpeg_coordinator_recompute(states, 2, evaluations, weights, 2, &result);
+  assert(states[0].worlds_resolved == 1);
+  assert(states[0].resolved_weight == 1);
+  assert(states[0].expectation.lo <= 1.0);
+  assert(fabs(states[0].expectation.lo - 1.0) < 1e-12);
+  assert(states[0].expectation.hi >= 16.5);
+  assert(fabs(states[0].expectation.hi - 16.5) < 1e-12);
+  assert(states[1].expectation.lo <= -10.0);
+  assert(states[1].expectation.hi >= 10.0);
+  assert(result.status == CPEG_COORDINATOR_PENDING);
+  assert(result.best_index == 0);
+  assert(fabs(result.value_error_bound - 7.75) < 1e-12);
+  assert(fabs(result.decision_regret_bound - 15.5) < 1e-12);
+
+  evaluations[0].value = (CpegInterval){.lo = 4.0, .hi = 4.0};
+  evaluations[1] =
+      (CpegWorldEval){.value = {.lo = 8.0, .hi = 8.0}, .resolved = true};
+  evaluations[2] =
+      (CpegWorldEval){.value = {.lo = 2.0, .hi = 2.0}, .resolved = true};
+  evaluations[3] =
+      (CpegWorldEval){.value = {.lo = 2.0, .hi = 2.0}, .resolved = true};
+  cpeg_coordinator_recompute(states, 2, evaluations, weights, 2, &result);
+  assert(result.status == CPEG_COORDINATOR_EXACT_VALUES);
+  assert(states[0].worlds_resolved == 2);
+  assert(states[0].resolved_weight == 4);
+  assert(states[0].expectation.lo <= 7.0);
+  assert(states[0].expectation.hi >= 7.0);
+  assert(states[0].expectation.hi - states[0].expectation.lo < 1e-12);
+  assert(states[1].expectation.lo <= 2.0);
+  assert(states[1].expectation.hi >= 2.0);
+  assert(states[1].expectation.hi - states[1].expectation.lo < 1e-12);
+  assert(result.best_index == 0);
+
+  const CpegInterval placement =
+      cpeg_placement_prior(/*score=*/16, /*bag=*/4, /*tiles_played=*/3,
+                           /*score_upper_bound=*/100);
+  assert(placement.lo == -284.0);
+  assert(placement.hi == 316.0);
+  const CpegInterval scoreless =
+      cpeg_scoreless_prior(/*bag=*/4, /*score_upper_bound=*/100);
+  assert(scoreless.lo == -600.0);
+  assert(scoreless.hi == 600.0);
+}
+
+static void test_cpeg_coordinator_tau_and_certification(void) {
+  const int64_t weights[] = {1, 1};
+  const CpegInterval priors[] = {
+      {.lo = 5.0, .hi = 15.0},
+      {.lo = -100.0, .hi = 100.0},
+      {.lo = -100.0, .hi = 5.0},
+  };
+  const CpegStableRank ranks[] = {
+      {.immediate_score = 40,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "high-score",
+       .generation_index = 0},
+      {.immediate_score = 16,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "tau-shape",
+       .generation_index = 1},
+      {.immediate_score = 0,
+       .kind = CPEG_CAND_PASS,
+       .label = "pass",
+       .generation_index = 2},
+  };
+  CpegCandState states[3];
+  cpeg_test_init_states(states, priors, ranks, 3);
+  CpegWorldEval evaluations[6] = {
+      {.value = {.lo = 10.0, .hi = 10.0}, .resolved = true},
+      {.value = {.lo = 10.0, .hi = 10.0}, .resolved = true},
+      {.value = {.lo = 30.0, .hi = 30.0}, .resolved = true},
+      {.value = {.lo = 0.0, .hi = 0.0}, .resolved = false},
+      {.value = {.lo = 0.0, .hi = 0.0}, .resolved = true},
+      {.value = {.lo = 0.0, .hi = 0.0}, .resolved = false},
+  };
+  CpegCoordinatorResult result;
+  cpeg_coordinator_recompute(states, 3, evaluations, weights, 2, &result);
+  assert(!states[1].eliminated);
+  assert(states[1].expectation.hi >= 65.0);
+  assert(result.status == CPEG_COORDINATOR_PENDING);
+
+  evaluations[3] =
+      (CpegWorldEval){.value = {.lo = 20.0, .hi = 20.0}, .resolved = true};
+  cpeg_coordinator_recompute(states, 3, evaluations, weights, 2, &result);
+  assert(result.status == CPEG_COORDINATOR_CERTIFIED);
+  assert(result.best_index == 1);
+  assert(result.unique_best);
+
+  evaluations[5] =
+      (CpegWorldEval){.value = {.lo = 1.0, .hi = 1.0}, .resolved = true};
+  cpeg_coordinator_recompute(states, 3, evaluations, weights, 2, &result);
+  assert(result.status == CPEG_COORDINATOR_EXACT_VALUES);
+  assert(result.best_index == 1);
+}
+
+static void test_cpeg_coordinator_elimination(void) {
+  const int64_t weights[] = {1, 1};
+  const CpegInterval priors[] = {{.lo = 8.0, .hi = 12.0},
+                                 {.lo = -5.0, .hi = 5.0}};
+  const CpegStableRank ranks[] = {
+      {.immediate_score = 20,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "winner",
+       .generation_index = 0},
+      {.immediate_score = 10,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "loser",
+       .generation_index = 1},
+  };
+  CpegCandState states[2];
+  cpeg_test_init_states(states, priors, ranks, 2);
+  CpegWorldEval evaluations[4] = {
+      {.value = {.lo = 10.0, .hi = 10.0}, .resolved = true},
+      {.value = {.lo = 10.0, .hi = 10.0}, .resolved = true},
+      {.value = {.lo = 4.0, .hi = 4.0}, .resolved = true},
+      {.value = {.lo = 0.0, .hi = 0.0}, .resolved = false},
+  };
+  CpegCoordinatorResult result;
+  cpeg_coordinator_recompute(states, 2, evaluations, weights, 2, &result);
+  assert(states[1].expectation.hi < states[0].expectation.lo);
+  assert(states[1].eliminated);
+  assert(result.status == CPEG_COORDINATOR_CERTIFIED);
+  assert(result.best_index == 0);
+
+  evaluations[3] =
+      (CpegWorldEval){.value = {.lo = 5.0, .hi = 5.0}, .resolved = true};
+  cpeg_coordinator_recompute(states, 2, evaluations, weights, 2, &result);
+  assert(states[1].eliminated);
+  assert(result.status == CPEG_COORDINATOR_EXACT_VALUES);
+  assert(result.best_index == 0);
+}
+
+static void test_cpeg_coordinator_tie(void) {
+  const int64_t weights[] = {1, 3};
+  const CpegInterval priors[] = {{.lo = -10.0, .hi = 10.0},
+                                 {.lo = -10.0, .hi = 10.0}};
+  const CpegStableRank ranks[] = {
+      {.immediate_score = 10,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "stable-first",
+       .generation_index = 1},
+      {.immediate_score = 10,
+       .kind = CPEG_CAND_PLACEMENT,
+       .label = "stable-second",
+       .generation_index = 0},
+  };
+  CpegCandState states[2];
+  cpeg_test_init_states(states, priors, ranks, 2);
+  const CpegWorldEval evaluations[4] = {
+      {.value = {.lo = 2.0, .hi = 2.0}, .resolved = true},
+      {.value = {.lo = 6.0, .hi = 6.0}, .resolved = true},
+      {.value = {.lo = 2.0, .hi = 2.0}, .resolved = true},
+      {.value = {.lo = 6.0, .hi = 6.0}, .resolved = true},
+  };
+  CpegCoordinatorResult result;
+  cpeg_coordinator_recompute(states, 2, evaluations, weights, 2, &result);
+  assert(result.status == CPEG_COORDINATOR_EXACT_VALUES);
+  assert(result.best_index == 0);
+  assert(!result.unique_best);
+}
+
+static void test_cpeg_coordinator_outward_rounding(void) {
+  const int64_t weights[CPEG_COORDINATOR_RANDOM_WORLDS] = {1, 2,  3, 5,
+                                                           7, 11, 13};
+  int64_t total_weight = 0;
+  for (int world_idx = 0; world_idx < CPEG_COORDINATOR_RANDOM_WORLDS;
+       world_idx++) {
+    total_weight += weights[world_idx];
+  }
+  const CpegInterval prior = {.lo = -1000.0, .hi = 1000.0};
+  const CpegStableRank rank = {
+      .immediate_score = 0,
+      .kind = CPEG_CAND_PLACEMENT,
+      .label = "random",
+      .generation_index = 0,
+  };
+  CpegWorldEval evaluations[CPEG_COORDINATOR_RANDOM_WORLDS];
+  CpegCoordinatorResult result;
+  for (int trial = 0; trial < CPEG_COORDINATOR_RANDOM_TRIALS; trial++) {
+    CpegCandState state;
+    cpeg_cand_state_init(&state, prior, &rank);
+    long double true_weighted_sum = 0.0L;
+    for (int world_idx = 0; world_idx < CPEG_COORDINATOR_RANDOM_WORLDS;
+         world_idx++) {
+      const double value =
+          ((double)(int32_t)cpeg_test_random() / 4294967296.0) * 1000.0;
+      evaluations[world_idx] = (CpegWorldEval){
+          .value = {.lo = value, .hi = value}, .resolved = true};
+      true_weighted_sum += (long double)weights[world_idx] * (long double)value;
+    }
+    const long double true_mean = true_weighted_sum / (long double)total_weight;
+    cpeg_coordinator_recompute(&state, 1, evaluations, weights,
+                               CPEG_COORDINATOR_RANDOM_WORLDS, &result);
+    assert((long double)state.expectation.lo <= true_mean);
+    assert(true_mean <= (long double)state.expectation.hi);
+    assert(result.status == CPEG_COORDINATOR_EXACT_VALUES);
+  }
+}
+
+static void test_cpeg_coordinator(void) {
+  test_cpeg_coordinator_aggregation();
+  test_cpeg_coordinator_tau_and_certification();
+  test_cpeg_coordinator_elimination();
+  test_cpeg_coordinator_tie();
+  test_cpeg_coordinator_outward_rounding();
+}
+
 void test_cpeg(void) {
   test_cpeg_endgame();
   test_cpeg_pre_endgame();
   test_cpeg_candidate_legality();
   test_cpeg_score_upper_bound();
   test_cpeg_enumeration_capacity_guard();
+  test_cpeg_coordinator();
   test_cpeg_incremental_round_trip();
 }
