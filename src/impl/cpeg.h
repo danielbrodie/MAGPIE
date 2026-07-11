@@ -189,6 +189,8 @@ typedef struct CpegCertifiedArgs {
   int num_threads;
   double budget_seconds;
   int batch_size;
+  // Internal/test-only deterministic work budget; zero is unbounded.
+  int max_batches;
 } CpegCertifiedArgs;
 
 typedef struct CpegCertifiedCand {
@@ -209,6 +211,7 @@ typedef struct CpegCertifiedResult {
   int best_index;
   int worlds_total;
   int jobs_completed;
+  int batches_completed;
   double optimum_lower;
   double optimum_upper;
   double decision_regret_bound;
@@ -237,8 +240,11 @@ typedef struct CpegCertifiedResult {
 int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
                            int num_threads, CpegPreResult *out);
 
-// Deterministic batched certified solve. budget_seconds is reserved for the
-// budgeted stage; zero runs until CERTIFIED or EXACT_VALUES.
+// Deterministic batched certified solve. A zero wall-clock or work budget is
+// unbounded. Wall-clock ESTIMATED results are not bit-identical across machines
+// or load because different complete-batch prefixes may finish; the schedule is
+// deterministic, and a given batches_completed count reproduces exactly. A
+// certified move cannot change except among exact co-optima.
 int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
                                      CpegCertifiedResult *out);
 

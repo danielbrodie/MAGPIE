@@ -828,63 +828,128 @@ static int cpeg_find_certified_candidate(const CpegCertifiedResult *result,
   return -1;
 }
 
-static void cpeg_assert_certified_bag1_mode(Config *config,
-                                            bool allow_exchanges) {
-  CpegCertifiedResult single_threaded;
-  CpegCertifiedResult four_threaded;
-  CpegPreResult oracle;
+static void
+cpeg_assert_certified_results_equal(const CpegCertifiedResult *lhs,
+                                    const CpegCertifiedResult *rhs) {
+  assert(lhs->status == rhs->status);
+  assert(lhs->count == rhs->count);
+  assert(lhs->best_index == rhs->best_index);
+  assert(lhs->worlds_total == rhs->worlds_total);
+  assert(lhs->jobs_completed == rhs->jobs_completed);
+  assert(lhs->batches_completed == rhs->batches_completed);
+  assert(lhs->optimum_lower == rhs->optimum_lower);
+  assert(lhs->optimum_upper == rhs->optimum_upper);
+  assert(lhs->decision_regret_bound == rhs->decision_regret_bound);
+  assert(lhs->unique_best == rhs->unique_best);
+  for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
+    const CpegCertifiedCand *lhs_candidate = &lhs->cands[candidate_idx];
+    const CpegCertifiedCand *rhs_candidate = &rhs->cands[candidate_idx];
+    assert_strings_equal(lhs_candidate->label, rhs_candidate->label);
+    assert(lhs_candidate->score == rhs_candidate->score);
+    assert(lhs_candidate->estimate == rhs_candidate->estimate);
+    assert(lhs_candidate->lower == rhs_candidate->lower);
+    assert(lhs_candidate->upper == rhs_candidate->upper);
+    assert(lhs_candidate->value_error_bound ==
+           rhs_candidate->value_error_bound);
+    assert(lhs_candidate->worlds_resolved == rhs_candidate->worlds_resolved);
+    assert(lhs_candidate->eliminated == rhs_candidate->eliminated);
+  }
+}
+
+static void
+cpeg_assert_best_interval_contains_oracle(const CpegCertifiedResult *result,
+                                          const CpegPreResult *oracle) {
+  assert(result->best_index >= 0);
+  const CpegCertifiedCand *best = &result->cands[result->best_index];
+  const double exact = cpeg_find_spread(oracle, best->label);
+  assert(isfinite(exact));
+  assert(best->lower <= exact);
+  assert(best->upper >= exact);
+}
+
+static void cpeg_assert_certified_bag1_exact(Config *config,
+                                             bool allow_exchanges) {
+  CpegCertifiedResult result;
   const CpegCertifiedArgs args = {
       .bag = 1,
       .allow_exchanges = allow_exchanges,
-      .num_threads = 1,
-      .budget_seconds = 0.0,
+      .num_threads = 4,
+      .budget_seconds = 60.0,
       .batch_size = 16,
+      .max_batches = 0,
   };
 
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_certified(config_get_game(config), &args,
-                                          &single_threaded) > 0);
-  assert(single_threaded.status == CPEG_PRE_CERTIFIED ||
-         single_threaded.status == CPEG_PRE_EXACT_VALUES);
-  assert(single_threaded.best_index >= 0);
-  assert_strings_equal(single_threaded.cands[single_threaded.best_index].label,
-                       "13J TAU");
-  const int tau_idx =
-      cpeg_find_certified_candidate(&single_threaded, "13J TAU");
+                                          &result) > 0);
+  assert(result.status == CPEG_PRE_EXACT_VALUES);
+  assert(result.best_index >= 0);
+  assert_strings_equal(result.cands[result.best_index].label, "13J TAU");
+  const int tau_idx = cpeg_find_certified_candidate(&result, "13J TAU");
   assert(tau_idx >= 0);
-  assert(single_threaded.cands[tau_idx].lower <= 44.125);
-  assert(single_threaded.cands[tau_idx].upper >= 44.125);
+  assert(result.cands[tau_idx].lower <= 44.125);
+  assert(result.cands[tau_idx].upper >= 44.125);
+}
 
-  CpegCertifiedArgs parallel_args = args;
+static void cpeg_assert_certified_bag1_early_stop(Config *config) {
+  CpegPreResult oracle;
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  assert(cpeg_solve_pre_endgame(config_get_game(config), /*bag=*/1,
+                                /*allow_exchanges=*/false, /*num_threads=*/4,
+                                &oracle) > 0);
+
+  const CpegCertifiedArgs work_args = {
+      .bag = 1,
+      .allow_exchanges = false,
+      .num_threads = 1,
+      .budget_seconds = 0.0,
+      .batch_size = 16,
+      .max_batches = 2,
+  };
+  CpegCertifiedResult single_threaded;
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  assert(cpeg_solve_pre_endgame_certified(config_get_game(config), &work_args,
+                                          &single_threaded) > 0);
+  assert(single_threaded.status == CPEG_PRE_ESTIMATED ||
+         single_threaded.status == CPEG_PRE_CERTIFIED);
+  assert(single_threaded.batches_completed == work_args.max_batches);
+  cpeg_assert_best_interval_contains_oracle(&single_threaded, &oracle);
+
+  CpegCertifiedArgs parallel_args = work_args;
   parallel_args.num_threads = 4;
+  CpegCertifiedResult four_threaded;
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_certified(config_get_game(config),
                                           &parallel_args, &four_threaded) > 0);
-  assert(four_threaded.status == single_threaded.status);
-  assert_strings_equal(four_threaded.cands[four_threaded.best_index].label,
-                       single_threaded.cands[single_threaded.best_index].label);
-  const int parallel_best_idx = four_threaded.best_index;
-  const int single_best_idx = single_threaded.best_index;
-  assert(four_threaded.cands[parallel_best_idx].lower ==
-         single_threaded.cands[single_best_idx].lower);
-  assert(four_threaded.cands[parallel_best_idx].upper ==
-         single_threaded.cands[single_best_idx].upper);
+  cpeg_assert_certified_results_equal(&single_threaded, &four_threaded);
 
+  CpegCertifiedArgs wall_args = work_args;
+  wall_args.num_threads = 4;
+  wall_args.budget_seconds = 0.001;
+  wall_args.max_batches = 0;
+  CpegCertifiedResult wall_limited;
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
-  assert(cpeg_solve_pre_endgame(config_get_game(config), /*bag=*/1,
-                                allow_exchanges, /*num_threads=*/1,
-                                &oracle) > 0);
-  assert(oracle.count > 0);
-  assert_strings_equal(single_threaded.cands[single_threaded.best_index].label,
-                       oracle.cands[0].label);
+  Game *wall_game = config_get_game(config);
+  game_gen_all_cross_sets(wall_game);
+  board_set_cross_sets_valid(game_get_board(wall_game), true);
+  Game *before = game_duplicate(wall_game);
+  assert(cpeg_solve_pre_endgame_certified(wall_game, &wall_args,
+                                          &wall_limited) > 0);
+  cpeg_test_assert_state_equal(before, wall_game);
+  game_destroy(before);
+  assert(wall_limited.status == CPEG_PRE_ESTIMATED ||
+         wall_limited.status == CPEG_PRE_CERTIFIED ||
+         wall_limited.status == CPEG_PRE_EXACT_VALUES);
+  cpeg_assert_best_interval_contains_oracle(&wall_limited, &oracle);
 }
 
 void test_cpeg_certified_bag1(void) {
   Config *config = config_create_or_die(
       "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
       "NWL23_crossplay -s1 score -s2 score -threads 1");
-  cpeg_assert_certified_bag1_mode(config, /*allow_exchanges=*/false);
-  cpeg_assert_certified_bag1_mode(config, /*allow_exchanges=*/true);
+  cpeg_assert_certified_bag1_exact(config, /*allow_exchanges=*/false);
+  cpeg_assert_certified_bag1_exact(config, /*allow_exchanges=*/true);
+  cpeg_assert_certified_bag1_early_stop(config);
   config_destroy(config);
 }
 
