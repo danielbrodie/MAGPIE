@@ -1,13 +1,18 @@
 #include "../src/def/equity_defs.h"
 #include "../src/def/game_history_defs.h"
 #include "../src/def/move_defs.h"
+#include "../src/ent/bag.h"
 #include "../src/ent/board.h"
 #include "../src/ent/equity.h"
 #include "../src/ent/game.h"
 #include "../src/ent/letter_distribution.h"
 #include "../src/ent/move.h"
+#include "../src/ent/move_undo.h"
+#include "../src/ent/player.h"
+#include "../src/ent/rack.h"
 #include "../src/impl/config.h"
 #include "../src/impl/cpeg.h"
+#include "../src/impl/gameplay.h"
 #include "../src/impl/move_gen.h"
 #include "../src/str/move_string.h"
 #include "../src/util/string_util.h"
@@ -15,7 +20,15 @@
 #include <assert.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+enum {
+  CPEG_UNDO_MOVE_CAP = 16384,
+  CPEG_UNDO_MAX_DEPTH = 3,
+  CPEG_UNDO_TRIALS = 1000,
+};
 
 // A real Crossplay bag-empty position (the endgame_final_turn.png fixture the
 // Python solver pins). Two plies remain: the mover plays C4 EYAS for 32, the
@@ -46,6 +59,247 @@ static const char *const CPEG_PRE_9653_CGP =
     "cgp 7KiNIN3/8G1TORN1/7ON6/7YO6/8R2H3/7BE1BO3/4F2OR1ET1J1/2REAVOW2HE1US/"
     "4TI1SODALITE/4WE1M2V3G/4AD1A1FED2U/CInQS2N1I1E1AE/A2A5L1T1I1/"
     "R2d2ZEAL1O1R1/P2I5Y1X3 DPIATSS/ 0/0 0";
+
+typedef struct CpegTestBranchUndo {
+  Bag *bag;
+  Rack rack;
+  int player_idx;
+  int player_on_turn_idx;
+  int consecutive_scoreless_turns;
+  game_end_reason_t game_end_reason;
+} CpegTestBranchUndo;
+
+static uint64_t cpeg_test_random_state = UINT64_C(0x9e3779b97f4a7c15);
+
+static uint32_t cpeg_test_random(void) {
+  cpeg_test_random_state ^= cpeg_test_random_state >> 12;
+  cpeg_test_random_state ^= cpeg_test_random_state << 25;
+  cpeg_test_random_state ^= cpeg_test_random_state >> 27;
+  return (uint32_t)((cpeg_test_random_state * UINT64_C(2685821657736338717)) >>
+                    32);
+}
+
+static void cpeg_test_save_branch(const Game *game, int player_idx,
+                                  CpegTestBranchUndo *undo) {
+  undo->bag = bag_duplicate(game_get_bag(game));
+  rack_copy(&undo->rack, player_get_rack(game_get_player(game, player_idx)));
+  undo->player_idx = player_idx;
+  undo->player_on_turn_idx = game_get_player_on_turn_index(game);
+  undo->consecutive_scoreless_turns =
+      game_get_consecutive_scoreless_turns(game);
+  undo->game_end_reason = game_get_game_end_reason(game);
+}
+
+static void cpeg_test_restore_branch(Game *game,
+                                     const CpegTestBranchUndo *undo) {
+  bag_copy(game_get_bag(game), undo->bag);
+  rack_copy(player_get_rack(game_get_player(game, undo->player_idx)),
+            &undo->rack);
+  game_set_player_on_turn_index(game, undo->player_on_turn_idx);
+  game_set_consecutive_scoreless_turns(game, undo->consecutive_scoreless_turns);
+  game_set_game_end_reason(game, undo->game_end_reason);
+}
+
+static void cpeg_test_destroy_branch(CpegTestBranchUndo *undo) {
+  bag_destroy(undo->bag);
+}
+
+static void cpeg_test_assert_bag_state_equal(const Bag *expected,
+                                             const Bag *actual) {
+  MachineLetter expected_tiles[MAX_BAG_SIZE];
+  MachineLetter actual_tiles[MAX_BAG_SIZE];
+  const int expected_count = bag_peek_tiles(expected, expected_tiles);
+  const int actual_count = bag_peek_tiles(actual, actual_tiles);
+  assert(expected_count == actual_count);
+  assert(memcmp(expected_tiles, actual_tiles,
+                (size_t)expected_count * sizeof(*expected_tiles)) == 0);
+
+  // Probe copies with the PRNG-using inverse operation too. Equal output after
+  // several insertions proves the otherwise opaque bag PRNG state was restored.
+  Bag *expected_probe = bag_duplicate(expected);
+  Bag *actual_probe = bag_duplicate(actual);
+  for (int probe_idx = 0; probe_idx < 4; probe_idx++) {
+    const MachineLetter ml = (MachineLetter)(probe_idx + 1);
+    bag_add_letter(expected_probe, ml, 0);
+    bag_add_letter(actual_probe, ml, 0);
+  }
+  const int expected_probe_count =
+      bag_peek_tiles(expected_probe, expected_tiles);
+  const int actual_probe_count = bag_peek_tiles(actual_probe, actual_tiles);
+  assert(expected_probe_count == actual_probe_count);
+  assert(memcmp(expected_tiles, actual_tiles,
+                (size_t)expected_probe_count * sizeof(*expected_tiles)) == 0);
+  bag_destroy(actual_probe);
+  bag_destroy(expected_probe);
+}
+
+static void cpeg_test_assert_state_equal(const Game *expected,
+                                         const Game *actual) {
+  assert(game_get_player_on_turn_index(expected) ==
+         game_get_player_on_turn_index(actual));
+  assert(game_get_consecutive_scoreless_turns(expected) ==
+         game_get_consecutive_scoreless_turns(actual));
+  assert(game_get_game_end_reason(expected) ==
+         game_get_game_end_reason(actual));
+  for (int player_idx = 0; player_idx < 2; player_idx++) {
+    const Player *expected_player = game_get_player(expected, player_idx);
+    const Player *actual_player = game_get_player(actual, player_idx);
+    assert(player_get_score(expected_player) ==
+           player_get_score(actual_player));
+    assert(memcmp(player_get_rack(expected_player),
+                  player_get_rack(actual_player), sizeof(Rack)) == 0);
+  }
+  assert(memcmp(game_get_board(expected), game_get_board(actual),
+                sizeof(Board)) == 0);
+  cpeg_test_assert_bag_state_equal(game_get_bag(expected),
+                                   game_get_bag(actual));
+}
+
+static const Move *cpeg_test_random_placement(const MoveList *moves) {
+  const Move *selected = NULL;
+  int placements_seen = 0;
+  const int count = move_list_get_count(moves);
+  for (int move_idx = 0; move_idx < count; move_idx++) {
+    const Move *move = move_list_get_move(moves, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    placements_seen++;
+    if (cpeg_test_random() % (uint32_t)placements_seen == 0) {
+      selected = move;
+    }
+  }
+  return selected;
+}
+
+static int cpeg_test_rack_to_array(const Rack *rack, MachineLetter *tiles) {
+  int count = 0;
+  const int dist_size = rack_get_dist_size(rack);
+  for (int ml = 0; ml < dist_size; ml++) {
+    const int letter_count = rack_get_letter(rack, (MachineLetter)ml);
+    for (int letter_idx = 0; letter_idx < letter_count; letter_idx++) {
+      tiles[count++] = (MachineLetter)ml;
+    }
+  }
+  return count;
+}
+
+static void cpeg_test_nested_round_trip(Game *game, int depth, int operation) {
+  if (depth >= CPEG_UNDO_MAX_DEPTH) {
+    return;
+  }
+  Game *before = game_duplicate(game);
+  const int on_turn = game_get_player_on_turn_index(game);
+  const int bag_count = bag_get_letters(game_get_bag(game));
+
+  MoveList *moves = move_list_create(CPEG_UNDO_MOVE_CAP);
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&args);
+  const Move *placement = cpeg_test_random_placement(moves);
+
+  if (operation == 0 && placement != NULL) {
+    MoveUndo *move_undo = malloc(sizeof(*move_undo));
+    assert(move_undo != NULL);
+    play_move_incremental(placement, game, move_undo);
+    CpegTestBranchUndo branch_undo;
+    cpeg_test_save_branch(game, on_turn, &branch_undo);
+
+    MachineLetter bag_tiles[MAX_BAG_SIZE];
+    int available = bag_peek_tiles(game_get_bag(game), bag_tiles);
+    const int tiles_played = move_get_tiles_played(placement);
+    const int draw_count = tiles_played < available ? tiles_played : available;
+    Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
+    for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+      const int selected_idx =
+          draw_idx +
+          (int)(cpeg_test_random() % (uint32_t)(available - draw_idx));
+      const MachineLetter ml = bag_tiles[selected_idx];
+      bag_tiles[selected_idx] = bag_tiles[draw_idx];
+      bag_draw_letter(game_get_bag(game), ml, on_turn);
+      rack_add_letter(mover_rack, ml);
+    }
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    cpeg_test_nested_round_trip(game, depth + 1, (operation + 1) % 3);
+
+    cpeg_test_restore_branch(game, &branch_undo);
+    cpeg_test_destroy_branch(&branch_undo);
+    unplay_move_incremental(game, move_undo);
+    free(move_undo);
+  } else if (operation == 1 && bag_count > 0) {
+    Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
+    if (!rack_is_empty(mover_rack)) {
+      CpegTestBranchUndo branch_undo;
+      cpeg_test_save_branch(game, on_turn, &branch_undo);
+      MachineLetter bag_tiles[MAX_BAG_SIZE];
+      const int available = bag_peek_tiles(game_get_bag(game), bag_tiles);
+      const MachineLetter drawn =
+          bag_tiles[cpeg_test_random() % (uint32_t)available];
+      MachineLetter rack_tiles[RACK_SIZE];
+      const int rack_count = cpeg_test_rack_to_array(mover_rack, rack_tiles);
+      const MachineLetter exchanged =
+          rack_tiles[cpeg_test_random() % (uint32_t)rack_count];
+      bag_draw_letter(game_get_bag(game), drawn, on_turn);
+      rack_add_letter(mover_rack, drawn);
+      rack_take_letter(mover_rack, exchanged);
+      bag_add_letter(game_get_bag(game), exchanged, on_turn);
+      game_start_next_player_turn(game);
+      game_set_consecutive_scoreless_turns(game, 0);
+      game_set_game_end_reason(game, GAME_END_REASON_NONE);
+      cpeg_test_nested_round_trip(game, depth + 1, (operation + 1) % 3);
+      cpeg_test_restore_branch(game, &branch_undo);
+      cpeg_test_destroy_branch(&branch_undo);
+    }
+  } else {
+    CpegTestBranchUndo branch_undo;
+    cpeg_test_save_branch(game, on_turn, &branch_undo);
+    game_start_next_player_turn(game);
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    cpeg_test_nested_round_trip(game, depth + 1, (operation + 1) % 3);
+    cpeg_test_restore_branch(game, &branch_undo);
+    cpeg_test_destroy_branch(&branch_undo);
+  }
+
+  move_list_destroy(moves);
+  cpeg_test_assert_state_equal(before, game);
+  game_destroy(before);
+}
+
+static void test_cpeg_incremental_round_trip(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  Game *game = config_get_game(config);
+  const LetterDistribution *ld = game_get_ld(game);
+  rack_set_to_string(ld, player_get_rack(game_get_player(game, 1)), "DEINRST");
+  const MachineLetter bag_tiles[] = {
+      ld_hl_to_ml(ld, "A"),
+      ld_hl_to_ml(ld, "E"),
+      ld_hl_to_ml(ld, "I"),
+      ld_hl_to_ml(ld, "O"),
+  };
+  bag_set_to_tiles(game_get_bag(game), bag_tiles,
+                   (int)(sizeof(bag_tiles) / sizeof(*bag_tiles)));
+  game_gen_all_cross_sets(game);
+  board_set_cross_sets_valid(game_get_board(game), true);
+
+  for (int trial = 0; trial < CPEG_UNDO_TRIALS; trial++) {
+    cpeg_test_nested_round_trip(game, 0, trial % 3);
+  }
+
+  config_destroy(config);
+}
 
 // Returns the expected spread of the candidate whose label matches, or NAN when
 // no such candidate is present.
@@ -84,8 +338,8 @@ static void test_cpeg_pre_endgame(void) {
       "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
       "NWL23_crossplay -s1 score -s2 score -threads 1");
 
-  // IMG_9570, bag 1, no exchanges: BEET's known value is reproduced exactly, and
-  // the exhaustive search's optimum is the blocker 13J TAU.
+  // IMG_9570, bag 1, no exchanges: BEET's known value is reproduced exactly,
+  // and the exhaustive search's optimum is the blocker 13J TAU.
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   Game *game = config_get_game(config);
   CpegPreResult result;
@@ -206,4 +460,5 @@ void test_cpeg(void) {
   test_cpeg_endgame();
   test_cpeg_pre_endgame();
   test_cpeg_candidate_legality();
+  test_cpeg_incremental_round_trip();
 }
