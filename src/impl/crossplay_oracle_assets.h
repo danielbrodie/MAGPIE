@@ -22,6 +22,22 @@ typedef struct CrossplayOracleAssetManifest {
   char blocklist_digest[SHA256_HEX_SIZE];
 } CrossplayOracleAssetManifest;
 
+// A persistent oracle process may reuse one verified in-memory asset snapshot.
+// Reuse is explicit at the command boundary and remains valid only while the
+// loaded asset identities and bingo bonus are unchanged.
+typedef struct CrossplayOracleAssetSession {
+  bool verified;
+  char manifest_path[CROSSPLAY_ORACLE_ASSET_PATH_SIZE];
+  char lexicon_id[CROSSPLAY_ORACLE_ASSET_ID_SIZE];
+  char layout_id[CROSSPLAY_ORACLE_ASSET_ID_SIZE];
+  char distribution_id[CROSSPLAY_ORACLE_ASSET_ID_SIZE];
+  const void *lexicon_handle;
+  const void *layout_handle;
+  const void *distribution_handle;
+  int bingo_bonus;
+  CrossplayOracleAssetManifest manifest;
+} CrossplayOracleAssetSession;
+
 bool crossplay_oracle_asset_manifest_load(
     const char *path, CrossplayOracleAssetManifest *manifest);
 bool crossplay_oracle_asset_manifest_verify(
@@ -29,5 +45,17 @@ bool crossplay_oracle_asset_manifest_verify(
     const char *lexicon_path, const char *layout_id, const char *layout_path,
     const char *distribution_id, const char *distribution_path,
     int bingo_bonus);
+bool crossplay_oracle_asset_session_remember(
+    CrossplayOracleAssetSession *session, const char *manifest_path,
+    const char *lexicon_id, const char *layout_id,
+    const char *distribution_id, const void *lexicon_handle,
+    const void *layout_handle, const void *distribution_handle, int bingo_bonus,
+    const CrossplayOracleAssetManifest *manifest);
+bool crossplay_oracle_asset_session_resolve(
+    const CrossplayOracleAssetSession *session, const char *manifest_path,
+    const char *lexicon_id, const char *layout_id,
+    const char *distribution_id, const void *lexicon_handle,
+    const void *layout_handle, const void *distribution_handle, int bingo_bonus,
+    CrossplayOracleAssetManifest *manifest);
 
 #endif

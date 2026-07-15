@@ -378,6 +378,7 @@ struct Config {
   ThreadControl *thread_control;
   Game *game;
   Game *game_backup;
+  CrossplayOracleAssetSession crossplay_oracle_asset_session;
   GameHistory *game_history;
   GameHistory *game_history_backup;
   MoveList *move_list;
@@ -1145,7 +1146,8 @@ void add_help_arg_to_string_builder(const Config *config, int token,
              "(bag empty). Emits a machine-readable one-line result.";
       break;
     case ARG_TOKEN_CROSSPLAY_ORACLE:
-      usages[0] = "<bag> <asset_manifest> [noexch] [apply <action_id>]";
+      usages[0] = "<bag> <asset_manifest> [noexch] [trustedassets] "
+                  "[apply <action_id>]";
       text = "Emits every legal Crossplay action in canonical action-id order "
              "after verifying the exact rules and native data assets. This "
              "neutral command never chooses or ranks a policy.";
@@ -3988,23 +3990,38 @@ static void crossplay_oracle_asset_error(ErrorStack *error_stack,
 
 static bool crossplay_oracle_config_assets(
     Config *config, const char *manifest_path,
-    CrossplayOracleAssetManifest *manifest, ErrorStack *error_stack) {
-  if (!crossplay_oracle_asset_manifest_load(manifest_path, manifest)) {
-    crossplay_oracle_asset_error(error_stack,
-                                 "asset manifest is missing or malformed");
-    return false;
-  }
+    bool reuse_verified_assets, CrossplayOracleAssetManifest *manifest,
+    ErrorStack *error_stack) {
   const char *p1_lexicon = players_data_get_data_name(
       config->players_data, PLAYERS_DATA_TYPE_KWG, 0);
   const char *p2_lexicon = players_data_get_data_name(
       config->players_data, PLAYERS_DATA_TYPE_KWG, 1);
+  const char *layout_id = board_layout_get_name(config->board_layout);
+  const char *distribution_id = ld_get_name(config->ld);
   if (p1_lexicon == NULL || p2_lexicon == NULL ||
       !strings_equal(p1_lexicon, p2_lexicon)) {
     crossplay_oracle_asset_error(error_stack,
                                  "both players must use one exact lexicon");
     return false;
   }
-
+  if (reuse_verified_assets) {
+    if (!crossplay_oracle_asset_session_resolve(
+            &config->crossplay_oracle_asset_session, manifest_path, p1_lexicon,
+            layout_id, distribution_id,
+            players_data_get_kwg(config->players_data, 0),
+            config->board_layout, config->ld, config->bingo_bonus, manifest)) {
+      crossplay_oracle_asset_error(
+          error_stack,
+          "verified asset session is absent or belongs to different assets");
+      return false;
+    }
+    return true;
+  }
+  if (!crossplay_oracle_asset_manifest_load(manifest_path, manifest)) {
+    crossplay_oracle_asset_error(error_stack,
+                                 "asset manifest is missing or malformed");
+    return false;
+  }
   char *lexicon_path = data_filepaths_get_readable_filename(
       config->data_paths, p1_lexicon, DATA_FILEPATH_TYPE_KWG, error_stack);
   char *layout_path = data_filepaths_get_readable_filename(
@@ -4021,8 +4038,8 @@ static bool crossplay_oracle_config_assets(
   }
   const bool verified = crossplay_oracle_asset_manifest_verify(
       manifest, p1_lexicon, lexicon_path,
-      board_layout_get_name(config->board_layout), layout_path,
-      ld_get_name(config->ld), distribution_path, config->bingo_bonus);
+      layout_id, layout_path, distribution_id, distribution_path,
+      config->bingo_bonus);
   free(lexicon_path);
   free(layout_path);
   free(distribution_path);
@@ -4030,8 +4047,18 @@ static bool crossplay_oracle_config_assets(
     crossplay_oracle_asset_error(
         error_stack,
         "loaded lexicon/layout/distribution/bingo/blocklist content differs");
+    return false;
   }
-  return verified;
+  if (!crossplay_oracle_asset_session_remember(
+          &config->crossplay_oracle_asset_session, manifest_path, p1_lexicon,
+          layout_id, distribution_id,
+          players_data_get_kwg(config->players_data, 0), config->board_layout,
+          config->ld, config->bingo_bonus, manifest)) {
+    crossplay_oracle_asset_error(error_stack,
+                                 "asset session identity is too large");
+    return false;
+  }
+  return true;
 }
 
 void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
@@ -4054,6 +4081,7 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
     return;
   }
   bool allow_exchanges = true;
+  bool reuse_verified_assets = false;
   const char *apply_action_id = NULL;
   const int arg_count =
       config_get_parg_num_set_values(config, ARG_TOKEN_CROSSPLAY_ORACLE);
@@ -4062,6 +4090,8 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
         config_get_parg_value(config, ARG_TOKEN_CROSSPLAY_ORACLE, arg_idx);
     if (strings_equal(option, "noexch")) {
       allow_exchanges = false;
+    } else if (strings_equal(option, "trustedassets")) {
+      reuse_verified_assets = true;
     } else if (strings_equal(option, "apply") && apply_action_id == NULL &&
                arg_idx + 1 < arg_count) {
       apply_action_id = config_get_parg_value(
@@ -4070,13 +4100,15 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
       error_stack_push(
           error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
           string_duplicate(
-              "crossplayoracle options are noexch and apply <action_id>"));
+              "crossplayoracle options are noexch, trustedassets, and apply "
+              "<action_id>"));
       return;
     }
   }
 
   CrossplayOracleAssetManifest manifest;
-  if (!crossplay_oracle_config_assets(config, manifest_path, &manifest,
+  if (!crossplay_oracle_config_assets(config, manifest_path,
+                                      reuse_verified_assets, &manifest,
                                       error_stack)) {
     return;
   }
@@ -9114,7 +9146,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
   cmd(ARG_TOKEN_CPEG, "cpeg", 0, 8, cpeg, generic, false);
-  cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 5,
+  cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 6,
       crossplay_oracle, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);

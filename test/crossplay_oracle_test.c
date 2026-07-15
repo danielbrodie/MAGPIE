@@ -139,6 +139,47 @@ static void test_asset_manifest_verification(void) {
       "data/layouts/crossplay.txt", "english_crossplay",
       "data/letterdistributions/english_crossplay.csv", 40));
 
+  CrossplayOracleAssetSession session = {0};
+  CrossplayOracleAssetManifest resolved;
+  const void *lexicon_handle = &manifest;
+  const void *layout_handle = &resolved;
+  const void *distribution_handle = &session;
+  assert(!crossplay_oracle_asset_session_resolve(
+      &session, manifest_path, "NWL23_crossplay", "crossplay",
+      "english_crossplay", lexicon_handle, layout_handle, distribution_handle,
+      40, &resolved));
+  assert(crossplay_oracle_asset_session_remember(
+      &session, manifest_path, "NWL23_crossplay", "crossplay",
+      "english_crossplay", lexicon_handle, layout_handle, distribution_handle,
+      40, &manifest));
+  assert(crossplay_oracle_asset_session_resolve(
+      &session, manifest_path, "NWL23_crossplay", "crossplay",
+      "english_crossplay", lexicon_handle, layout_handle, distribution_handle,
+      40, &resolved));
+  assert(memcmp(&resolved, &manifest, sizeof(manifest)) == 0);
+  assert(!crossplay_oracle_asset_session_resolve(
+      &session, "different-manifest.txt", "NWL23_crossplay", "crossplay",
+      "english_crossplay", lexicon_handle, layout_handle, distribution_handle,
+      40, &resolved));
+  assert(!crossplay_oracle_asset_session_resolve(
+      &session, manifest_path, "NWL23_crossplay", "crossplay",
+      "english_crossplay", lexicon_handle, layout_handle, distribution_handle,
+      50, &resolved));
+  assert(!crossplay_oracle_asset_session_resolve(
+      &session, manifest_path, "NWL23_crossplay", "crossplay",
+      "english_crossplay", &resolved, layout_handle, distribution_handle, 40,
+      &resolved));
+
+  Config *config = crossplay_oracle_test_config();
+  char *six_arg_command = get_formatted_string(
+      "crossplayoracle 0 %s noexch trustedassets apply "
+      "d04d289dc4be5bbe028e20372d31aefe6c3a5fa1361b778a99c522ec4b484e8e",
+      manifest_path);
+  config_load_command(config, six_arg_command, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  free(six_arg_command);
+  config_destroy(config);
+
   manifest.lexicon_digest[0] = manifest.lexicon_digest[0] == '0' ? '1' : '0';
   assert(!crossplay_oracle_asset_manifest_verify(
       &manifest, "NWL23_crossplay",

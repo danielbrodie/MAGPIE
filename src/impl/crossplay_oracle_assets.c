@@ -161,3 +161,62 @@ bool crossplay_oracle_asset_manifest_verify(
          crossplay_oracle_asset_file_matches(manifest->blocklist_path,
                                               manifest->blocklist_digest);
 }
+
+bool crossplay_oracle_asset_session_remember(
+    CrossplayOracleAssetSession *session, const char *manifest_path,
+    const char *lexicon_id, const char *layout_id,
+    const char *distribution_id, const void *lexicon_handle,
+    const void *layout_handle, const void *distribution_handle, int bingo_bonus,
+    const CrossplayOracleAssetManifest *manifest) {
+  if (session == NULL || manifest_path == NULL || lexicon_id == NULL ||
+      layout_id == NULL || distribution_id == NULL || lexicon_handle == NULL ||
+      layout_handle == NULL || distribution_handle == NULL ||
+      manifest == NULL) {
+    return false;
+  }
+  CrossplayOracleAssetSession candidate = {0};
+  if (!crossplay_oracle_asset_copy(candidate.manifest_path,
+                                   sizeof(candidate.manifest_path),
+                                   manifest_path) ||
+      !crossplay_oracle_asset_copy(candidate.lexicon_id,
+                                   sizeof(candidate.lexicon_id), lexicon_id) ||
+      !crossplay_oracle_asset_copy(candidate.layout_id,
+                                   sizeof(candidate.layout_id), layout_id) ||
+      !crossplay_oracle_asset_copy(candidate.distribution_id,
+                                   sizeof(candidate.distribution_id),
+                                   distribution_id)) {
+    return false;
+  }
+  candidate.bingo_bonus = bingo_bonus;
+  candidate.lexicon_handle = lexicon_handle;
+  candidate.layout_handle = layout_handle;
+  candidate.distribution_handle = distribution_handle;
+  candidate.manifest = *manifest;
+  candidate.verified = true;
+  *session = candidate;
+  return true;
+}
+
+bool crossplay_oracle_asset_session_resolve(
+    const CrossplayOracleAssetSession *session, const char *manifest_path,
+    const char *lexicon_id, const char *layout_id,
+    const char *distribution_id, const void *lexicon_handle,
+    const void *layout_handle, const void *distribution_handle, int bingo_bonus,
+    CrossplayOracleAssetManifest *manifest) {
+  if (session == NULL || manifest_path == NULL || lexicon_id == NULL ||
+      layout_id == NULL || distribution_id == NULL || lexicon_handle == NULL ||
+      layout_handle == NULL || distribution_handle == NULL ||
+      manifest == NULL || !session->verified ||
+      strcmp(session->manifest_path, manifest_path) != 0 ||
+      strcmp(session->lexicon_id, lexicon_id) != 0 ||
+      strcmp(session->layout_id, layout_id) != 0 ||
+      strcmp(session->distribution_id, distribution_id) != 0 ||
+      session->lexicon_handle != lexicon_handle ||
+      session->layout_handle != layout_handle ||
+      session->distribution_handle != distribution_handle ||
+      session->bingo_bonus != bingo_bonus) {
+    return false;
+  }
+  *manifest = session->manifest;
+  return true;
+}
