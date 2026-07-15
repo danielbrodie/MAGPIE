@@ -220,6 +220,7 @@ typedef struct CpegWtlResult {
 typedef enum CpegPreStatus {
   CPEG_PRE_CERTIFIED,
   CPEG_PRE_EXACT_VALUES,
+  CPEG_PRE_BOUNDED,
   CPEG_PRE_ESTIMATED,
   CPEG_PRE_STATISTICAL,
 } CpegPreStatus;
@@ -316,6 +317,88 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
 void cpeg_pre_result_destroy(CpegPreResult *result);
 void cpeg_wtl_result_destroy(CpegWtlResult *result);
 void cpeg_certified_result_destroy(CpegCertifiedResult *result);
+
+// A deterministic enclosure of the score-aware outcome. `estimate` is only a
+// display point inside the intervals; proof decisions use interval endpoints.
+typedef struct CpegWtlEnvelope {
+  CpegWtlValue estimate;
+  CpegInterval win;
+  CpegInterval tie;
+  CpegInterval loss;
+  CpegInterval expected_final_margin;
+} CpegWtlEnvelope;
+
+typedef enum CpegWtlProofKind {
+  CPEG_WTL_PROOF_UNRESOLVED,
+  CPEG_WTL_PROOF_DEFENSE_BOUND,
+  CPEG_WTL_PROOF_EXACT,
+} CpegWtlProofKind;
+
+typedef struct CpegWtlCertifiedArgs {
+  int bag;
+  bool allow_exchanges;
+  int num_threads;
+  int64_t initial_lead;
+  double budget_seconds;
+  int batch_size;
+  // Internal/test-only deterministic batch budget; zero is unbounded.
+  int max_batches;
+} CpegWtlCertifiedArgs;
+
+typedef struct CpegWtlCertifiedCand {
+  char label[CPEG_MOVE_STR_LEN];
+  int score;
+  CpegWtlEnvelope outcome;
+  int64_t outcome_den;
+  int64_t win_lower_num;
+  int64_t win_upper_num;
+  int64_t tie_lower_num;
+  int64_t tie_upper_num;
+  int64_t loss_lower_num;
+  int64_t loss_upper_num;
+  int worlds_exact;
+  int worlds_bounded;
+  int worlds_unresolved;
+  int64_t exact_weight;
+  bool eliminated;
+} CpegWtlCertifiedCand;
+
+typedef struct CpegWtlCertifiedResult {
+  CpegPreStatus status;
+  CpegWtlCertifiedCand *cands;
+  int count;
+  int best_index;
+  int worlds_distinct;
+  int64_t world_weight_mass;
+  int exact_jobs;
+  int bound_jobs;
+  int batches_completed;
+  double decision_regret_bound;
+  int64_t regret_num;
+  int64_t regret_den;
+  bool unique_best;
+  CpegRootCoverage coverage;
+} CpegWtlCertifiedResult;
+
+// Construct the sound outcome enclosure implied by a concrete opponent
+// defense and a root-favorable final-margin upper bound.
+CpegWtlEnvelope cpeg_wtl_envelope_from_margin_upper(int64_t margin_upper,
+                                                    CpegInterval margin_prior);
+
+// True only when lhs is proved lexicographically better than rhs. Later
+// components are consulted only after the earlier component is a point on
+// both sides and the two points are equal.
+bool cpeg_wtl_envelope_dominates(const CpegWtlEnvelope *lhs,
+                                 const CpegWtlEnvelope *rhs);
+
+// Candidate-complete, score-aware certification. Every root action is
+// retained. Staged concrete-defense witnesses contract strict-win envelopes;
+// surviving non-horizon actions are finished with exact bag-empty endgames.
+int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
+                                         const CpegWtlCertifiedArgs *args,
+                                         CpegWtlCertifiedResult *out);
+
+void cpeg_wtl_certified_result_destroy(CpegWtlCertifiedResult *result);
 
 typedef struct CpegStatisticalArgs {
   int bag;

@@ -278,6 +278,75 @@ int cpeg_wtl_compare(const CpegWtlValue *lhs, const CpegWtlValue *rhs) {
   return 0;
 }
 
+static CpegWtlEnvelope cpeg_wtl_unresolved_envelope(CpegInterval margin_prior) {
+  return (CpegWtlEnvelope){
+      .estimate =
+          {
+              .win = 1.0 / 3.0,
+              .tie = 1.0 / 3.0,
+              .loss = 1.0 / 3.0,
+              .expected_final_margin =
+                  margin_prior.lo / 2.0 + margin_prior.hi / 2.0,
+          },
+      .win = {.lo = 0.0, .hi = 1.0},
+      .tie = {.lo = 0.0, .hi = 1.0},
+      .loss = {.lo = 0.0, .hi = 1.0},
+      .expected_final_margin = margin_prior,
+  };
+}
+
+CpegWtlEnvelope cpeg_wtl_envelope_from_margin_upper(int64_t margin_upper,
+                                                    CpegInterval margin_prior) {
+  CpegWtlEnvelope envelope = cpeg_wtl_unresolved_envelope(margin_prior);
+  if ((double)margin_upper < envelope.expected_final_margin.hi) {
+    envelope.expected_final_margin.hi = (double)margin_upper;
+  }
+  if (envelope.expected_final_margin.lo > envelope.expected_final_margin.hi) {
+    envelope.expected_final_margin.lo = envelope.expected_final_margin.hi;
+  }
+  envelope.estimate.expected_final_margin =
+      envelope.expected_final_margin.lo / 2.0 +
+      envelope.expected_final_margin.hi / 2.0;
+  if (margin_upper < 0) {
+    envelope.win = (CpegInterval){.lo = 0.0, .hi = 0.0};
+    envelope.tie = (CpegInterval){.lo = 0.0, .hi = 0.0};
+    envelope.loss = (CpegInterval){.lo = 1.0, .hi = 1.0};
+    envelope.estimate.win = 0.0;
+    envelope.estimate.tie = 0.0;
+    envelope.estimate.loss = 1.0;
+  } else if (margin_upper == 0) {
+    envelope.win = (CpegInterval){.lo = 0.0, .hi = 0.0};
+    envelope.estimate.win = 0.0;
+  }
+  return envelope;
+}
+
+static bool cpeg_interval_is_point(CpegInterval interval) {
+  return interval.lo == interval.hi;
+}
+
+bool cpeg_wtl_envelope_dominates(const CpegWtlEnvelope *lhs,
+                                 const CpegWtlEnvelope *rhs) {
+  if (lhs == NULL || rhs == NULL) {
+    return false;
+  }
+  if (lhs->win.lo > rhs->win.hi) {
+    return true;
+  }
+  if (!cpeg_interval_is_point(lhs->win) || !cpeg_interval_is_point(rhs->win) ||
+      lhs->win.lo != rhs->win.lo) {
+    return false;
+  }
+  if (lhs->tie.lo > rhs->tie.hi) {
+    return true;
+  }
+  if (!cpeg_interval_is_point(lhs->tie) || !cpeg_interval_is_point(rhs->tie) ||
+      lhs->tie.lo != rhs->tie.lo) {
+    return false;
+  }
+  return lhs->expected_final_margin.lo > rhs->expected_final_margin.hi;
+}
+
 int cpeg_wtl_weighted_average(const CpegWtlValue *values,
                               const int64_t *weights, int count,
                               CpegWtlValue *out) {
@@ -2405,6 +2474,15 @@ void cpeg_certified_result_destroy(CpegCertifiedResult *result) {
   result->best_index = -1;
 }
 
+void cpeg_wtl_certified_result_destroy(CpegWtlCertifiedResult *result) {
+  if (result == NULL) {
+    return;
+  }
+  free(result->cands);
+  memset(result, 0, sizeof(*result));
+  result->best_index = -1;
+}
+
 void cpeg_statistical_result_destroy(CpegStatisticalResult *result) {
   if (result == NULL) {
     return;
@@ -2875,6 +2953,2744 @@ static void cpeg_sort_scheduled_worlds(CpegScheduledWorld *worlds,
     }
     worlds[insertion_idx] = current;
   }
+}
+
+typedef struct CpegWtlProofWorld {
+  CpegWtlEnvelope envelope;
+  CpegWtlProofKind proof;
+  int64_t draw_mass;
+  int64_t win_lower_mass;
+  int64_t win_upper_mass;
+  int64_t tie_lower_mass;
+  int64_t tie_upper_mass;
+  int64_t loss_lower_mass;
+  int64_t loss_upper_mass;
+} CpegWtlProofWorld;
+
+typedef struct CpegWtlProofState {
+  int64_t win_lower_mass;
+  int64_t win_upper_mass;
+  int64_t tie_lower_mass;
+  int64_t tie_upper_mass;
+  int64_t loss_lower_mass;
+  int64_t loss_upper_mass;
+  int64_t outcome_mass;
+  CpegWtlEnvelope outcome;
+} CpegWtlProofState;
+
+typedef struct CpegDefenseWorker {
+  Game *opponent_game;
+  Game *draw_game;
+  Game *defense_game;
+  MoveList *opponent_moves;
+  MoveList *root_best;
+  MoveUndo *defense_undo;
+  MoveList *endgame_mover;
+  MoveList *endgame_reply;
+  MoveUndo *endgame_undo;
+} CpegDefenseWorker;
+
+typedef struct CpegDefenseJob {
+  CpegDefenseWorker *workers;
+  const Game *source_game;
+  const CpegMultiset *world;
+  const int *unseen;
+  int ld_size;
+  int opponent_idx;
+  int root_idx;
+  const CpegRootCand *candidate;
+  int64_t initial_lead;
+  int64_t deadline_ns;
+  CpegInterval margin_prior;
+  bool exhaustive_horizon;
+  int max_defenses;
+  bool complete;
+  bool capacity_exceeded;
+  CpegWtlProofWorld result;
+} CpegDefenseJob;
+
+static CpegWtlEnvelope cpeg_wtl_exact_envelope(int64_t final_margin) {
+  const CpegWtlValue value = cpeg_wtl_classify_margin(final_margin);
+  return (CpegWtlEnvelope){
+      .estimate = value,
+      .win = {.lo = value.win, .hi = value.win},
+      .tie = {.lo = value.tie, .hi = value.tie},
+      .loss = {.lo = value.loss, .hi = value.loss},
+      .expected_final_margin =
+          {
+              .lo = (double)final_margin,
+              .hi = (double)final_margin,
+          },
+  };
+}
+
+static int cpeg_small_move_pointer_compare(const void *lhs, const void *rhs) {
+  const SmallMove *const lhs_move = *(const SmallMove *const *)lhs;
+  const SmallMove *const rhs_move = *(const SmallMove *const *)rhs;
+  const int lhs_score = small_move_get_score(lhs_move);
+  const int rhs_score = small_move_get_score(rhs_move);
+  if (lhs_score != rhs_score) {
+    return lhs_score > rhs_score ? -1 : 1;
+  }
+  if (lhs_move->tiny_move != rhs_move->tiny_move) {
+    return lhs_move->tiny_move < rhs_move->tiny_move ? -1 : 1;
+  }
+  return 0;
+}
+
+static bool cpeg_defense_deadline_reached(int64_t deadline_ns) {
+  return deadline_ns != 0 && ctimer_monotonic_ns() >= deadline_ns;
+}
+
+static bool cpeg_generate_small_moves(Game *game, MoveList *moves,
+                                      move_record_t record_type) {
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = moves,
+      .move_record_type = record_type,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&args);
+  return moves->count <= CPEG_MOVE_LIST_CAP;
+}
+
+static bool
+cpeg_root_best_after_defense(CpegDefenseWorker *worker, const Game *draw_game,
+                             const SmallMove *defense, int64_t threshold,
+                             bool require_exact_score, int *root_score,
+                             bool *threshold_exceeded) {
+  game_copy(worker->defense_game, draw_game);
+  if (defense == NULL) {
+    game_start_next_player_turn(worker->defense_game);
+  } else {
+    small_move_to_move(worker->opponent_moves->spare_move, defense,
+                       game_get_board(worker->defense_game));
+    play_move_incremental(worker->opponent_moves->spare_move,
+                          worker->defense_game, worker->defense_undo);
+  }
+  bag_set_to_tiles(game_get_bag(worker->defense_game), NULL, 0);
+  game_set_game_end_reason(worker->defense_game, GAME_END_REASON_NONE);
+  game_set_consecutive_scoreless_turns(worker->defense_game, 0);
+  Equity target = EQUITY_MAX_VALUE;
+  if (!require_exact_score && threshold >= (int64_t)EQUITY_MIN_DOUBLE &&
+      threshold <= (int64_t)EQUITY_MAX_DOUBLE) {
+    target = int_to_equity((int)threshold);
+  }
+  const MoveGenArgs root_args = {
+      .game = worker->defense_game,
+      .move_list = worker->root_best,
+      .move_record_type = MOVE_RECORD_BEST,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = target,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&root_args);
+  if (move_list_get_count(worker->root_best) < 1) {
+    return false;
+  }
+  *root_score =
+      equity_to_int(move_get_score(move_list_get_move(worker->root_best, 0)));
+  *threshold_exceeded = !require_exact_score && *root_score > threshold;
+  return true;
+}
+
+static bool cpeg_apply_root_draw(const CpegDefenseJob *job,
+                                 CpegDefenseWorker *worker,
+                                 const CpegMultiset *draw) {
+  cpeg_set_world(worker->draw_game, job->source_game, job->world, job->unseen,
+                 job->ld_size, job->opponent_idx);
+  if (job->candidate->kind == 1) {
+    game_start_next_player_turn(worker->draw_game);
+    return true;
+  }
+
+  Bag *bag = game_get_bag(worker->draw_game);
+  Rack *root_rack =
+      player_get_rack(game_get_player(worker->draw_game, job->root_idx));
+  for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+    bag_draw_letter(bag, draw->tiles[tile_idx], job->root_idx);
+    rack_add_letter(root_rack, draw->tiles[tile_idx]);
+  }
+  if (job->candidate->kind == 2) {
+    for (int tile_idx = 0; tile_idx < job->candidate->exch_n; tile_idx++) {
+      rack_take_letter(root_rack, job->candidate->exch_tiles[tile_idx]);
+      bag_add_letter(bag, job->candidate->exch_tiles[tile_idx], job->root_idx);
+    }
+    game_start_next_player_turn(worker->draw_game);
+  }
+  game_set_game_end_reason(worker->draw_game, GAME_END_REASON_NONE);
+  game_set_consecutive_scoreless_turns(worker->draw_game, 0);
+  return true;
+}
+
+static bool
+cpeg_defense_for_draw(CpegDefenseJob *job, CpegDefenseWorker *worker,
+                      int remaining_bag, int64_t margin_after_root,
+                      bool include_voluntary_pass, bool defense_list_complete,
+                      CpegWtlEnvelope *out, CpegWtlProofKind *proof) {
+  bool have_bound = false;
+  int64_t best_margin_upper = INT64_MAX;
+  int defenses_tested = 0;
+
+  if (remaining_bag == 0 && include_voluntary_pass) {
+    int root_score = 0;
+    bool threshold_exceeded = false;
+    if (!cpeg_root_best_after_defense(
+            worker, worker->draw_game, NULL, INT64_MAX,
+            /*require_exact_score=*/true, &root_score, &threshold_exceeded) ||
+        !cpeg_checked_margin_add(margin_after_root, root_score,
+                                 &best_margin_upper)) {
+      return false;
+    }
+    have_bound = true;
+    defenses_tested++;
+  }
+
+  for (int move_idx = 0; move_idx < worker->opponent_moves->count; move_idx++) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->complete = false;
+      return false;
+    }
+    const SmallMove *defense = worker->opponent_moves->small_moves[move_idx];
+    if (small_move_is_pass(defense) ||
+        small_move_get_tiles_played(defense) < remaining_bag) {
+      continue;
+    }
+    int root_score = 0;
+    bool threshold_exceeded = false;
+    const int64_t threshold =
+        (int64_t)small_move_get_score(defense) - margin_after_root;
+    const bool require_exact_score =
+        remaining_bag == 0 && job->max_defenses == 0;
+    if (!cpeg_root_best_after_defense(worker, worker->draw_game, defense,
+                                      threshold, require_exact_score,
+                                      &root_score, &threshold_exceeded)) {
+      job->capacity_exceeded = true;
+      return false;
+    }
+    defenses_tested++;
+    if (threshold_exceeded) {
+      if (job->max_defenses > 0 && defenses_tested >= job->max_defenses) {
+        break;
+      }
+      continue;
+    }
+    int64_t margin_upper;
+    if (!cpeg_checked_margin_add(margin_after_root,
+                                 -(int64_t)small_move_get_score(defense),
+                                 &margin_upper) ||
+        !cpeg_checked_margin_add(margin_upper, root_score, &margin_upper)) {
+      return false;
+    }
+    have_bound = true;
+    if (margin_upper < best_margin_upper) {
+      best_margin_upper = margin_upper;
+    }
+    if (!job->exhaustive_horizon && remaining_bag == 0 &&
+        best_margin_upper < 0) {
+      break;
+    }
+    if (remaining_bag > 0 && best_margin_upper <= 0) {
+      break;
+    }
+    if (job->max_defenses > 0 && defenses_tested >= job->max_defenses) {
+      break;
+    }
+  }
+
+  if (!have_bound) {
+    *out = cpeg_wtl_unresolved_envelope(job->margin_prior);
+    *proof = CPEG_WTL_PROOF_UNRESOLVED;
+    return true;
+  }
+  if (remaining_bag == 0 && defense_list_complete &&
+      (job->exhaustive_horizon || best_margin_upper >= 0)) {
+    *out = cpeg_wtl_exact_envelope(best_margin_upper);
+    *proof = CPEG_WTL_PROOF_EXACT;
+    return true;
+  }
+  *out =
+      cpeg_wtl_envelope_from_margin_upper(best_margin_upper, job->margin_prior);
+  *proof = CPEG_WTL_PROOF_DEFENSE_BOUND;
+  return true;
+}
+
+static CpegWtlEnvelope
+cpeg_weighted_draw_envelope(const CpegWtlEnvelope *values,
+                            const int64_t *weights, int count,
+                            int64_t weight_total) {
+  CpegWtlEnvelope result = {0};
+  double win_lower = 0.0;
+  double win_upper = 0.0;
+  double tie_lower = 0.0;
+  double tie_upper = 0.0;
+  double loss_lower = 0.0;
+  double loss_upper = 0.0;
+  double margin_lower = 0.0;
+  double margin_upper = 0.0;
+  for (int value_idx = 0; value_idx < count; value_idx++) {
+    const double weight = (double)weights[value_idx];
+    win_lower = cpeg_down_add(win_lower,
+                              cpeg_down_mul(weight, values[value_idx].win.lo));
+    win_upper =
+        cpeg_up_add(win_upper, cpeg_up_mul(weight, values[value_idx].win.hi));
+    tie_lower = cpeg_down_add(tie_lower,
+                              cpeg_down_mul(weight, values[value_idx].tie.lo));
+    tie_upper =
+        cpeg_up_add(tie_upper, cpeg_up_mul(weight, values[value_idx].tie.hi));
+    loss_lower = cpeg_down_add(
+        loss_lower, cpeg_down_mul(weight, values[value_idx].loss.lo));
+    loss_upper =
+        cpeg_up_add(loss_upper, cpeg_up_mul(weight, values[value_idx].loss.hi));
+    margin_lower = cpeg_down_add(
+        margin_lower,
+        cpeg_down_mul(weight, values[value_idx].expected_final_margin.lo));
+    margin_upper = cpeg_up_add(
+        margin_upper,
+        cpeg_up_mul(weight, values[value_idx].expected_final_margin.hi));
+  }
+  const double denominator = (double)weight_total;
+  result.win = (CpegInterval){.lo = cpeg_down_div(win_lower, denominator),
+                              .hi = cpeg_up_div(win_upper, denominator)};
+  result.tie = (CpegInterval){.lo = cpeg_down_div(tie_lower, denominator),
+                              .hi = cpeg_up_div(tie_upper, denominator)};
+  result.loss = (CpegInterval){.lo = cpeg_down_div(loss_lower, denominator),
+                               .hi = cpeg_up_div(loss_upper, denominator)};
+  if (result.win.lo < 0.0) {
+    result.win.lo = 0.0;
+  }
+  if (result.win.hi > 1.0) {
+    result.win.hi = 1.0;
+  }
+  if (result.tie.lo < 0.0) {
+    result.tie.lo = 0.0;
+  }
+  if (result.tie.hi > 1.0) {
+    result.tie.hi = 1.0;
+  }
+  if (result.loss.lo < 0.0) {
+    result.loss.lo = 0.0;
+  }
+  if (result.loss.hi > 1.0) {
+    result.loss.hi = 1.0;
+  }
+  result.expected_final_margin = (CpegInterval){
+      .lo = cpeg_down_div(margin_lower, denominator),
+      .hi = cpeg_up_div(margin_upper, denominator),
+  };
+  const double estimate_win = result.win.lo;
+  const double estimate_tie = result.tie.lo;
+  double estimate_loss = 1.0 - estimate_win - estimate_tie;
+  if (estimate_loss < result.loss.lo) {
+    estimate_loss = result.loss.lo;
+  }
+  if (estimate_loss > result.loss.hi) {
+    estimate_loss = result.loss.hi;
+  }
+  result.estimate = (CpegWtlValue){
+      .win = estimate_win,
+      .tie = estimate_tie,
+      .loss = estimate_loss,
+      .expected_final_margin = result.expected_final_margin.lo / 2.0 +
+                               result.expected_final_margin.hi / 2.0,
+  };
+  return result;
+}
+
+static void cpeg_defense_job_run(void *arg, int worker_idx) {
+  CpegDefenseJob *job = (CpegDefenseJob *)arg;
+  CpegDefenseWorker *worker = &job->workers[worker_idx];
+  job->complete = true;
+  job->capacity_exceeded = false;
+  memset(&job->result, 0, sizeof(job->result));
+
+  cpeg_set_world(worker->opponent_game, job->source_game, job->world,
+                 job->unseen, job->ld_size, job->opponent_idx);
+  if (job->candidate->kind != 0) {
+    game_start_next_player_turn(worker->opponent_game);
+  }
+  const bool horizon =
+      job->candidate->kind == 0 &&
+      move_get_tiles_played(&job->candidate->move) >= job->world->n;
+  int remaining_after_root = job->world->n;
+  if (job->candidate->kind == 0) {
+    const int tiles_played = move_get_tiles_played(&job->candidate->move);
+    const int tiles_drawn =
+        tiles_played < job->world->n ? tiles_played : job->world->n;
+    remaining_after_root -= tiles_drawn;
+  }
+  const bool fast_horizon = horizon && !job->exhaustive_horizon;
+  const bool fast_single_defense =
+      job->max_defenses == 1 && remaining_after_root <= 1;
+  const move_record_t opponent_record_type = fast_horizon || fast_single_defense
+                                                 ? MOVE_RECORD_BEST_SMALL
+                                                 : MOVE_RECORD_ALL_SMALL;
+  if (!cpeg_generate_small_moves(worker->opponent_game, worker->opponent_moves,
+                                 opponent_record_type)) {
+    job->capacity_exceeded = true;
+    return;
+  }
+  qsort(worker->opponent_moves->small_moves,
+        (size_t)worker->opponent_moves->count,
+        sizeof(*worker->opponent_moves->small_moves),
+        cpeg_small_move_pointer_compare);
+
+  CpegMultiset draws[CPEG_ENUM_CAP] = {0};
+  int draw_count = 1;
+  if (job->candidate->kind == 0) {
+    const int tiles_played = move_get_tiles_played(&job->candidate->move);
+    const int draw_size =
+        tiles_played < job->world->n ? tiles_played : job->world->n;
+    int counts[MAX_ALPHABET_SIZE] = {0};
+    for (int tile_idx = 0; tile_idx < job->world->n; tile_idx++) {
+      counts[job->world->tiles[tile_idx]]++;
+    }
+    bool overflow = false;
+    draw_count = cpeg_enum_submultisets(counts, job->ld_size, draw_size, draws,
+                                        CPEG_ENUM_CAP, &overflow);
+    if (overflow || draw_count < 1) {
+      job->capacity_exceeded = true;
+      return;
+    }
+  } else if (job->candidate->kind == 2) {
+    int counts[MAX_ALPHABET_SIZE] = {0};
+    for (int tile_idx = 0; tile_idx < job->world->n; tile_idx++) {
+      counts[job->world->tiles[tile_idx]]++;
+    }
+    bool overflow = false;
+    draw_count =
+        cpeg_enum_submultisets(counts, job->ld_size, job->candidate->exch_n,
+                               draws, CPEG_ENUM_CAP, &overflow);
+    if (overflow || draw_count < 1) {
+      job->capacity_exceeded = true;
+      return;
+    }
+  } else {
+    draws[0].weight = 1;
+  }
+
+  CpegWtlEnvelope draw_values[CPEG_ENUM_CAP] = {0};
+  int64_t draw_weights[CPEG_ENUM_CAP] = {0};
+  CpegWtlProofKind aggregate_proof = CPEG_WTL_PROOF_EXACT;
+  int64_t draw_mass = 0;
+  int64_t win_lower_mass = 0;
+  int64_t win_upper_mass = 0;
+  int64_t tie_lower_mass = 0;
+  int64_t tie_upper_mass = 0;
+  int64_t loss_lower_mass = 0;
+  int64_t loss_upper_mass = 0;
+  int64_t margin_after_root;
+  if (!cpeg_checked_margin_add(job->initial_lead, job->candidate->score,
+                               &margin_after_root)) {
+    job->complete = false;
+    return;
+  }
+  for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->complete = false;
+      return;
+    }
+    if (!cpeg_apply_root_draw(job, worker, &draws[draw_idx])) {
+      job->complete = false;
+      return;
+    }
+    const int remaining_bag = bag_get_letters(game_get_bag(worker->draw_game));
+    CpegWtlProofKind draw_proof;
+    if (!cpeg_defense_for_draw(
+            job, worker, remaining_bag, margin_after_root,
+            /*include_voluntary_pass=*/job->exhaustive_horizon,
+            /*defense_list_complete=*/
+            !fast_horizon && !fast_single_defense, &draw_values[draw_idx],
+            &draw_proof)) {
+      if (job->complete) {
+        job->capacity_exceeded = true;
+      }
+      return;
+    }
+    if (fast_horizon && job->max_defenses != 1 &&
+        draw_values[draw_idx].loss.lo < 1.0) {
+      if (!cpeg_generate_small_moves(worker->opponent_game,
+                                     worker->opponent_moves,
+                                     MOVE_RECORD_ALL_SMALL)) {
+        job->capacity_exceeded = true;
+        return;
+      }
+      qsort(worker->opponent_moves->small_moves,
+            (size_t)worker->opponent_moves->count,
+            sizeof(*worker->opponent_moves->small_moves),
+            cpeg_small_move_pointer_compare);
+      if (!cpeg_defense_for_draw(job, worker, remaining_bag, margin_after_root,
+                                 /*include_voluntary_pass=*/true,
+                                 /*defense_list_complete=*/true,
+                                 &draw_values[draw_idx], &draw_proof)) {
+        if (job->complete) {
+          job->capacity_exceeded = true;
+        }
+        return;
+      }
+    }
+    const int64_t draw_weight = draws[draw_idx].weight;
+    draw_weights[draw_idx] = draw_weight;
+    draw_mass += draw_weight;
+    if (draw_values[draw_idx].win.lo == 1.0) {
+      win_lower_mass += draw_weight;
+    }
+    if (draw_values[draw_idx].win.hi > 0.0) {
+      win_upper_mass += draw_weight;
+    }
+    if (draw_values[draw_idx].tie.lo == 1.0) {
+      tie_lower_mass += draw_weight;
+    }
+    if (draw_values[draw_idx].tie.hi > 0.0) {
+      tie_upper_mass += draw_weight;
+    }
+    if (draw_values[draw_idx].loss.lo == 1.0) {
+      loss_lower_mass += draw_weight;
+    }
+    if (draw_values[draw_idx].loss.hi > 0.0) {
+      loss_upper_mass += draw_weight;
+    }
+    if (draw_proof < aggregate_proof) {
+      aggregate_proof = draw_proof;
+    }
+  }
+  job->result = (CpegWtlProofWorld){
+      .envelope = cpeg_weighted_draw_envelope(draw_values, draw_weights,
+                                              draw_count, draw_mass),
+      .proof = aggregate_proof,
+      .draw_mass = draw_mass,
+      .win_lower_mass = win_lower_mass,
+      .win_upper_mass = win_upper_mass,
+      .tie_lower_mass = tie_lower_mass,
+      .tie_upper_mass = tie_upper_mass,
+      .loss_lower_mass = loss_lower_mass,
+      .loss_upper_mass = loss_upper_mass,
+  };
+}
+
+static int64_t cpeg_wtl_candidate_draw_mass(const CpegRootCand *candidate,
+                                            int bag) {
+  int draw_count = 0;
+  if (candidate->kind == 0) {
+    draw_count = move_get_tiles_played(&candidate->move);
+    if (draw_count > bag) {
+      draw_count = bag;
+    }
+  } else if (candidate->kind == 2) {
+    draw_count = candidate->exch_n;
+  }
+  return peg_binomial(bag, draw_count);
+}
+
+static CpegInterval cpeg_wtl_rational_interval(int64_t numerator,
+                                               int64_t denominator) {
+  if (numerator <= 0) {
+    return (CpegInterval){.lo = 0.0, .hi = 0.0};
+  }
+  if (numerator >= denominator) {
+    return (CpegInterval){.lo = 1.0, .hi = 1.0};
+  }
+  const double value = (double)numerator / (double)denominator;
+  return (CpegInterval){
+      .lo = nextafter(value, -INFINITY),
+      .hi = nextafter(value, INFINITY),
+  };
+}
+
+static void cpeg_wtl_set_rational_outcome(CpegWtlCertifiedCand *candidate) {
+  const int64_t denominator = candidate->outcome_den;
+  candidate->outcome.win = (CpegInterval){
+      .lo =
+          cpeg_wtl_rational_interval(candidate->win_lower_num, denominator).lo,
+      .hi =
+          cpeg_wtl_rational_interval(candidate->win_upper_num, denominator).hi,
+  };
+  candidate->outcome.tie = (CpegInterval){
+      .lo =
+          cpeg_wtl_rational_interval(candidate->tie_lower_num, denominator).lo,
+      .hi =
+          cpeg_wtl_rational_interval(candidate->tie_upper_num, denominator).hi,
+  };
+  candidate->outcome.loss = (CpegInterval){
+      .lo =
+          cpeg_wtl_rational_interval(candidate->loss_lower_num, denominator).lo,
+      .hi =
+          cpeg_wtl_rational_interval(candidate->loss_upper_num, denominator).hi,
+  };
+
+  int64_t point_win = candidate->win_lower_num;
+  int64_t point_tie = candidate->tie_lower_num;
+  int64_t point_loss = candidate->loss_lower_num;
+  int64_t remaining = denominator - point_win - point_tie - point_loss;
+  int64_t available = candidate->win_upper_num - point_win;
+  int64_t allocated = remaining < available ? remaining : available;
+  point_win += allocated;
+  remaining -= allocated;
+  available = candidate->tie_upper_num - point_tie;
+  allocated = remaining < available ? remaining : available;
+  point_tie += allocated;
+  remaining -= allocated;
+  point_loss += remaining;
+
+  const CpegInterval point_win_interval =
+      cpeg_wtl_rational_interval(point_win, denominator);
+  const CpegInterval point_tie_interval =
+      cpeg_wtl_rational_interval(point_tie, denominator);
+  const double win_choices[3] = {
+      (double)point_win / (double)denominator,
+      point_win_interval.lo,
+      point_win_interval.hi,
+  };
+  const double tie_choices[3] = {
+      (double)point_tie / (double)denominator,
+      point_tie_interval.lo,
+      point_tie_interval.hi,
+  };
+  bool found = false;
+  for (int win_idx = 0; win_idx < 3 && !found; win_idx++) {
+    for (int tie_idx = 0; tie_idx < 3; tie_idx++) {
+      const double loss = 1.0 - win_choices[win_idx] - tie_choices[tie_idx];
+      if (loss >= candidate->outcome.loss.lo &&
+          loss <= candidate->outcome.loss.hi) {
+        candidate->outcome.estimate.win = win_choices[win_idx];
+        candidate->outcome.estimate.tie = tie_choices[tie_idx];
+        candidate->outcome.estimate.loss = loss;
+        found = true;
+        break;
+      }
+    }
+  }
+  if (!found) {
+    candidate->outcome.estimate.win = (double)point_win / (double)denominator;
+    candidate->outcome.estimate.tie = (double)point_tie / (double)denominator;
+    candidate->outcome.estimate.loss = (double)point_loss / (double)denominator;
+  }
+}
+
+static void cpeg_wtl_recompute_candidate(
+    CpegWtlCertifiedCand *candidate, CpegWtlProofState *state,
+    const CpegWtlProofWorld *world_evaluations,
+    const CpegScheduledWorld *worlds, int world_count, int64_t world_mass,
+    int64_t draw_mass, CpegInterval margin_prior) {
+  CpegWtlEnvelope values[CPEG_WORLD_CAP] = {0};
+  int64_t weights[CPEG_WORLD_CAP] = {0};
+  memset(state, 0, sizeof(*state));
+  candidate->worlds_exact = 0;
+  candidate->worlds_bounded = 0;
+  candidate->worlds_unresolved = 0;
+  candidate->exact_weight = 0;
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    const CpegWtlProofWorld *evaluation = &world_evaluations[world_idx];
+    const int64_t world_weight = worlds[world_idx].multiset.weight;
+    weights[world_idx] = world_weight;
+    if (evaluation->proof == CPEG_WTL_PROOF_UNRESOLVED) {
+      values[world_idx] = cpeg_wtl_unresolved_envelope(margin_prior);
+      state->win_upper_mass += world_weight * draw_mass;
+      state->tie_upper_mass += world_weight * draw_mass;
+      state->loss_upper_mass += world_weight * draw_mass;
+      candidate->worlds_unresolved++;
+      continue;
+    }
+    values[world_idx] = evaluation->envelope;
+    state->win_lower_mass += world_weight * evaluation->win_lower_mass;
+    state->win_upper_mass += world_weight * evaluation->win_upper_mass;
+    state->tie_lower_mass += world_weight * evaluation->tie_lower_mass;
+    state->tie_upper_mass += world_weight * evaluation->tie_upper_mass;
+    state->loss_lower_mass += world_weight * evaluation->loss_lower_mass;
+    state->loss_upper_mass += world_weight * evaluation->loss_upper_mass;
+    if (evaluation->proof == CPEG_WTL_PROOF_EXACT) {
+      candidate->worlds_exact++;
+      candidate->exact_weight += world_weight;
+    } else {
+      candidate->worlds_bounded++;
+    }
+  }
+  state->outcome_mass = world_mass * draw_mass;
+  state->outcome =
+      cpeg_weighted_draw_envelope(values, weights, world_count, world_mass);
+  candidate->outcome = state->outcome;
+  candidate->outcome_den = state->outcome_mass;
+  candidate->win_lower_num = state->win_lower_mass;
+  candidate->win_upper_num = state->win_upper_mass;
+  candidate->tie_lower_num = state->tie_lower_mass;
+  candidate->tie_upper_num = state->tie_upper_mass;
+  candidate->loss_lower_num = state->loss_lower_mass;
+  candidate->loss_upper_num = state->loss_upper_mass;
+  cpeg_wtl_set_rational_outcome(candidate);
+  state->outcome = candidate->outcome;
+}
+
+static bool cpeg_wtl_fraction_less(int64_t lhs_num, int64_t lhs_den,
+                                   int64_t rhs_num, int64_t rhs_den,
+                                   bool *valid) {
+  if (lhs_num < 0 || rhs_num < 0 || lhs_den <= 0 || rhs_den <= 0 ||
+      (lhs_num > 0 && rhs_den > INT64_MAX / lhs_num) ||
+      (rhs_num > 0 && lhs_den > INT64_MAX / rhs_num)) {
+    *valid = false;
+    return false;
+  }
+  return lhs_num * rhs_den < rhs_num * lhs_den;
+}
+
+static bool cpeg_wtl_candidate_precedes(const CpegRootCand *candidates, int bag,
+                                        int lhs_idx, int rhs_idx) {
+  const bool lhs_horizon =
+      candidates[lhs_idx].kind == 0 &&
+      move_get_tiles_played(&candidates[lhs_idx].move) >= bag;
+  const bool rhs_horizon =
+      candidates[rhs_idx].kind == 0 &&
+      move_get_tiles_played(&candidates[rhs_idx].move) >= bag;
+  if (lhs_horizon != rhs_horizon) {
+    return lhs_horizon;
+  }
+  if (candidates[lhs_idx].score != candidates[rhs_idx].score) {
+    return candidates[lhs_idx].score > candidates[rhs_idx].score;
+  }
+  const CpegCandKind lhs_kind = cpeg_root_candidate_kind(&candidates[lhs_idx]);
+  const CpegCandKind rhs_kind = cpeg_root_candidate_kind(&candidates[rhs_idx]);
+  if (lhs_kind != rhs_kind) {
+    return lhs_kind < rhs_kind;
+  }
+  return lhs_idx < rhs_idx;
+}
+
+static int64_t cpeg_wtl_proof_deadline_ns(double budget_seconds) {
+  if (budget_seconds <= 0.0) {
+    return 0;
+  }
+  const int64_t start_ns = ctimer_monotonic_ns();
+  const double budget_ns = budget_seconds * 1000000000.0;
+  if (budget_ns >= (double)(INT64_MAX - start_ns)) {
+    return INT64_MAX;
+  }
+  return start_ns + (int64_t)budget_ns;
+}
+
+static bool cpeg_wtl_proof_budget_reached(int64_t deadline_ns, int max_batches,
+                                          int batches_completed) {
+  return cpeg_defense_deadline_reached(deadline_ns) ||
+         (max_batches > 0 && batches_completed >= max_batches);
+}
+
+static bool cpeg_wtl_run_defense_batch(
+    PegPool *pool, CpegDefenseWorker *workers, int helper_worker_idx,
+    CpegDefenseJob *jobs, void **job_ptrs, int first_world, int world_count,
+    const Game *source_game, const CpegScheduledWorld *worlds,
+    const int *unseen, int ld_size, int opponent_idx, int root_idx,
+    const CpegRootCand *candidate, int64_t initial_lead, int64_t deadline_ns,
+    CpegInterval margin_prior, bool exhaustive_horizon, int max_defenses,
+    CpegWtlProofWorld *world_evaluations, int *exact_jobs, int *bound_jobs,
+    bool *batch_complete) {
+  *batch_complete = false;
+  for (int job_idx = 0; job_idx < world_count; job_idx++) {
+    const int world_idx = first_world + job_idx;
+    jobs[job_idx] = (CpegDefenseJob){
+        .workers = workers,
+        .source_game = source_game,
+        .world = &worlds[world_idx].multiset,
+        .unseen = unseen,
+        .ld_size = ld_size,
+        .opponent_idx = opponent_idx,
+        .root_idx = root_idx,
+        .candidate = candidate,
+        .initial_lead = initial_lead,
+        .deadline_ns = deadline_ns,
+        .margin_prior = margin_prior,
+        .exhaustive_horizon = exhaustive_horizon,
+        .max_defenses = max_defenses,
+    };
+    job_ptrs[job_idx] = &jobs[job_idx];
+  }
+  peg_pool_submit_and_wait(pool, cpeg_defense_job_run, job_ptrs, world_count,
+                           helper_worker_idx);
+  for (int job_idx = 0; job_idx < world_count; job_idx++) {
+    if (jobs[job_idx].capacity_exceeded) {
+      return false;
+    }
+    if (!jobs[job_idx].complete) {
+      return true;
+    }
+  }
+  for (int job_idx = 0; job_idx < world_count; job_idx++) {
+    const int world_idx = first_world + job_idx;
+    world_evaluations[world_idx] = jobs[job_idx].result;
+    if (jobs[job_idx].result.proof == CPEG_WTL_PROOF_EXACT) {
+      (*exact_jobs)++;
+    } else {
+      (*bound_jobs)++;
+    }
+  }
+  *batch_complete = true;
+  return true;
+}
+
+typedef struct CpegWtlReplyCacheEntry {
+  uint64_t rack_key;
+  int score;
+} CpegWtlReplyCacheEntry;
+
+static uint64_t cpeg_wtl_rack_key(const Rack *rack, int ld_size) {
+  uint64_t key = 1;
+  for (int ml = 0; ml < ld_size; ml++) {
+    const int count = rack_get_letter(rack, (MachineLetter)ml);
+    for (int tile_idx = 0; tile_idx < count; tile_idx++) {
+      key = (key << 5) | (uint64_t)(ml + 1);
+    }
+  }
+  return key;
+}
+
+static int cpeg_wtl_cached_root_score(Game *defended_game, MoveList *root_moves,
+                                      int ld_size,
+                                      CpegWtlReplyCacheEntry *cache,
+                                      int cache_capacity, int64_t threshold) {
+  const int root_idx = game_get_player_on_turn_index(defended_game);
+  const Rack *root_rack =
+      player_get_rack(game_get_player(defended_game, root_idx));
+  const uint64_t rack_key = cpeg_wtl_rack_key(root_rack, ld_size);
+  const int start_slot = (int)(rack_key % (uint64_t)cache_capacity);
+  for (int probe = 0; probe < cache_capacity; probe++) {
+    const int slot = (start_slot + probe) % cache_capacity;
+    if (cache[slot].rack_key == rack_key) {
+      return cache[slot].score;
+    }
+    if (cache[slot].rack_key == 0) {
+      Equity target = EQUITY_MAX_VALUE;
+      if (threshold >= (int64_t)EQUITY_MIN_DOUBLE &&
+          threshold <= (int64_t)EQUITY_MAX_DOUBLE) {
+        target = int_to_equity((int)threshold);
+      }
+      const MoveGenArgs root_args = {
+          .game = defended_game,
+          .move_list = root_moves,
+          .move_record_type = MOVE_RECORD_BEST,
+          .move_sort_type = MOVE_SORT_SCORE,
+          .override_kwg = NULL,
+          .eq_margin_movegen = 0,
+          .target_equity = target,
+          .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      };
+      generate_moves(&root_args);
+      const int score =
+          equity_to_int(move_get_score(move_list_get_move(root_moves, 0)));
+      cache[slot] = (CpegWtlReplyCacheEntry){
+          .rack_key = rack_key,
+          .score = score,
+      };
+      return score;
+    }
+  }
+  return INT_MAX;
+}
+
+static bool cpeg_wtl_screen_scoreless_candidates(
+    const Game *root_game, const CpegRootCand *candidates, int candidate_count,
+    const CpegScheduledWorld *worlds, int world_count, int64_t world_mass,
+    const int *unseen, int ld_size, int root_idx, int opponent_idx,
+    const CpegWtlCertifiedArgs *args, int64_t deadline_ns,
+    CpegInterval margin_prior, CpegWtlCertifiedResult *out,
+    CpegWtlProofState *states, bool *stopped) {
+  enum { REPLY_CACHE_CAPACITY = 8192 };
+  int64_t *win_upper =
+      calloc_or_die((size_t)candidate_count, sizeof(*win_upper));
+  int64_t *tie_upper =
+      calloc_or_die((size_t)candidate_count, sizeof(*tie_upper));
+  int64_t *loss_lower =
+      calloc_or_die((size_t)candidate_count, sizeof(*loss_lower));
+  Game *world_game = game_duplicate(root_game);
+  MoveList *opponent_moves = move_list_create_small(CPEG_MOVE_LIST_CAP + 1);
+  MoveList *root_moves = move_list_create(1);
+  MoveUndo *defense_undo = malloc_or_die(sizeof(*defense_undo));
+  CpegWtlReplyCacheEntry *cache =
+      calloc_or_die(REPLY_CACHE_CAPACITY, sizeof(*cache));
+  int worlds_bounded = 0;
+  int64_t bounded_world_mass = 0;
+
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    if (cpeg_wtl_proof_budget_reached(deadline_ns, args->max_batches,
+                                      out->batches_completed)) {
+      *stopped = true;
+      break;
+    }
+    cpeg_set_world(world_game, root_game, &worlds[world_idx].multiset, unseen,
+                   ld_size, opponent_idx);
+    game_start_next_player_turn(world_game);
+    if (!cpeg_generate_small_moves(world_game, opponent_moves,
+                                   MOVE_RECORD_ALL_SMALL)) {
+      free(cache);
+      free(defense_undo);
+      move_list_destroy(root_moves);
+      small_move_list_destroy(opponent_moves);
+      game_destroy(world_game);
+      free(loss_lower);
+      free(tie_upper);
+      free(win_upper);
+      return false;
+    }
+    qsort(opponent_moves->small_moves, (size_t)opponent_moves->count,
+          sizeof(*opponent_moves->small_moves),
+          cpeg_small_move_pointer_compare);
+    const SmallMove *defense = NULL;
+    for (int move_idx = 0; move_idx < opponent_moves->count; move_idx++) {
+      const SmallMove *move = opponent_moves->small_moves[move_idx];
+      if (!small_move_is_pass(move) &&
+          small_move_get_tiles_played(move) >= args->bag) {
+        defense = move;
+        break;
+      }
+    }
+    if (defense == NULL) {
+      out->batches_completed++;
+      continue;
+    }
+    small_move_to_move(opponent_moves->spare_move, defense,
+                       game_get_board(world_game));
+    play_move_incremental(opponent_moves->spare_move, world_game, defense_undo);
+    game_set_game_end_reason(world_game, GAME_END_REASON_NONE);
+    bag_set_to_tiles(game_get_bag(world_game), NULL, 0);
+    memset(cache, 0, REPLY_CACHE_CAPACITY * sizeof(*cache));
+    const int defense_score = small_move_get_score(defense);
+    const int64_t threshold = (int64_t)defense_score - args->initial_lead;
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      const CpegRootCand *candidate = &candidates[candidate_idx];
+      if (candidate->kind == 0) {
+        continue;
+      }
+      CpegMultiset draws[CPEG_ENUM_CAP] = {0};
+      int draw_count = 1;
+      if (candidate->kind == 2) {
+        int counts[MAX_ALPHABET_SIZE] = {0};
+        for (int tile_idx = 0; tile_idx < worlds[world_idx].multiset.n;
+             tile_idx++) {
+          counts[worlds[world_idx].multiset.tiles[tile_idx]]++;
+        }
+        bool overflow = false;
+        draw_count = cpeg_enum_submultisets(counts, ld_size, candidate->exch_n,
+                                            draws, CPEG_ENUM_CAP, &overflow);
+        if (overflow || draw_count < 1) {
+          free(cache);
+          free(defense_undo);
+          move_list_destroy(root_moves);
+          small_move_list_destroy(opponent_moves);
+          game_destroy(world_game);
+          free(loss_lower);
+          free(tie_upper);
+          free(win_upper);
+          return false;
+        }
+      } else {
+        draws[0].weight = 1;
+      }
+      int64_t candidate_win_upper = 0;
+      int64_t candidate_tie_upper = 0;
+      int64_t candidate_loss_lower = 0;
+      for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+        Rack branch_rack;
+        rack_copy(&branch_rack,
+                  player_get_rack(game_get_player(root_game, root_idx)));
+        if (candidate->kind == 2) {
+          for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
+            rack_take_letter(&branch_rack, candidate->exch_tiles[tile_idx]);
+          }
+          for (int tile_idx = 0; tile_idx < draws[draw_idx].n; tile_idx++) {
+            rack_add_letter(&branch_rack, draws[draw_idx].tiles[tile_idx]);
+          }
+        }
+        rack_copy(player_get_rack(game_get_player(world_game, root_idx)),
+                  &branch_rack);
+        const int root_score =
+            cpeg_wtl_cached_root_score(world_game, root_moves, ld_size, cache,
+                                       REPLY_CACHE_CAPACITY, threshold);
+        const int64_t margin_upper =
+            args->initial_lead - (int64_t)defense_score + root_score;
+        if (margin_upper > 0) {
+          candidate_win_upper += draws[draw_idx].weight;
+        }
+        if (margin_upper >= 0) {
+          candidate_tie_upper += draws[draw_idx].weight;
+        } else {
+          candidate_loss_lower += draws[draw_idx].weight;
+        }
+      }
+      const int64_t world_weight = worlds[world_idx].multiset.weight;
+      win_upper[candidate_idx] += world_weight * candidate_win_upper;
+      tie_upper[candidate_idx] += world_weight * candidate_tie_upper;
+      loss_lower[candidate_idx] += world_weight * candidate_loss_lower;
+      out->bound_jobs++;
+    }
+    worlds_bounded++;
+    bounded_world_mass += worlds[world_idx].multiset.weight;
+    out->batches_completed++;
+  }
+
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    const CpegRootCand *candidate = &candidates[candidate_idx];
+    if (candidate->kind == 0) {
+      continue;
+    }
+    const int64_t draw_mass =
+        cpeg_wtl_candidate_draw_mass(candidate, args->bag);
+    const int64_t outcome_mass = world_mass * draw_mass;
+    const int64_t unresolved_mass =
+        (world_mass - bounded_world_mass) * draw_mass;
+    CpegWtlCertifiedCand *result_candidate = &out->cands[candidate_idx];
+    result_candidate->outcome_den = outcome_mass;
+    result_candidate->win_lower_num = 0;
+    result_candidate->win_upper_num =
+        win_upper[candidate_idx] + unresolved_mass;
+    result_candidate->tie_lower_num = 0;
+    result_candidate->tie_upper_num =
+        tie_upper[candidate_idx] + unresolved_mass;
+    result_candidate->loss_lower_num = loss_lower[candidate_idx];
+    result_candidate->loss_upper_num = outcome_mass;
+    result_candidate->worlds_exact = 0;
+    result_candidate->worlds_bounded = worlds_bounded;
+    result_candidate->worlds_unresolved = world_count - worlds_bounded;
+    result_candidate->exact_weight = 0;
+    result_candidate->outcome = (CpegWtlEnvelope){
+        .estimate =
+            {
+                .win = 0.0,
+                .tie = 0.0,
+                .loss = 1.0,
+                .expected_final_margin =
+                    margin_prior.lo / 2.0 + margin_prior.hi / 2.0,
+            },
+        .win = cpeg_wtl_rational_interval(0, outcome_mass),
+        .tie = cpeg_wtl_rational_interval(0, outcome_mass),
+        .loss =
+            cpeg_wtl_rational_interval(loss_lower[candidate_idx], outcome_mass),
+        .expected_final_margin = margin_prior,
+    };
+    result_candidate->outcome.win.hi =
+        cpeg_wtl_rational_interval(result_candidate->win_upper_num,
+                                   outcome_mass)
+            .hi;
+    result_candidate->outcome.tie.hi =
+        cpeg_wtl_rational_interval(result_candidate->tie_upper_num,
+                                   outcome_mass)
+            .hi;
+    result_candidate->outcome.loss.hi = 1.0;
+    cpeg_wtl_set_rational_outcome(result_candidate);
+    states[candidate_idx] = (CpegWtlProofState){
+        .win_upper_mass = result_candidate->win_upper_num,
+        .tie_upper_mass = result_candidate->tie_upper_num,
+        .loss_lower_mass = result_candidate->loss_lower_num,
+        .loss_upper_mass = outcome_mass,
+        .outcome_mass = outcome_mass,
+        .outcome = result_candidate->outcome,
+    };
+  }
+
+  free(cache);
+  free(defense_undo);
+  move_list_destroy(root_moves);
+  small_move_list_destroy(opponent_moves);
+  game_destroy(world_game);
+  free(loss_lower);
+  free(tie_upper);
+  free(win_upper);
+  return true;
+}
+
+typedef struct CpegWtlScorelessWorldJob {
+  CpegDefenseWorker *workers;
+  const Game *root_game;
+  const CpegRootCand *candidates;
+  int candidate_count;
+  const CpegScheduledWorld *world;
+  const int *unseen;
+  int ld_size;
+  int root_idx;
+  int opponent_idx;
+  int bag;
+  int64_t initial_lead;
+  int64_t deadline_ns;
+  int64_t *win_upper;
+  int64_t *tie_upper;
+  int64_t *loss_lower;
+  bool bounded;
+  bool complete;
+  bool proof_valid;
+} CpegWtlScorelessWorldJob;
+
+static void cpeg_wtl_scoreless_world_job_run(void *arg, int worker_idx) {
+  enum { REPLY_CACHE_CAPACITY = 1024 };
+  CpegWtlScorelessWorldJob *job = arg;
+  CpegDefenseWorker *worker = &job->workers[worker_idx];
+  job->complete = true;
+  job->proof_valid = true;
+  if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+    job->complete = false;
+    return;
+  }
+  cpeg_set_world(worker->opponent_game, job->root_game, &job->world->multiset,
+                 job->unseen, job->ld_size, job->opponent_idx);
+  game_start_next_player_turn(worker->opponent_game);
+  if (!cpeg_generate_small_moves(worker->opponent_game, worker->opponent_moves,
+                                 MOVE_RECORD_ALL_SMALL)) {
+    job->proof_valid = false;
+    return;
+  }
+  qsort(worker->opponent_moves->small_moves,
+        (size_t)worker->opponent_moves->count,
+        sizeof(*worker->opponent_moves->small_moves),
+        cpeg_small_move_pointer_compare);
+  const SmallMove *defense = NULL;
+  for (int move_idx = 0; move_idx < worker->opponent_moves->count; move_idx++) {
+    const SmallMove *move = worker->opponent_moves->small_moves[move_idx];
+    if (!small_move_is_pass(move) &&
+        small_move_get_tiles_played(move) >= job->bag) {
+      defense = move;
+      break;
+    }
+  }
+  if (defense == NULL) {
+    return;
+  }
+  game_copy(worker->defense_game, worker->opponent_game);
+  small_move_to_move(worker->opponent_moves->spare_move, defense,
+                     game_get_board(worker->defense_game));
+  play_move_incremental(worker->opponent_moves->spare_move,
+                        worker->defense_game, worker->defense_undo);
+  bag_set_to_tiles(game_get_bag(worker->defense_game), NULL, 0);
+  game_set_game_end_reason(worker->defense_game, GAME_END_REASON_NONE);
+  game_set_consecutive_scoreless_turns(worker->defense_game, 0);
+  CpegWtlReplyCacheEntry cache[REPLY_CACHE_CAPACITY] = {0};
+  const int defense_score = small_move_get_score(defense);
+  const int64_t threshold = (int64_t)defense_score - job->initial_lead;
+  for (int candidate_idx = 0; candidate_idx < job->candidate_count;
+       candidate_idx++) {
+    const CpegRootCand *candidate = &job->candidates[candidate_idx];
+    if (candidate->kind == 0) {
+      continue;
+    }
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->complete = false;
+      return;
+    }
+    CpegMultiset draws[CPEG_ENUM_CAP] = {0};
+    int draw_count = 1;
+    if (candidate->kind == 2) {
+      int counts[MAX_ALPHABET_SIZE] = {0};
+      for (int tile_idx = 0; tile_idx < job->world->multiset.n; tile_idx++) {
+        counts[job->world->multiset.tiles[tile_idx]]++;
+      }
+      bool overflow = false;
+      draw_count =
+          cpeg_enum_submultisets(counts, job->ld_size, candidate->exch_n, draws,
+                                 CPEG_ENUM_CAP, &overflow);
+      if (overflow || draw_count < 1) {
+        job->proof_valid = false;
+        return;
+      }
+    } else {
+      draws[0].weight = 1;
+    }
+    for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+      Rack branch_rack;
+      rack_copy(&branch_rack, player_get_rack(game_get_player(job->root_game,
+                                                              job->root_idx)));
+      if (candidate->kind == 2) {
+        for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
+          rack_take_letter(&branch_rack, candidate->exch_tiles[tile_idx]);
+        }
+        for (int tile_idx = 0; tile_idx < draws[draw_idx].n; tile_idx++) {
+          rack_add_letter(&branch_rack, draws[draw_idx].tiles[tile_idx]);
+        }
+      }
+      rack_copy(
+          player_get_rack(game_get_player(worker->defense_game, job->root_idx)),
+          &branch_rack);
+      const int root_score = cpeg_wtl_cached_root_score(
+          worker->defense_game, worker->root_best, job->ld_size, cache,
+          REPLY_CACHE_CAPACITY, threshold);
+      if (root_score == INT_MAX) {
+        job->proof_valid = false;
+        return;
+      }
+      int64_t margin_upper;
+      if (!cpeg_checked_margin_add(job->initial_lead, -(int64_t)defense_score,
+                                   &margin_upper) ||
+          !cpeg_checked_margin_add(margin_upper, root_score, &margin_upper)) {
+        job->proof_valid = false;
+        return;
+      }
+      if (margin_upper > 0) {
+        job->win_upper[candidate_idx] += draws[draw_idx].weight;
+      }
+      if (margin_upper >= 0) {
+        job->tie_upper[candidate_idx] += draws[draw_idx].weight;
+      } else {
+        job->loss_lower[candidate_idx] += draws[draw_idx].weight;
+      }
+    }
+  }
+  job->bounded = true;
+}
+
+static bool cpeg_wtl_screen_scoreless_candidates_parallel(
+    PegPool *pool, CpegDefenseWorker *workers, int helper_worker_idx,
+    Game *root_game, const CpegRootCand *candidates, int candidate_count,
+    const CpegScheduledWorld *worlds, int world_count, int64_t world_mass,
+    const int *unseen, int ld_size, int root_idx, int opponent_idx,
+    const CpegWtlCertifiedArgs *args, int64_t deadline_ns,
+    CpegInterval margin_prior, CpegWtlCertifiedResult *out,
+    CpegWtlProofState *states, bool *stopped) {
+  CpegWtlScorelessWorldJob *jobs =
+      calloc_or_die((size_t)world_count, sizeof(*jobs));
+  void **job_ptrs = malloc_or_die((size_t)world_count * sizeof(*job_ptrs));
+  int64_t *win_upper = calloc_or_die(
+      (size_t)world_count * (size_t)candidate_count, sizeof(*win_upper));
+  int64_t *tie_upper = calloc_or_die(
+      (size_t)world_count * (size_t)candidate_count, sizeof(*tie_upper));
+  int64_t *loss_lower = calloc_or_die(
+      (size_t)world_count * (size_t)candidate_count, sizeof(*loss_lower));
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    jobs[world_idx] = (CpegWtlScorelessWorldJob){
+        .workers = workers,
+        .root_game = root_game,
+        .candidates = candidates,
+        .candidate_count = candidate_count,
+        .world = &worlds[world_idx],
+        .unseen = unseen,
+        .ld_size = ld_size,
+        .root_idx = root_idx,
+        .opponent_idx = opponent_idx,
+        .bag = args->bag,
+        .initial_lead = args->initial_lead,
+        .deadline_ns = deadline_ns,
+        .win_upper = &win_upper[world_idx * candidate_count],
+        .tie_upper = &tie_upper[world_idx * candidate_count],
+        .loss_lower = &loss_lower[world_idx * candidate_count],
+    };
+    job_ptrs[world_idx] = &jobs[world_idx];
+  }
+  peg_pool_submit_and_wait(pool, cpeg_wtl_scoreless_world_job_run, job_ptrs,
+                           world_count, helper_worker_idx);
+
+  bool proof_valid = true;
+  int worlds_bounded = 0;
+  int64_t bounded_world_mass = 0;
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    if (!jobs[world_idx].proof_valid) {
+      proof_valid = false;
+    }
+    if (!jobs[world_idx].complete) {
+      *stopped = true;
+    }
+    if (jobs[world_idx].bounded) {
+      worlds_bounded++;
+      bounded_world_mass += worlds[world_idx].multiset.weight;
+      out->batches_completed++;
+    }
+  }
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    const CpegRootCand *candidate = &candidates[candidate_idx];
+    if (candidate->kind == 0) {
+      continue;
+    }
+    const int64_t draw_mass =
+        cpeg_wtl_candidate_draw_mass(candidate, args->bag);
+    const int64_t outcome_mass = world_mass * draw_mass;
+    int64_t candidate_win_upper = (world_mass - bounded_world_mass) * draw_mass;
+    int64_t candidate_tie_upper = candidate_win_upper;
+    int64_t candidate_loss_lower = 0;
+    for (int world_idx = 0; world_idx < world_count; world_idx++) {
+      if (!jobs[world_idx].bounded) {
+        continue;
+      }
+      const int64_t world_weight = worlds[world_idx].multiset.weight;
+      const int offset = world_idx * candidate_count + candidate_idx;
+      candidate_win_upper += world_weight * win_upper[offset];
+      candidate_tie_upper += world_weight * tie_upper[offset];
+      candidate_loss_lower += world_weight * loss_lower[offset];
+    }
+    CpegWtlCertifiedCand *result_candidate = &out->cands[candidate_idx];
+    result_candidate->outcome_den = outcome_mass;
+    result_candidate->win_lower_num = 0;
+    result_candidate->win_upper_num = candidate_win_upper;
+    result_candidate->tie_lower_num = 0;
+    result_candidate->tie_upper_num = candidate_tie_upper;
+    result_candidate->loss_lower_num = candidate_loss_lower;
+    result_candidate->loss_upper_num = outcome_mass;
+    result_candidate->worlds_exact = 0;
+    result_candidate->worlds_bounded = worlds_bounded;
+    result_candidate->worlds_unresolved = world_count - worlds_bounded;
+    result_candidate->exact_weight = 0;
+    result_candidate->outcome = cpeg_wtl_unresolved_envelope(margin_prior);
+    cpeg_wtl_set_rational_outcome(result_candidate);
+    states[candidate_idx] = (CpegWtlProofState){
+        .win_upper_mass = candidate_win_upper,
+        .tie_upper_mass = candidate_tie_upper,
+        .loss_lower_mass = candidate_loss_lower,
+        .loss_upper_mass = outcome_mass,
+        .outcome_mass = outcome_mass,
+        .outcome = result_candidate->outcome,
+    };
+    out->bound_jobs += worlds_bounded;
+  }
+  free(loss_lower);
+  free(tie_upper);
+  free(win_upper);
+  free(job_ptrs);
+  free(jobs);
+  return proof_valid;
+}
+
+typedef struct CpegWtlPlacementScreenJob {
+  CpegDefenseWorker *workers;
+  const Game *source_game;
+  const CpegScheduledWorld *worlds;
+  int world_count;
+  const int *unseen;
+  int ld_size;
+  int opponent_idx;
+  int root_idx;
+  const CpegRootCand *candidate;
+  int64_t initial_lead;
+  int64_t deadline_ns;
+  CpegInterval margin_prior;
+  int64_t world_mass;
+  int64_t incumbent_win_lower;
+  int64_t incumbent_outcome_mass;
+  CpegWtlCertifiedCand *result_candidate;
+  CpegWtlProofState *state;
+  CpegWtlProofWorld *world_evaluations;
+  int exact_jobs;
+  int bound_jobs;
+  int batches_completed;
+  bool proof_valid;
+  bool deadline_reached;
+} CpegWtlPlacementScreenJob;
+
+static bool cpeg_wtl_shallow_placement_world(CpegWtlPlacementScreenJob *job,
+                                             CpegDefenseWorker *worker,
+                                             int world_idx,
+                                             CpegWtlProofWorld *result) {
+  memset(result, 0, sizeof(*result));
+  const CpegMultiset *world = &job->worlds[world_idx].multiset;
+  cpeg_set_world(worker->opponent_game, job->source_game, world, job->unseen,
+                 job->ld_size, job->opponent_idx);
+  const int tiles_played = move_get_tiles_played(&job->candidate->move);
+  const int tiles_drawn = tiles_played < world->n ? tiles_played : world->n;
+  const int remaining_bag = world->n - tiles_drawn;
+  const bool single_best_defense = remaining_bag <= 1;
+  if (!cpeg_generate_small_moves(worker->opponent_game, worker->opponent_moves,
+                                 single_best_defense ? MOVE_RECORD_BEST_SMALL
+                                                     : MOVE_RECORD_ALL_SMALL)) {
+    return false;
+  }
+  qsort(worker->opponent_moves->small_moves,
+        (size_t)worker->opponent_moves->count,
+        sizeof(*worker->opponent_moves->small_moves),
+        cpeg_small_move_pointer_compare);
+  const SmallMove *defense = NULL;
+  for (int move_idx = 0; move_idx < worker->opponent_moves->count; move_idx++) {
+    const SmallMove *move = worker->opponent_moves->small_moves[move_idx];
+    if (!small_move_is_pass(move) &&
+        small_move_get_tiles_played(move) >= remaining_bag) {
+      defense = move;
+      break;
+    }
+  }
+  if (defense == NULL) {
+    result->envelope = cpeg_wtl_unresolved_envelope(job->margin_prior);
+    result->proof = CPEG_WTL_PROOF_UNRESOLVED;
+    return true;
+  }
+
+  Rack leave;
+  rack_copy(&leave, player_get_rack(
+                        game_get_player(worker->opponent_game, job->root_idx)));
+  game_copy(worker->defense_game, worker->opponent_game);
+  small_move_to_move(worker->opponent_moves->spare_move, defense,
+                     game_get_board(worker->defense_game));
+  play_move_incremental(worker->opponent_moves->spare_move,
+                        worker->defense_game, worker->defense_undo);
+  bag_set_to_tiles(game_get_bag(worker->defense_game), NULL, 0);
+  game_set_game_end_reason(worker->defense_game, GAME_END_REASON_NONE);
+  game_set_consecutive_scoreless_turns(worker->defense_game, 0);
+
+  int bag_counts[MAX_ALPHABET_SIZE] = {0};
+  for (int tile_idx = 0; tile_idx < world->n; tile_idx++) {
+    bag_counts[world->tiles[tile_idx]]++;
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP] = {0};
+  bool overflow = false;
+  const int draw_count = cpeg_enum_submultisets(
+      bag_counts, job->ld_size, tiles_drawn, draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow || draw_count < 1) {
+    return false;
+  }
+  CpegWtlEnvelope draw_values[CPEG_ENUM_CAP] = {0};
+  int64_t draw_weights[CPEG_ENUM_CAP] = {0};
+  int64_t draw_mass = 0;
+  const int defense_score = small_move_get_score(defense);
+  int64_t margin_after_root;
+  if (!cpeg_checked_margin_add(job->initial_lead, job->candidate->score,
+                               &margin_after_root)) {
+    return false;
+  }
+  const int64_t threshold = (int64_t)defense_score - margin_after_root;
+  for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->deadline_reached = true;
+      return true;
+    }
+    Rack branch_rack;
+    rack_copy(&branch_rack, &leave);
+    for (int tile_idx = 0; tile_idx < draws[draw_idx].n; tile_idx++) {
+      rack_add_letter(&branch_rack, draws[draw_idx].tiles[tile_idx]);
+    }
+    rack_copy(
+        player_get_rack(game_get_player(worker->defense_game, job->root_idx)),
+        &branch_rack);
+    Equity target = EQUITY_MAX_VALUE;
+    if (threshold >= (int64_t)EQUITY_MIN_DOUBLE &&
+        threshold <= (int64_t)EQUITY_MAX_DOUBLE) {
+      target = int_to_equity((int)threshold);
+    }
+    const MoveGenArgs root_args = {
+        .game = worker->defense_game,
+        .move_list = worker->root_best,
+        .move_record_type = MOVE_RECORD_BEST,
+        .move_sort_type = MOVE_SORT_SCORE,
+        .override_kwg = NULL,
+        .eq_margin_movegen = 0,
+        .target_equity = target,
+        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+    };
+    generate_moves(&root_args);
+    if (move_list_get_count(worker->root_best) < 1) {
+      return false;
+    }
+    const int root_score =
+        equity_to_int(move_get_score(move_list_get_move(worker->root_best, 0)));
+    int64_t margin_upper;
+    if (!cpeg_checked_margin_add(margin_after_root, -(int64_t)defense_score,
+                                 &margin_upper) ||
+        !cpeg_checked_margin_add(margin_upper, root_score, &margin_upper)) {
+      return false;
+    }
+    draw_values[draw_idx] =
+        cpeg_wtl_envelope_from_margin_upper(margin_upper, job->margin_prior);
+    draw_weights[draw_idx] = draws[draw_idx].weight;
+    draw_mass += draws[draw_idx].weight;
+    if (margin_upper > 0) {
+      result->win_upper_mass += draws[draw_idx].weight;
+    }
+    if (margin_upper >= 0) {
+      result->tie_upper_mass += draws[draw_idx].weight;
+    }
+    if (margin_upper < 0) {
+      result->loss_lower_mass += draws[draw_idx].weight;
+    }
+    result->loss_upper_mass += draws[draw_idx].weight;
+  }
+  result->envelope = cpeg_weighted_draw_envelope(draw_values, draw_weights,
+                                                 draw_count, draw_mass);
+  result->proof = CPEG_WTL_PROOF_DEFENSE_BOUND;
+  result->draw_mass = draw_mass;
+  return true;
+}
+
+static void cpeg_wtl_placement_screen_job_run(void *arg, int worker_idx) {
+  CpegWtlPlacementScreenJob *job = arg;
+  const int64_t draw_mass =
+      cpeg_wtl_candidate_draw_mass(job->candidate, job->worlds[0].multiset.n);
+  const int64_t outcome_mass = job->world_mass * draw_mass;
+  int64_t win_upper_mass = outcome_mass;
+  job->proof_valid = true;
+  for (int world_idx = 0; world_idx < job->world_count; world_idx++) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->deadline_reached = true;
+      break;
+    }
+    CpegWtlProofWorld evaluation;
+    if (!cpeg_wtl_shallow_placement_world(job, &job->workers[worker_idx],
+                                          world_idx, &evaluation)) {
+      job->proof_valid = false;
+      break;
+    }
+    if (job->deadline_reached) {
+      break;
+    }
+    job->world_evaluations[world_idx] = evaluation;
+    const int64_t world_weight = job->worlds[world_idx].multiset.weight;
+    win_upper_mass -= world_weight * (draw_mass - evaluation.win_upper_mass);
+    if (evaluation.proof == CPEG_WTL_PROOF_EXACT) {
+      job->exact_jobs++;
+    } else {
+      job->bound_jobs++;
+    }
+    job->batches_completed++;
+    bool comparison_valid = true;
+    if (cpeg_wtl_fraction_less(
+            win_upper_mass, outcome_mass, job->incumbent_win_lower,
+            job->incumbent_outcome_mass, &comparison_valid)) {
+      job->result_candidate->eliminated = true;
+      break;
+    }
+    if (!comparison_valid) {
+      job->proof_valid = false;
+      break;
+    }
+  }
+  cpeg_wtl_recompute_candidate(
+      job->result_candidate, job->state, job->world_evaluations, job->worlds,
+      job->world_count, job->world_mass, draw_mass, job->margin_prior);
+}
+
+static bool cpeg_wtl_screen_placements_parallel(
+    PegPool *pool, CpegDefenseWorker *workers, int helper_worker_idx,
+    const Game *root_game, const CpegRootCand *candidates, int candidate_count,
+    const CpegScheduledWorld *worlds, int world_count, int64_t world_mass,
+    const int *unseen, int ld_size, int opponent_idx, int root_idx,
+    int incumbent_idx, const CpegWtlCertifiedArgs *args, int64_t deadline_ns,
+    CpegInterval margin_prior, CpegWtlCertifiedResult *out,
+    CpegWtlProofState *states, bool *stopped) {
+  int job_count = 0;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx != incumbent_idx && candidates[candidate_idx].kind == 0) {
+      job_count++;
+    }
+  }
+  CpegWtlPlacementScreenJob *screen_jobs =
+      calloc_or_die((size_t)job_count, sizeof(*screen_jobs));
+  void **screen_job_ptrs =
+      malloc_or_die((size_t)job_count * sizeof(*screen_job_ptrs));
+  Game **templates = calloc_or_die((size_t)job_count, sizeof(*templates));
+  CpegWtlProofWorld *evaluations = calloc_or_die(
+      (size_t)job_count * (size_t)world_count, sizeof(*evaluations));
+  int job_idx = 0;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx == incumbent_idx || candidates[candidate_idx].kind != 0) {
+      continue;
+    }
+    templates[job_idx] =
+        cpeg_build_root_template(root_game, &candidates[candidate_idx].move);
+    screen_jobs[job_idx] = (CpegWtlPlacementScreenJob){
+        .workers = workers,
+        .source_game = templates[job_idx],
+        .worlds = worlds,
+        .world_count = world_count,
+        .unseen = unseen,
+        .ld_size = ld_size,
+        .opponent_idx = opponent_idx,
+        .root_idx = root_idx,
+        .candidate = &candidates[candidate_idx],
+        .initial_lead = args->initial_lead,
+        .deadline_ns = deadline_ns,
+        .margin_prior = margin_prior,
+        .world_mass = world_mass,
+        .incumbent_win_lower = states[incumbent_idx].win_lower_mass,
+        .incumbent_outcome_mass = states[incumbent_idx].outcome_mass,
+        .result_candidate = &out->cands[candidate_idx],
+        .state = &states[candidate_idx],
+        .world_evaluations = &evaluations[job_idx * world_count],
+    };
+    screen_job_ptrs[job_idx] = &screen_jobs[job_idx];
+    job_idx++;
+  }
+  peg_pool_submit_and_wait(pool, cpeg_wtl_placement_screen_job_run,
+                           screen_job_ptrs, job_count, helper_worker_idx);
+
+  bool proof_valid = true;
+  for (int screen_idx = 0; screen_idx < job_count; screen_idx++) {
+    const CpegWtlPlacementScreenJob *job = &screen_jobs[screen_idx];
+    out->exact_jobs += job->exact_jobs;
+    out->bound_jobs += job->bound_jobs;
+    out->batches_completed += job->batches_completed;
+    if (!job->proof_valid) {
+      proof_valid = false;
+    }
+    if (job->deadline_reached) {
+      *stopped = true;
+    }
+    game_destroy(templates[screen_idx]);
+  }
+  free(evaluations);
+  free(templates);
+  free(screen_job_ptrs);
+  free(screen_jobs);
+  return proof_valid;
+}
+
+typedef struct CpegWtlPlacementRefineJob {
+  CpegDefenseWorker *workers;
+  const Game *source_game;
+  const CpegScheduledWorld *worlds;
+  int world_count;
+  const int *unseen;
+  int ld_size;
+  int opponent_idx;
+  int root_idx;
+  const CpegRootCand *candidate;
+  int64_t initial_lead;
+  int64_t deadline_ns;
+  CpegInterval margin_prior;
+  int64_t world_mass;
+  int64_t incumbent_win_lower;
+  int64_t incumbent_outcome_mass;
+  int max_defenses;
+  CpegWtlCertifiedCand *result_candidate;
+  CpegWtlProofState *state;
+  CpegWtlProofWorld *world_evaluations;
+  int exact_jobs;
+  int bound_jobs;
+  int batches_completed;
+  bool proof_valid;
+  bool deadline_reached;
+} CpegWtlPlacementRefineJob;
+
+static bool cpeg_wtl_refine_placement_world(CpegWtlPlacementRefineJob *job,
+                                            CpegDefenseWorker *worker,
+                                            int world_idx,
+                                            CpegWtlProofWorld *result) {
+  memset(result, 0, sizeof(*result));
+  const CpegMultiset *world = &job->worlds[world_idx].multiset;
+  cpeg_set_world(worker->opponent_game, job->source_game, world, job->unseen,
+                 job->ld_size, job->opponent_idx);
+  const int tiles_played = move_get_tiles_played(&job->candidate->move);
+  const int tiles_drawn = tiles_played < world->n ? tiles_played : world->n;
+  const int remaining_bag = world->n - tiles_drawn;
+  if (!cpeg_generate_small_moves(worker->opponent_game, worker->opponent_moves,
+                                 MOVE_RECORD_ALL_SMALL)) {
+    return false;
+  }
+  qsort(worker->opponent_moves->small_moves,
+        (size_t)worker->opponent_moves->count,
+        sizeof(*worker->opponent_moves->small_moves),
+        cpeg_small_move_pointer_compare);
+  Rack leave;
+  rack_copy(&leave, player_get_rack(
+                        game_get_player(worker->opponent_game, job->root_idx)));
+  int bag_counts[MAX_ALPHABET_SIZE] = {0};
+  for (int tile_idx = 0; tile_idx < world->n; tile_idx++) {
+    bag_counts[world->tiles[tile_idx]]++;
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP] = {0};
+  bool overflow = false;
+  const int draw_count = cpeg_enum_submultisets(
+      bag_counts, job->ld_size, tiles_drawn, draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow || draw_count < 1) {
+    return false;
+  }
+  int64_t best_margin_upper[CPEG_ENUM_CAP];
+  bool have_bound[CPEG_ENUM_CAP] = {0};
+  for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+    best_margin_upper[draw_idx] = INT64_MAX;
+  }
+  int64_t margin_after_root;
+  if (!cpeg_checked_margin_add(job->initial_lead, job->candidate->score,
+                               &margin_after_root)) {
+    return false;
+  }
+  int defenses_tried = 0;
+  for (int move_idx = 0; move_idx < worker->opponent_moves->count; move_idx++) {
+    const SmallMove *defense = worker->opponent_moves->small_moves[move_idx];
+    if (small_move_is_pass(defense) ||
+        small_move_get_tiles_played(defense) < remaining_bag) {
+      continue;
+    }
+    if (defenses_tried >= job->max_defenses) {
+      break;
+    }
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->deadline_reached = true;
+      return true;
+    }
+    defenses_tried++;
+    game_copy(worker->defense_game, worker->opponent_game);
+    small_move_to_move(worker->opponent_moves->spare_move, defense,
+                       game_get_board(worker->defense_game));
+    play_move_incremental(worker->opponent_moves->spare_move,
+                          worker->defense_game, worker->defense_undo);
+    bag_set_to_tiles(game_get_bag(worker->defense_game), NULL, 0);
+    game_set_game_end_reason(worker->defense_game, GAME_END_REASON_NONE);
+    game_set_consecutive_scoreless_turns(worker->defense_game, 0);
+    const int defense_score = small_move_get_score(defense);
+    const int64_t threshold = (int64_t)defense_score - margin_after_root;
+    for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+      if (have_bound[draw_idx] && best_margin_upper[draw_idx] <= 0) {
+        continue;
+      }
+      Rack branch_rack;
+      rack_copy(&branch_rack, &leave);
+      for (int tile_idx = 0; tile_idx < draws[draw_idx].n; tile_idx++) {
+        rack_add_letter(&branch_rack, draws[draw_idx].tiles[tile_idx]);
+      }
+      rack_copy(
+          player_get_rack(game_get_player(worker->defense_game, job->root_idx)),
+          &branch_rack);
+      Equity target = EQUITY_MAX_VALUE;
+      if (threshold >= (int64_t)EQUITY_MIN_DOUBLE &&
+          threshold <= (int64_t)EQUITY_MAX_DOUBLE) {
+        target = int_to_equity((int)threshold);
+      }
+      const MoveGenArgs root_args = {
+          .game = worker->defense_game,
+          .move_list = worker->root_best,
+          .move_record_type = MOVE_RECORD_BEST,
+          .move_sort_type = MOVE_SORT_SCORE,
+          .override_kwg = NULL,
+          .eq_margin_movegen = 0,
+          .target_equity = target,
+          .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      };
+      generate_moves(&root_args);
+      if (move_list_get_count(worker->root_best) < 1) {
+        return false;
+      }
+      const int root_score = equity_to_int(
+          move_get_score(move_list_get_move(worker->root_best, 0)));
+      int64_t margin_upper;
+      if (!cpeg_checked_margin_add(margin_after_root, -(int64_t)defense_score,
+                                   &margin_upper) ||
+          !cpeg_checked_margin_add(margin_upper, root_score, &margin_upper)) {
+        return false;
+      }
+      have_bound[draw_idx] = true;
+      if (margin_upper < best_margin_upper[draw_idx]) {
+        best_margin_upper[draw_idx] = margin_upper;
+      }
+    }
+  }
+
+  CpegWtlEnvelope draw_values[CPEG_ENUM_CAP] = {0};
+  int64_t draw_weights[CPEG_ENUM_CAP] = {0};
+  int64_t draw_mass = 0;
+  CpegWtlProofKind aggregate_proof = CPEG_WTL_PROOF_DEFENSE_BOUND;
+  for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+    if (have_bound[draw_idx]) {
+      draw_values[draw_idx] = cpeg_wtl_envelope_from_margin_upper(
+          best_margin_upper[draw_idx], job->margin_prior);
+    } else {
+      draw_values[draw_idx] = cpeg_wtl_unresolved_envelope(job->margin_prior);
+      aggregate_proof = CPEG_WTL_PROOF_UNRESOLVED;
+    }
+    const int64_t draw_weight = draws[draw_idx].weight;
+    draw_weights[draw_idx] = draw_weight;
+    draw_mass += draw_weight;
+    if (!have_bound[draw_idx] || best_margin_upper[draw_idx] > 0) {
+      result->win_upper_mass += draw_weight;
+    }
+    if (!have_bound[draw_idx] || best_margin_upper[draw_idx] >= 0) {
+      result->tie_upper_mass += draw_weight;
+    }
+    if (have_bound[draw_idx] && best_margin_upper[draw_idx] < 0) {
+      result->loss_lower_mass += draw_weight;
+    }
+    result->loss_upper_mass += draw_weight;
+  }
+  result->envelope = cpeg_weighted_draw_envelope(draw_values, draw_weights,
+                                                 draw_count, draw_mass);
+  result->proof = aggregate_proof;
+  result->draw_mass = draw_mass;
+  return true;
+}
+
+static bool cpeg_wtl_fixed_defense_world(CpegWtlPlacementRefineJob *job,
+                                         CpegDefenseWorker *worker,
+                                         int world_idx,
+                                         CpegWtlProofWorld *result) {
+  memset(result, 0, sizeof(*result));
+  const CpegMultiset *world = &job->worlds[world_idx].multiset;
+  cpeg_set_world(worker->opponent_game, job->source_game, world, job->unseen,
+                 job->ld_size, job->opponent_idx);
+  const int tiles_played = move_get_tiles_played(&job->candidate->move);
+  const int tiles_drawn = tiles_played < world->n ? tiles_played : world->n;
+  const int remaining_bag = world->n - tiles_drawn;
+  const bool single_best_defense = remaining_bag <= 1;
+  if (!cpeg_generate_small_moves(worker->opponent_game, worker->opponent_moves,
+                                 single_best_defense ? MOVE_RECORD_BEST_SMALL
+                                                     : MOVE_RECORD_ALL_SMALL)) {
+    return false;
+  }
+  qsort(worker->opponent_moves->small_moves,
+        (size_t)worker->opponent_moves->count,
+        sizeof(*worker->opponent_moves->small_moves),
+        cpeg_small_move_pointer_compare);
+  const SmallMove *defense = NULL;
+  for (int move_idx = 0; move_idx < worker->opponent_moves->count; move_idx++) {
+    const SmallMove *move = worker->opponent_moves->small_moves[move_idx];
+    if (!small_move_is_pass(move) &&
+        small_move_get_tiles_played(move) >= remaining_bag) {
+      defense = move;
+      break;
+    }
+  }
+  if (defense == NULL) {
+    result->envelope = cpeg_wtl_unresolved_envelope(job->margin_prior);
+    result->proof = CPEG_WTL_PROOF_UNRESOLVED;
+    return true;
+  }
+
+  Rack leave;
+  rack_copy(&leave, player_get_rack(
+                        game_get_player(worker->opponent_game, job->root_idx)));
+  game_copy(worker->defense_game, worker->opponent_game);
+  small_move_to_move(worker->opponent_moves->spare_move, defense,
+                     game_get_board(worker->defense_game));
+  play_move_incremental(worker->opponent_moves->spare_move,
+                        worker->defense_game, worker->defense_undo);
+  game_set_game_end_reason(worker->defense_game, GAME_END_REASON_NONE);
+  game_set_consecutive_scoreless_turns(worker->defense_game, 0);
+  Rack post_defense_opponent;
+  rack_copy(&post_defense_opponent,
+            player_get_rack(
+                game_get_player(worker->defense_game, job->opponent_idx)));
+
+  int bag_counts[MAX_ALPHABET_SIZE] = {0};
+  for (int tile_idx = 0; tile_idx < world->n; tile_idx++) {
+    bag_counts[world->tiles[tile_idx]]++;
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP] = {0};
+  bool overflow = false;
+  const int draw_count = cpeg_enum_submultisets(
+      bag_counts, job->ld_size, tiles_drawn, draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow || draw_count < 1) {
+    return false;
+  }
+  CpegWtlEnvelope draw_values[CPEG_ENUM_CAP] = {0};
+  int64_t draw_weights[CPEG_ENUM_CAP] = {0};
+  int64_t draw_mass = 0;
+  const int defense_score = small_move_get_score(defense);
+  int64_t margin_after_defense;
+  if (!cpeg_checked_margin_add(job->initial_lead, job->candidate->score,
+                               &margin_after_defense) ||
+      !cpeg_checked_margin_add(margin_after_defense, -(int64_t)defense_score,
+                               &margin_after_defense)) {
+    return false;
+  }
+  for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->deadline_reached = true;
+      return true;
+    }
+    Rack branch_rack;
+    rack_copy(&branch_rack, &leave);
+    int remaining_counts[MAX_ALPHABET_SIZE];
+    memcpy(remaining_counts, bag_counts, sizeof(remaining_counts));
+    for (int tile_idx = 0; tile_idx < draws[draw_idx].n; tile_idx++) {
+      const MachineLetter ml = draws[draw_idx].tiles[tile_idx];
+      rack_add_letter(&branch_rack, ml);
+      remaining_counts[ml]--;
+    }
+    rack_copy(
+        player_get_rack(game_get_player(worker->defense_game, job->root_idx)),
+        &branch_rack);
+    Rack *opponent_rack = player_get_rack(
+        game_get_player(worker->defense_game, job->opponent_idx));
+    rack_copy(opponent_rack, &post_defense_opponent);
+    for (int ml = 0; ml < job->ld_size; ml++) {
+      for (int tile_idx = 0; tile_idx < remaining_counts[ml]; tile_idx++) {
+        rack_add_letter(opponent_rack, (MachineLetter)ml);
+      }
+    }
+    bag_set_to_tiles(game_get_bag(worker->defense_game), NULL, 0);
+    game_set_game_end_reason(worker->defense_game, GAME_END_REASON_NONE);
+    game_set_consecutive_scoreless_turns(worker->defense_game, 0);
+    CpegResult endgame_result;
+    bool capacity_exceeded = false;
+    const int root_swing = cpeg_endgame_core(
+        worker->defense_game, worker->endgame_mover, worker->endgame_reply,
+        worker->endgame_undo, &endgame_result, &capacity_exceeded);
+    if (capacity_exceeded) {
+      draw_values[draw_idx] = cpeg_wtl_unresolved_envelope(job->margin_prior);
+      result->win_upper_mass += draws[draw_idx].weight;
+      result->tie_upper_mass += draws[draw_idx].weight;
+    } else {
+      int64_t margin_upper;
+      if (!cpeg_checked_margin_add(margin_after_defense, root_swing,
+                                   &margin_upper)) {
+        return false;
+      }
+      draw_values[draw_idx] =
+          cpeg_wtl_envelope_from_margin_upper(margin_upper, job->margin_prior);
+      if (margin_upper > 0) {
+        result->win_upper_mass += draws[draw_idx].weight;
+      }
+      if (margin_upper >= 0) {
+        result->tie_upper_mass += draws[draw_idx].weight;
+      } else {
+        result->loss_lower_mass += draws[draw_idx].weight;
+      }
+    }
+    result->loss_upper_mass += draws[draw_idx].weight;
+    draw_weights[draw_idx] = draws[draw_idx].weight;
+    draw_mass += draws[draw_idx].weight;
+  }
+  result->envelope = cpeg_weighted_draw_envelope(draw_values, draw_weights,
+                                                 draw_count, draw_mass);
+  result->proof = CPEG_WTL_PROOF_DEFENSE_BOUND;
+  result->draw_mass = draw_mass;
+  return true;
+}
+
+static void cpeg_wtl_placement_refine_job_run(void *arg, int worker_idx) {
+  CpegWtlPlacementRefineJob *job = arg;
+  const int bag = job->worlds[0].multiset.n;
+  const int64_t draw_mass = cpeg_wtl_candidate_draw_mass(job->candidate, bag);
+  const int64_t outcome_mass = job->world_mass * draw_mass;
+  int64_t win_upper_mass = outcome_mass;
+  job->proof_valid = true;
+  for (int world_idx = 0; world_idx < job->world_count; world_idx++) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->deadline_reached = true;
+      break;
+    }
+    CpegWtlProofWorld evaluation;
+    if (!cpeg_wtl_refine_placement_world(job, &job->workers[worker_idx],
+                                         world_idx, &evaluation)) {
+      job->proof_valid = false;
+      break;
+    }
+    if (job->deadline_reached) {
+      break;
+    }
+    job->world_evaluations[world_idx] = evaluation;
+    const int64_t world_weight = job->worlds[world_idx].multiset.weight;
+    win_upper_mass -= world_weight * (draw_mass - evaluation.win_upper_mass);
+    if (evaluation.proof == CPEG_WTL_PROOF_EXACT) {
+      job->exact_jobs++;
+    } else {
+      job->bound_jobs++;
+    }
+    job->batches_completed++;
+    bool comparison_valid = true;
+    if (cpeg_wtl_fraction_less(
+            win_upper_mass, outcome_mass, job->incumbent_win_lower,
+            job->incumbent_outcome_mass, &comparison_valid)) {
+      job->result_candidate->eliminated = true;
+      break;
+    }
+    if (!comparison_valid) {
+      job->proof_valid = false;
+      break;
+    }
+  }
+  cpeg_wtl_recompute_candidate(
+      job->result_candidate, job->state, job->world_evaluations, job->worlds,
+      job->world_count, job->world_mass, draw_mass, job->margin_prior);
+}
+
+static void cpeg_wtl_fixed_defense_job_run(void *arg, int worker_idx) {
+  CpegWtlPlacementRefineJob *job = arg;
+  const int bag = job->worlds[0].multiset.n;
+  const int64_t draw_mass = cpeg_wtl_candidate_draw_mass(job->candidate, bag);
+  const int64_t outcome_mass = job->world_mass * draw_mass;
+  int64_t win_upper_mass = outcome_mass;
+  job->proof_valid = true;
+  for (int world_idx = 0; world_idx < job->world_count; world_idx++) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->deadline_reached = true;
+      break;
+    }
+    CpegWtlProofWorld evaluation;
+    if (!cpeg_wtl_fixed_defense_world(job, &job->workers[worker_idx], world_idx,
+                                      &evaluation)) {
+      job->proof_valid = false;
+      break;
+    }
+    if (job->deadline_reached) {
+      break;
+    }
+    job->world_evaluations[world_idx] = evaluation;
+    const int64_t world_weight = job->worlds[world_idx].multiset.weight;
+    win_upper_mass -= world_weight * (draw_mass - evaluation.win_upper_mass);
+    job->bound_jobs++;
+    job->batches_completed++;
+    bool comparison_valid = true;
+    if (cpeg_wtl_fraction_less(
+            win_upper_mass, outcome_mass, job->incumbent_win_lower,
+            job->incumbent_outcome_mass, &comparison_valid)) {
+      job->result_candidate->eliminated = true;
+      break;
+    }
+    if (!comparison_valid) {
+      job->proof_valid = false;
+      break;
+    }
+  }
+  cpeg_wtl_recompute_candidate(
+      job->result_candidate, job->state, job->world_evaluations, job->worlds,
+      job->world_count, job->world_mass, draw_mass, job->margin_prior);
+}
+
+static bool cpeg_wtl_refine_surviving_placements(
+    PegPool *pool, CpegDefenseWorker *workers, int helper_worker_idx,
+    Game *root_game, const CpegRootCand *candidates, int candidate_count,
+    const CpegScheduledWorld *worlds, int world_count, int64_t world_mass,
+    const int *unseen, int ld_size, int opponent_idx, int root_idx,
+    int incumbent_idx, const CpegWtlCertifiedArgs *args, int64_t deadline_ns,
+    CpegInterval margin_prior, int max_defenses, bool fixed_endgame,
+    CpegWtlCertifiedResult *out, CpegWtlProofState *states, bool *stopped) {
+  int job_count = 0;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    const bool eligible =
+        candidates[candidate_idx].kind == 0 &&
+        (!fixed_endgame ||
+         move_get_tiles_played(&candidates[candidate_idx].move) < args->bag);
+    if (candidate_idx != incumbent_idx && eligible &&
+        !out->cands[candidate_idx].eliminated) {
+      job_count++;
+    }
+  }
+  if (job_count == 0) {
+    return true;
+  }
+  CpegWtlPlacementRefineJob *refine_jobs =
+      calloc_or_die((size_t)job_count, sizeof(*refine_jobs));
+  void **refine_job_ptrs =
+      malloc_or_die((size_t)job_count * sizeof(*refine_job_ptrs));
+  Game **templates = calloc_or_die((size_t)job_count, sizeof(*templates));
+  CpegWtlProofWorld *evaluations = calloc_or_die(
+      (size_t)job_count * (size_t)world_count, sizeof(*evaluations));
+  int job_idx = 0;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    const bool eligible =
+        candidates[candidate_idx].kind == 0 &&
+        (!fixed_endgame ||
+         move_get_tiles_played(&candidates[candidate_idx].move) < args->bag);
+    if (candidate_idx == incumbent_idx || !eligible ||
+        out->cands[candidate_idx].eliminated) {
+      continue;
+    }
+    templates[job_idx] =
+        cpeg_build_root_template(root_game, &candidates[candidate_idx].move);
+    refine_jobs[job_idx] = (CpegWtlPlacementRefineJob){
+        .workers = workers,
+        .source_game = templates[job_idx],
+        .worlds = worlds,
+        .world_count = world_count,
+        .unseen = unseen,
+        .ld_size = ld_size,
+        .opponent_idx = opponent_idx,
+        .root_idx = root_idx,
+        .candidate = &candidates[candidate_idx],
+        .initial_lead = args->initial_lead,
+        .deadline_ns = deadline_ns,
+        .margin_prior = margin_prior,
+        .world_mass = world_mass,
+        .incumbent_win_lower = states[incumbent_idx].win_lower_mass,
+        .incumbent_outcome_mass = states[incumbent_idx].outcome_mass,
+        .max_defenses = max_defenses,
+        .result_candidate = &out->cands[candidate_idx],
+        .state = &states[candidate_idx],
+        .world_evaluations = &evaluations[job_idx * world_count],
+    };
+    refine_job_ptrs[job_idx] = &refine_jobs[job_idx];
+    job_idx++;
+  }
+  peg_pool_submit_and_wait(pool,
+                           fixed_endgame ? cpeg_wtl_fixed_defense_job_run
+                                         : cpeg_wtl_placement_refine_job_run,
+                           refine_job_ptrs, job_count, helper_worker_idx);
+
+  bool proof_valid = true;
+  for (int refine_idx = 0; refine_idx < job_count; refine_idx++) {
+    const CpegWtlPlacementRefineJob *job = &refine_jobs[refine_idx];
+    out->exact_jobs += job->exact_jobs;
+    out->bound_jobs += job->bound_jobs;
+    out->batches_completed += job->batches_completed;
+    if (!job->proof_valid) {
+      proof_valid = false;
+    }
+    if (job->deadline_reached) {
+      *stopped = true;
+    }
+    game_destroy(templates[refine_idx]);
+  }
+  free(evaluations);
+  free(templates);
+  free(refine_job_ptrs);
+  free(refine_jobs);
+  return proof_valid;
+}
+
+typedef struct CpegWtlFixedWorldJob {
+  CpegWtlPlacementRefineJob context;
+  int world_idx;
+  CpegWtlProofWorld result;
+  bool complete;
+  bool proof_valid;
+} CpegWtlFixedWorldJob;
+
+static void cpeg_wtl_fixed_world_job_run(void *arg, int worker_idx) {
+  CpegWtlFixedWorldJob *job = arg;
+  job->complete = true;
+  job->proof_valid = cpeg_wtl_fixed_defense_world(
+      &job->context, &job->context.workers[worker_idx], job->world_idx,
+      &job->result);
+  if (job->context.deadline_reached) {
+    job->complete = false;
+  }
+}
+
+static bool cpeg_wtl_refine_fixed_worlds_parallel(
+    PegPool *pool, CpegDefenseWorker *workers, int helper_worker_idx,
+    const Game *root_game, const CpegRootCand *candidates, int candidate_count,
+    const CpegScheduledWorld *worlds, int world_count, int64_t world_mass,
+    const int *unseen, int ld_size, int opponent_idx, int root_idx,
+    int incumbent_idx, const CpegWtlCertifiedArgs *args, int64_t deadline_ns,
+    CpegInterval margin_prior, CpegWtlCertifiedResult *out,
+    CpegWtlProofState *states, bool *stopped) {
+  int refine_count = 0;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx != incumbent_idx && candidates[candidate_idx].kind == 0 &&
+        move_get_tiles_played(&candidates[candidate_idx].move) < args->bag &&
+        !out->cands[candidate_idx].eliminated) {
+      refine_count++;
+    }
+  }
+  if (refine_count == 0) {
+    return true;
+  }
+  int *candidate_indices =
+      malloc_or_die((size_t)refine_count * sizeof(*candidate_indices));
+  Game **templates = calloc_or_die((size_t)refine_count, sizeof(*templates));
+  CpegWtlProofWorld *evaluations = calloc_or_die(
+      (size_t)refine_count * (size_t)world_count, sizeof(*evaluations));
+  const int job_count = refine_count * world_count;
+  CpegWtlFixedWorldJob *jobs = calloc_or_die((size_t)job_count, sizeof(*jobs));
+  void **job_ptrs = malloc_or_die((size_t)job_count * sizeof(*job_ptrs));
+  int refine_idx = 0;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx == incumbent_idx || candidates[candidate_idx].kind != 0 ||
+        move_get_tiles_played(&candidates[candidate_idx].move) >= args->bag ||
+        out->cands[candidate_idx].eliminated) {
+      continue;
+    }
+    candidate_indices[refine_idx] = candidate_idx;
+    templates[refine_idx] =
+        cpeg_build_root_template(root_game, &candidates[candidate_idx].move);
+    for (int world_idx = 0; world_idx < world_count; world_idx++) {
+      const int job_idx = refine_idx * world_count + world_idx;
+      jobs[job_idx] = (CpegWtlFixedWorldJob){
+          .context =
+              {
+                  .workers = workers,
+                  .source_game = templates[refine_idx],
+                  .worlds = worlds,
+                  .world_count = world_count,
+                  .unseen = unseen,
+                  .ld_size = ld_size,
+                  .opponent_idx = opponent_idx,
+                  .root_idx = root_idx,
+                  .candidate = &candidates[candidate_idx],
+                  .initial_lead = args->initial_lead,
+                  .deadline_ns = deadline_ns,
+                  .margin_prior = margin_prior,
+                  .world_mass = world_mass,
+              },
+          .world_idx = world_idx,
+      };
+      job_ptrs[job_idx] = &jobs[job_idx];
+    }
+    refine_idx++;
+  }
+  peg_pool_submit_and_wait(pool, cpeg_wtl_fixed_world_job_run, job_ptrs,
+                           job_count, helper_worker_idx);
+
+  bool proof_valid = true;
+  for (int job_idx = 0; job_idx < job_count; job_idx++) {
+    if (!jobs[job_idx].proof_valid) {
+      proof_valid = false;
+    }
+    if (!jobs[job_idx].complete) {
+      *stopped = true;
+      continue;
+    }
+    const int candidate_slot = job_idx / world_count;
+    const int world_idx = job_idx % world_count;
+    evaluations[candidate_slot * world_count + world_idx] =
+        jobs[job_idx].result;
+    out->bound_jobs++;
+    out->batches_completed++;
+  }
+  for (int candidate_slot = 0; candidate_slot < refine_count;
+       candidate_slot++) {
+    const int candidate_idx = candidate_indices[candidate_slot];
+    const int64_t draw_mass =
+        cpeg_wtl_candidate_draw_mass(&candidates[candidate_idx], args->bag);
+    cpeg_wtl_recompute_candidate(
+        &out->cands[candidate_idx], &states[candidate_idx],
+        &evaluations[candidate_slot * world_count], worlds, world_count,
+        world_mass, draw_mass, margin_prior);
+  }
+  for (int candidate_slot = 0; candidate_slot < refine_count;
+       candidate_slot++) {
+    game_destroy(templates[candidate_slot]);
+  }
+  free(job_ptrs);
+  free(jobs);
+  free(evaluations);
+  free(templates);
+  free(candidate_indices);
+  return proof_valid;
+}
+
+int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
+                                         const CpegWtlCertifiedArgs *args,
+                                         CpegWtlCertifiedResult *out) {
+  if (out == NULL) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  out->best_index = -1;
+  if (game == NULL || args == NULL || args->bag < 1 ||
+      args->bag > PEG_MAX_BAG || !isfinite(args->budget_seconds) ||
+      args->budget_seconds < 0.0 || args->max_batches < 0) {
+    return -1;
+  }
+
+  int result = -1;
+  bool proof_valid = true;
+  const int64_t deadline_ns = cpeg_wtl_proof_deadline_ns(args->budget_seconds);
+  Game *root_game = game_duplicate(game);
+  const LetterDistribution *ld = game_get_ld(root_game);
+  const int ld_size = ld_get_size(ld);
+  game_gen_all_cross_sets(root_game);
+  board_set_cross_sets_valid(game_get_board(root_game), true);
+  const int root_idx = game_get_player_on_turn_index(root_game);
+  const int opponent_idx = 1 - root_idx;
+  int unseen[MAX_ALPHABET_SIZE];
+  const int total_unseen = cpeg_compute_unseen(root_game, root_idx, unseen);
+  if (total_unseen - args->bag < 0 || total_unseen - args->bag > RACK_SIZE) {
+    game_destroy(root_game);
+    return -1;
+  }
+
+  CpegRootCollection root_collection = {0};
+  CpegScheduledWorld *worlds = NULL;
+  CpegDefenseWorker *workers = NULL;
+  PegPool *pool = NULL;
+  CpegDefenseJob *jobs = NULL;
+  void **job_ptrs = NULL;
+  int *candidate_order = NULL;
+  bool *candidates_refined = NULL;
+  CpegWtlProofState *states = NULL;
+  CpegWtlProofWorld *world_evaluations = NULL;
+  int scratch_count = 0;
+  if (!cpeg_collect_root_candidates(root_game, args->bag, args->allow_exchanges,
+                                    &root_collection)) {
+    goto cleanup;
+  }
+  CpegRootCand *candidates = root_collection.candidates;
+  const int candidate_count = root_collection.count;
+  out->coverage = root_collection.coverage;
+  out->cands = calloc_or_die((size_t)candidate_count, sizeof(*out->cands));
+  states = calloc_or_die((size_t)candidate_count, sizeof(*states));
+  candidate_order =
+      malloc_or_die((size_t)candidate_count * sizeof(*candidate_order));
+  candidates_refined =
+      calloc_or_die((size_t)candidate_count, sizeof(*candidates_refined));
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    candidate_order[candidate_idx] = candidate_idx;
+    cpeg_render_root_candidate(out->cands[candidate_idx].label,
+                               &candidates[candidate_idx],
+                               game_get_board(root_game), ld);
+    out->cands[candidate_idx].score = candidates[candidate_idx].score;
+    int insertion_idx = candidate_idx;
+    while (insertion_idx > 0 &&
+           cpeg_wtl_candidate_precedes(candidates, args->bag,
+                                       candidate_order[insertion_idx],
+                                       candidate_order[insertion_idx - 1])) {
+      const int previous = candidate_order[insertion_idx - 1];
+      candidate_order[insertion_idx - 1] = candidate_order[insertion_idx];
+      candidate_order[insertion_idx] = previous;
+      insertion_idx--;
+    }
+  }
+
+  CpegMultiset enumerated_worlds[CPEG_WORLD_CAP];
+  bool world_overflow = false;
+  const int world_count =
+      cpeg_enum_submultisets(unseen, ld_size, args->bag, enumerated_worlds,
+                             CPEG_WORLD_CAP, &world_overflow);
+  if (world_overflow || world_count < 1) {
+    goto cleanup;
+  }
+  worlds = malloc_or_die((size_t)world_count * sizeof(*worlds));
+  int64_t world_mass = 0;
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    worlds[world_idx] = (CpegScheduledWorld){
+        .multiset = enumerated_worlds[world_idx],
+        .generation_index = world_idx,
+    };
+    world_mass += enumerated_worlds[world_idx].weight;
+  }
+  cpeg_sort_scheduled_worlds(worlds, world_count);
+  out->worlds_distinct = world_count;
+  out->world_weight_mass = world_mass;
+  const int root_score_bound =
+      cpeg_score_upper_bound(game_get_board(root_game), root_game);
+  const CpegInterval root_spread_prior =
+      cpeg_scoreless_prior(args->bag, root_score_bound);
+  const CpegInterval unresolved_margin_prior = {
+      .lo = cpeg_down_add((double)args->initial_lead, root_spread_prior.lo),
+      .hi = cpeg_up_add((double)args->initial_lead, root_spread_prior.hi),
+  };
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    const int64_t draw_mass =
+        cpeg_wtl_candidate_draw_mass(&candidates[candidate_idx], args->bag);
+    const int64_t outcome_mass = world_mass * draw_mass;
+    states[candidate_idx] = (CpegWtlProofState){
+        .win_upper_mass = outcome_mass,
+        .tie_upper_mass = outcome_mass,
+        .loss_upper_mass = outcome_mass,
+        .outcome_mass = outcome_mass,
+        .outcome = cpeg_wtl_unresolved_envelope(unresolved_margin_prior),
+    };
+    CpegWtlCertifiedCand *result_candidate = &out->cands[candidate_idx];
+    result_candidate->outcome = states[candidate_idx].outcome;
+    result_candidate->outcome_den = outcome_mass;
+    result_candidate->win_upper_num = outcome_mass;
+    result_candidate->tie_upper_num = outcome_mass;
+    result_candidate->loss_upper_num = outcome_mass;
+    result_candidate->worlds_unresolved = world_count;
+  }
+
+  const int thread_count = args->num_threads < 1 ? 1 : args->num_threads;
+  pool = thread_count > 1 ? peg_pool_create(thread_count, 0) : NULL;
+  if (pool != NULL) {
+    peg_pool_set_stuck_timeout_seconds(pool, 0);
+  }
+  scratch_count = pool != NULL ? thread_count + 1 : 1;
+  workers = calloc_or_die((size_t)scratch_count, sizeof(*workers));
+  for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+    workers[worker_idx].opponent_game = game_duplicate(root_game);
+    workers[worker_idx].draw_game = game_duplicate(root_game);
+    workers[worker_idx].defense_game = game_duplicate(root_game);
+    workers[worker_idx].opponent_moves =
+        move_list_create_small(CPEG_MOVE_LIST_CAP + 1);
+    workers[worker_idx].root_best = move_list_create(1);
+    workers[worker_idx].defense_undo = malloc_or_die(sizeof(MoveUndo));
+    workers[worker_idx].endgame_mover =
+        move_list_create(CPEG_MOVE_LIST_CAP + 1);
+    workers[worker_idx].endgame_reply = move_list_create(CPEG_MOVE_LIST_CAP);
+    workers[worker_idx].endgame_undo = malloc_or_die(sizeof(MoveUndo));
+  }
+  int batch_size = args->batch_size > 0 ? args->batch_size : 64;
+  if (batch_size > world_count) {
+    batch_size = world_count;
+  }
+  jobs = calloc_or_die((size_t)batch_size, sizeof(*jobs));
+  job_ptrs = malloc_or_die((size_t)batch_size * sizeof(*job_ptrs));
+  world_evaluations =
+      calloc_or_die((size_t)world_count, sizeof(*world_evaluations));
+  const int helper_worker_idx = pool != NULL ? thread_count : 0;
+
+  int incumbent_idx = -1;
+  bool stopped = false;
+  for (int order_idx = 0; order_idx < candidate_count && !stopped;
+       order_idx++) {
+    if (args->max_batches == 0 && incumbent_idx >= 0) {
+      break;
+    }
+    const int candidate_idx = candidate_order[order_idx];
+    const CpegRootCand *candidate = &candidates[candidate_idx];
+    if (candidate->kind != 0) {
+      continue;
+    }
+    const bool horizon =
+        move_get_tiles_played(&candidate->move) >= args->bag;
+    const bool bootstrap = incumbent_idx < 0 && horizon;
+    Game *template_game =
+        candidate->kind == 0
+            ? cpeg_build_root_template(root_game, &candidate->move)
+            : NULL;
+    const Game *source_game = template_game != NULL ? template_game : root_game;
+    const CpegInterval margin_prior = unresolved_margin_prior;
+    const int64_t draw_mass =
+        cpeg_wtl_candidate_draw_mass(candidate, args->bag);
+    memset(world_evaluations, 0,
+           (size_t)world_count * sizeof(*world_evaluations));
+
+    for (int first_world = 0; first_world < world_count;
+         first_world += batch_size) {
+      if (cpeg_wtl_proof_budget_reached(deadline_ns, args->max_batches,
+                                        out->batches_completed)) {
+        stopped = true;
+        break;
+      }
+      int batch_count = world_count - first_world;
+      if (batch_count > batch_size) {
+        batch_count = batch_size;
+      }
+      bool batch_complete = false;
+      proof_valid = cpeg_wtl_run_defense_batch(
+          pool, workers, helper_worker_idx, jobs, job_ptrs, first_world,
+          batch_count, source_game, worlds, unseen, ld_size, opponent_idx,
+          root_idx, candidate, args->initial_lead, deadline_ns, margin_prior,
+          bootstrap, bootstrap ? 0 : 1, world_evaluations, &out->exact_jobs,
+          &out->bound_jobs, &batch_complete);
+      if (!proof_valid || !batch_complete) {
+        stopped = true;
+        break;
+      }
+      out->batches_completed++;
+      cpeg_wtl_recompute_candidate(
+          &out->cands[candidate_idx], &states[candidate_idx], world_evaluations,
+          worlds, world_count, world_mass, draw_mass, margin_prior);
+      if (incumbent_idx >= 0 &&
+          cpeg_wtl_fraction_less(states[candidate_idx].win_upper_mass,
+                                 states[candidate_idx].outcome_mass,
+                                 states[incumbent_idx].win_lower_mass,
+                                 states[incumbent_idx].outcome_mass,
+                                 &proof_valid)) {
+        out->cands[candidate_idx].eliminated = true;
+        break;
+      }
+      if (!proof_valid) {
+        stopped = true;
+        break;
+      }
+    }
+
+    if (stopped || out->cands[candidate_idx].eliminated) {
+      if (template_game != NULL) {
+        game_destroy(template_game);
+      }
+      continue;
+    }
+    cpeg_wtl_recompute_candidate(
+        &out->cands[candidate_idx], &states[candidate_idx], world_evaluations,
+        worlds, world_count, world_mass, draw_mass, margin_prior);
+    const bool improves_incumbent =
+        horizon && (incumbent_idx < 0 ||
+                    cpeg_wtl_fraction_less(states[incumbent_idx].win_lower_mass,
+                                           states[incumbent_idx].outcome_mass,
+                                           states[candidate_idx].win_lower_mass,
+                                           states[candidate_idx].outcome_mass,
+                                           &proof_valid));
+    if (improves_incumbent && !bootstrap) {
+      memset(world_evaluations, 0,
+             (size_t)world_count * sizeof(*world_evaluations));
+      for (int first_world = 0; first_world < world_count;
+           first_world += batch_size) {
+        if (cpeg_wtl_proof_budget_reached(deadline_ns, args->max_batches,
+                                          out->batches_completed)) {
+          stopped = true;
+          break;
+        }
+        int batch_count = world_count - first_world;
+        if (batch_count > batch_size) {
+          batch_count = batch_size;
+        }
+        bool batch_complete = false;
+        proof_valid = cpeg_wtl_run_defense_batch(
+            pool, workers, helper_worker_idx, jobs, job_ptrs, first_world,
+            batch_count, source_game, worlds, unseen, ld_size, opponent_idx,
+            root_idx, candidate, args->initial_lead, deadline_ns, margin_prior,
+            /*exhaustive_horizon=*/true, /*max_defenses=*/0, world_evaluations,
+            &out->exact_jobs, &out->bound_jobs, &batch_complete);
+        if (!proof_valid || !batch_complete) {
+          stopped = true;
+          break;
+        }
+        out->batches_completed++;
+      }
+      cpeg_wtl_recompute_candidate(
+          &out->cands[candidate_idx], &states[candidate_idx], world_evaluations,
+          worlds, world_count, world_mass, draw_mass, margin_prior);
+    }
+    if (improves_incumbent && !stopped) {
+      incumbent_idx = candidate_idx;
+    }
+    if (template_game != NULL) {
+      game_destroy(template_game);
+    }
+    if (!proof_valid) {
+      stopped = true;
+    }
+  }
+
+  if (!stopped && args->max_batches == 0 && incumbent_idx >= 0) {
+    proof_valid = cpeg_wtl_screen_placements_parallel(
+        pool, workers, helper_worker_idx, root_game, candidates,
+        candidate_count, worlds, world_count, world_mass, unseen, ld_size,
+        opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
+        unresolved_margin_prior, out, states, &stopped);
+  }
+
+  // Stage B: refine horizon-collapsing challengers by their proved strict-win
+  // upper mass, not by score or label. A root-empty action has one
+  // deterministic draw per world, so exhausting its opponent final actions
+  // establishes exact W/T/L integer mass without entering the recursive
+  // pre-endgame solver.
+  while (!stopped && incumbent_idx >= 0) {
+    int challenger_idx = -1;
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      const bool horizon =
+          candidates[candidate_idx].kind == 0 &&
+          move_get_tiles_played(&candidates[candidate_idx].move) >= args->bag;
+      if (!horizon || candidate_idx == incumbent_idx ||
+          candidates_refined[candidate_idx] ||
+          out->cands[candidate_idx].eliminated) {
+        continue;
+      }
+      if (cpeg_wtl_fraction_less(states[candidate_idx].win_upper_mass,
+                                 states[candidate_idx].outcome_mass,
+                                 states[incumbent_idx].win_lower_mass,
+                                 states[incumbent_idx].outcome_mass,
+                                 &proof_valid)) {
+        out->cands[candidate_idx].eliminated = true;
+        continue;
+      }
+      if (challenger_idx < 0) {
+        challenger_idx = candidate_idx;
+        continue;
+      }
+      const CpegWtlProofState *challenger_state = &states[challenger_idx];
+      const CpegWtlProofState *candidate_state = &states[candidate_idx];
+      const bool candidate_has_higher_upper = cpeg_wtl_fraction_less(
+          challenger_state->win_upper_mass, challenger_state->outcome_mass,
+          candidate_state->win_upper_mass, candidate_state->outcome_mass,
+          &proof_valid);
+      if (!proof_valid) {
+        break;
+      }
+      const bool equal_upper =
+          challenger_state->win_upper_mass * candidate_state->outcome_mass ==
+          candidate_state->win_upper_mass * challenger_state->outcome_mass;
+      if (candidate_has_higher_upper ||
+          (equal_upper && candidate_idx < challenger_idx)) {
+        challenger_idx = candidate_idx;
+      }
+    }
+    if (!proof_valid || challenger_idx < 0) {
+      break;
+    }
+    candidates_refined[challenger_idx] = true;
+    const CpegRootCand *candidate = &candidates[challenger_idx];
+    Game *template_game = cpeg_build_root_template(root_game, &candidate->move);
+    memset(world_evaluations, 0,
+           (size_t)world_count * sizeof(*world_evaluations));
+    for (int first_world = 0; first_world < world_count;
+         first_world += batch_size) {
+      if (cpeg_wtl_proof_budget_reached(deadline_ns, args->max_batches,
+                                        out->batches_completed)) {
+        stopped = true;
+        break;
+      }
+      int batch_count = world_count - first_world;
+      if (batch_count > batch_size) {
+        batch_count = batch_size;
+      }
+      bool batch_complete = false;
+      proof_valid = cpeg_wtl_run_defense_batch(
+          pool, workers, helper_worker_idx, jobs, job_ptrs, first_world,
+          batch_count, template_game, worlds, unseen, ld_size, opponent_idx,
+          root_idx, candidate, args->initial_lead, deadline_ns,
+          unresolved_margin_prior, /*exhaustive_horizon=*/false,
+          /*max_defenses=*/0, world_evaluations, &out->exact_jobs,
+          &out->bound_jobs, &batch_complete);
+      if (!proof_valid || !batch_complete) {
+        stopped = true;
+        break;
+      }
+      out->batches_completed++;
+    }
+    cpeg_wtl_recompute_candidate(&out->cands[challenger_idx],
+                                 &states[challenger_idx], world_evaluations,
+                                 worlds, world_count, world_mass,
+                                 /*draw_mass=*/1, unresolved_margin_prior);
+    const bool improves = cpeg_wtl_fraction_less(
+        states[incumbent_idx].win_lower_mass,
+        states[incumbent_idx].outcome_mass,
+        states[challenger_idx].win_lower_mass,
+        states[challenger_idx].outcome_mass, &proof_valid);
+    if (improves && !stopped) {
+      incumbent_idx = challenger_idx;
+    }
+    game_destroy(template_game);
+    if (improves && !stopped) {
+      break;
+    }
+  }
+
+  if (!stopped) {
+    if (args->max_batches == 0) {
+      proof_valid = cpeg_wtl_screen_scoreless_candidates_parallel(
+          pool, workers, helper_worker_idx, root_game, candidates,
+          candidate_count, worlds, world_count, world_mass, unseen, ld_size,
+          root_idx, opponent_idx, args, deadline_ns, unresolved_margin_prior,
+          out, states, &stopped);
+    } else {
+      proof_valid = cpeg_wtl_screen_scoreless_candidates(
+          root_game, candidates, candidate_count, worlds, world_count,
+          world_mass, unseen, ld_size, root_idx, opponent_idx, args,
+          deadline_ns, unresolved_margin_prior, out, states, &stopped);
+    }
+  }
+
+  if (!stopped && incumbent_idx >= 0) {
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      if (candidate_idx == incumbent_idx) {
+        continue;
+      }
+      out->cands[candidate_idx].eliminated = cpeg_wtl_fraction_less(
+          states[candidate_idx].win_upper_mass,
+          states[candidate_idx].outcome_mass,
+          states[incumbent_idx].win_lower_mass,
+          states[incumbent_idx].outcome_mass, &proof_valid);
+    }
+  }
+  if (proof_valid && !stopped && args->max_batches == 0 && incumbent_idx >= 0) {
+    proof_valid = cpeg_wtl_refine_surviving_placements(
+        pool, workers, helper_worker_idx, root_game, candidates,
+        candidate_count, worlds, world_count, world_mass, unseen, ld_size,
+        opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
+        unresolved_margin_prior, /*max_defenses=*/64,
+        /*fixed_endgame=*/false, out, states, &stopped);
+  }
+  if (proof_valid && !stopped && incumbent_idx >= 0) {
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      if (candidate_idx == incumbent_idx) {
+        continue;
+      }
+      out->cands[candidate_idx].eliminated = cpeg_wtl_fraction_less(
+          states[candidate_idx].win_upper_mass,
+          states[candidate_idx].outcome_mass,
+          states[incumbent_idx].win_lower_mass,
+          states[incumbent_idx].outcome_mass, &proof_valid);
+    }
+  }
+  if (proof_valid && !stopped && args->max_batches == 0 && incumbent_idx >= 0) {
+    proof_valid = cpeg_wtl_refine_fixed_worlds_parallel(
+        pool, workers, helper_worker_idx, root_game, candidates,
+        candidate_count, worlds, world_count, world_mass, unseen, ld_size,
+        opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
+        unresolved_margin_prior, out, states, &stopped);
+  }
+
+  if (!proof_valid) {
+    goto cleanup;
+  }
+  if (incumbent_idx >= 0) {
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      if (candidate_idx == incumbent_idx) {
+        continue;
+      }
+      out->cands[candidate_idx].eliminated = cpeg_wtl_fraction_less(
+          states[candidate_idx].win_upper_mass,
+          states[candidate_idx].outcome_mass,
+          states[incumbent_idx].win_lower_mass,
+          states[incumbent_idx].outcome_mass, &proof_valid);
+    }
+  }
+  if (!proof_valid) {
+    goto cleanup;
+  }
+  bool certified = incumbent_idx >= 0;
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx != incumbent_idx &&
+        !out->cands[candidate_idx].eliminated) {
+      certified = false;
+      break;
+    }
+  }
+  out->status = certified ? CPEG_PRE_CERTIFIED : CPEG_PRE_BOUNDED;
+  out->best_index = incumbent_idx >= 0 ? incumbent_idx : candidate_order[0];
+  out->unique_best = certified;
+  out->count = candidate_count;
+  out->regret_num = 0;
+  out->regret_den = 1;
+  const CpegWtlCertifiedCand *selected = &out->cands[out->best_index];
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidate_idx == out->best_index) {
+      continue;
+    }
+    const CpegWtlCertifiedCand *other = &out->cands[candidate_idx];
+    if (other->win_upper_num > 0 &&
+        selected->outcome_den > INT64_MAX / other->win_upper_num) {
+      proof_valid = false;
+      break;
+    }
+    if (selected->win_lower_num > 0 &&
+        other->outcome_den > INT64_MAX / selected->win_lower_num) {
+      proof_valid = false;
+      break;
+    }
+    const int64_t upper_scaled = other->win_upper_num * selected->outcome_den;
+    const int64_t lower_scaled = selected->win_lower_num * other->outcome_den;
+    if (upper_scaled <= lower_scaled) {
+      continue;
+    }
+    if (other->outcome_den > INT64_MAX / selected->outcome_den) {
+      proof_valid = false;
+      break;
+    }
+    const int64_t regret_num = upper_scaled - lower_scaled;
+    const int64_t regret_den = other->outcome_den * selected->outcome_den;
+    if (cpeg_wtl_fraction_less(out->regret_num, out->regret_den, regret_num,
+                               regret_den, &proof_valid)) {
+      out->regret_num = regret_num;
+      out->regret_den = regret_den;
+    }
+  }
+  if (!proof_valid) {
+    goto cleanup;
+  }
+  out->decision_regret_bound =
+      (double)out->regret_num / (double)out->regret_den;
+  result = candidate_count;
+
+cleanup:
+  free(world_evaluations);
+  free(candidates_refined);
+  free(states);
+  free(candidate_order);
+  free(job_ptrs);
+  free(jobs);
+  peg_pool_destroy(pool);
+  if (workers != NULL) {
+    for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
+      move_list_destroy(workers[worker_idx].root_best);
+      small_move_list_destroy(workers[worker_idx].opponent_moves);
+      free(workers[worker_idx].endgame_undo);
+      move_list_destroy(workers[worker_idx].endgame_reply);
+      move_list_destroy(workers[worker_idx].endgame_mover);
+      free(workers[worker_idx].defense_undo);
+      game_destroy(workers[worker_idx].defense_game);
+      game_destroy(workers[worker_idx].draw_game);
+      game_destroy(workers[worker_idx].opponent_game);
+    }
+  }
+  free(workers);
+  free(worlds);
+  cpeg_root_collection_destroy(&root_collection);
+  game_destroy(root_game);
+  if (result < 0) {
+    cpeg_wtl_certified_result_destroy(out);
+  }
+  return result;
 }
 
 static void cpeg_sort_candidate_order(const CpegCandState *states, int *order,

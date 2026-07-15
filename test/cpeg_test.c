@@ -1434,6 +1434,238 @@ void test_cpeg_wtl_senator(void) {
   config_destroy(config);
 }
 
+static void cpeg_assert_wtl_certified_candidate_valid(
+    const CpegWtlCertifiedCand *candidate) {
+  assert(candidate->outcome_den > 0);
+  assert(candidate->win_lower_num >= 0);
+  assert(candidate->win_lower_num <= candidate->win_upper_num);
+  assert(candidate->win_upper_num <= candidate->outcome_den);
+  assert(candidate->tie_lower_num >= 0);
+  assert(candidate->tie_lower_num <= candidate->tie_upper_num);
+  assert(candidate->tie_upper_num <= candidate->outcome_den);
+  assert(candidate->loss_lower_num >= 0);
+  assert(candidate->loss_lower_num <= candidate->loss_upper_num);
+  assert(candidate->loss_upper_num <= candidate->outcome_den);
+  assert(candidate->outcome.estimate.win >= candidate->outcome.win.lo);
+  assert(candidate->outcome.estimate.win <= candidate->outcome.win.hi);
+  assert(candidate->outcome.estimate.tie >= candidate->outcome.tie.lo);
+  assert(candidate->outcome.estimate.tie <= candidate->outcome.tie.hi);
+  assert(candidate->outcome.estimate.loss >= candidate->outcome.loss.lo);
+  assert(candidate->outcome.estimate.loss <= candidate->outcome.loss.hi);
+  assert(fabs(candidate->outcome.estimate.win +
+              candidate->outcome.estimate.tie +
+              candidate->outcome.estimate.loss - 1.0) < 1e-15);
+}
+
+static void
+cpeg_assert_wtl_certified_results_equal(const CpegWtlCertifiedResult *lhs,
+                                        const CpegWtlCertifiedResult *rhs) {
+  assert(lhs->status == rhs->status);
+  assert(lhs->count == rhs->count);
+  assert(lhs->best_index == rhs->best_index);
+  assert(lhs->worlds_distinct == rhs->worlds_distinct);
+  assert(lhs->world_weight_mass == rhs->world_weight_mass);
+  assert(lhs->coverage.total == rhs->coverage.total);
+  for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
+    const CpegWtlCertifiedCand *lhs_candidate = &lhs->cands[candidate_idx];
+    const CpegWtlCertifiedCand *rhs_candidate = &rhs->cands[candidate_idx];
+    assert_strings_equal(lhs_candidate->label, rhs_candidate->label);
+    assert(lhs_candidate->outcome_den == rhs_candidate->outcome_den);
+    assert(lhs_candidate->win_lower_num == rhs_candidate->win_lower_num);
+    assert(lhs_candidate->win_upper_num == rhs_candidate->win_upper_num);
+    assert(lhs_candidate->tie_lower_num == rhs_candidate->tie_lower_num);
+    assert(lhs_candidate->tie_upper_num == rhs_candidate->tie_upper_num);
+    assert(lhs_candidate->loss_lower_num == rhs_candidate->loss_lower_num);
+    assert(lhs_candidate->loss_upper_num == rhs_candidate->loss_upper_num);
+  }
+}
+
+static const CpegWtlCertifiedCand *
+cpeg_find_wtl_certified_candidate(const CpegWtlCertifiedResult *result,
+                                  const char *label) {
+  for (int candidate_idx = 0; candidate_idx < result->count; candidate_idx++) {
+    if (strcmp(result->cands[candidate_idx].label, label) == 0) {
+      return &result->cands[candidate_idx];
+    }
+  }
+  return NULL;
+}
+
+void test_cpeg_wtl_certified_proof(void) {
+  const CpegInterval prior = {.lo = -100.0, .hi = 100.0};
+  const CpegWtlEnvelope proved_loss =
+      cpeg_wtl_envelope_from_margin_upper(-1, prior);
+  assert(proved_loss.win.lo == 0.0 && proved_loss.win.hi == 0.0);
+  assert(proved_loss.tie.lo == 0.0 && proved_loss.tie.hi == 0.0);
+  assert(proved_loss.loss.lo == 1.0 && proved_loss.loss.hi == 1.0);
+  const CpegWtlEnvelope no_strict_win =
+      cpeg_wtl_envelope_from_margin_upper(0, prior);
+  assert(no_strict_win.win.lo == 0.0 && no_strict_win.win.hi == 0.0);
+  assert(!cpeg_wtl_envelope_dominates(&no_strict_win, &proved_loss));
+  assert(!cpeg_wtl_envelope_dominates(&proved_loss, &no_strict_win));
+  const CpegWtlEnvelope exact_tie = {
+      .estimate = {.tie = 1.0},
+      .win = {.lo = 0.0, .hi = 0.0},
+      .tie = {.lo = 1.0, .hi = 1.0},
+      .loss = {.lo = 0.0, .hi = 0.0},
+      .expected_final_margin = {.lo = 0.0, .hi = 0.0},
+  };
+  assert(cpeg_wtl_envelope_dominates(&exact_tie, &proved_loss));
+
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 1");
+  const CpegWtlCertifiedArgs one_thread_args = {
+      .bag = 4,
+      .allow_exchanges = true,
+      .num_threads = 1,
+      .initial_lead = -51,
+      .budget_seconds = 0.0,
+      .batch_size = 1,
+      .max_batches = 1,
+  };
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  CpegWtlCertifiedResult one_thread = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &one_thread_args, &one_thread) == 1314);
+  assert(one_thread.status == CPEG_PRE_BOUNDED);
+  assert(one_thread.coverage.placements == 1215);
+  assert(one_thread.coverage.exchanges == 98);
+  assert(one_thread.coverage.passes == 1);
+  assert(one_thread.coverage.total == 1314);
+  assert(one_thread.coverage.generation_complete);
+  assert(one_thread.worlds_distinct == 246);
+  assert(one_thread.world_weight_mass == 330);
+  for (int candidate_idx = 0; candidate_idx < one_thread.count;
+       candidate_idx++) {
+    cpeg_assert_wtl_certified_candidate_valid(&one_thread.cands[candidate_idx]);
+  }
+
+  CpegWtlCertifiedArgs four_thread_args = one_thread_args;
+  four_thread_args.num_threads = 4;
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  CpegWtlCertifiedResult four_threads = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config),
+                                              &four_thread_args,
+                                              &four_threads) == 1314);
+  cpeg_assert_wtl_certified_results_equal(&one_thread, &four_threads);
+  cpeg_wtl_certified_result_destroy(&four_threads);
+  cpeg_wtl_certified_result_destroy(&one_thread);
+
+  const CpegWtlCertifiedArgs compact_args = {
+      .bag = 1,
+      .allow_exchanges = false,
+      .num_threads = 4,
+      .initial_lead = -50,
+      .budget_seconds = 10.0,
+  };
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  CpegWtlCertifiedResult compact = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config),
+                                              &compact_args, &compact) > 0);
+  assert(compact.status == CPEG_PRE_CERTIFIED);
+  assert(compact.unique_best);
+  assert_strings_equal(compact.cands[compact.best_index].label, "15J BEET");
+  assert(compact.cands[compact.best_index].win_lower_num == 1);
+  assert(compact.cands[compact.best_index].win_upper_num == 1);
+  assert(compact.cands[compact.best_index].outcome_den == 8);
+  assert(compact.regret_num == 0);
+  assert(compact.regret_den == 1);
+  cpeg_wtl_certified_result_destroy(&compact);
+
+  // Exchange draws come from the pre-exchange bag: returned tiles are not
+  // eligible to be redrawn on the same turn. Check every bag-one exchange
+  // enclosure against the exact W/T/L oracle, and require a contracted bound
+  // so this is not satisfied by an untouched [0, 1] prior.
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  const CpegWtlArgs exchange_oracle_args = {
+      .bag = 1,
+      .allow_exchanges = true,
+      .num_threads = 4,
+      .initial_lead = -51,
+  };
+  CpegWtlResult exchange_oracle = {0};
+  assert(cpeg_solve_pre_endgame_wtl(config_get_game(config),
+                                    &exchange_oracle_args,
+                                    &exchange_oracle) > 0);
+  const CpegWtlCertifiedArgs exchange_bound_args = {
+      .bag = 1,
+      .allow_exchanges = true,
+      .num_threads = 4,
+      .initial_lead = -51,
+      .budget_seconds = 10.0,
+  };
+  CpegWtlCertifiedResult exchange_bounds = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config),
+                                              &exchange_bound_args,
+                                              &exchange_bounds) > 0);
+  int exchanges_checked = 0;
+  bool saw_contracted_exchange = false;
+  for (int candidate_idx = 0; candidate_idx < exchange_oracle.count;
+       candidate_idx++) {
+    const CpegWtlCand *exact = &exchange_oracle.cands[candidate_idx];
+    if (strncmp(exact->label, "exch:", 5) != 0) {
+      continue;
+    }
+    const CpegWtlCertifiedCand *bounded =
+        cpeg_find_wtl_certified_candidate(&exchange_bounds, exact->label);
+    assert(bounded != NULL);
+    const int64_t exact_win =
+        (int64_t)llround(exact->value.win * (double)bounded->outcome_den);
+    const int64_t exact_tie_mass =
+        (int64_t)llround(exact->value.tie * (double)bounded->outcome_den);
+    const int64_t exact_loss =
+        (int64_t)llround(exact->value.loss * (double)bounded->outcome_den);
+    assert(bounded->win_lower_num <= exact_win);
+    assert(exact_win <= bounded->win_upper_num);
+    assert(bounded->tie_lower_num <= exact_tie_mass);
+    assert(exact_tie_mass <= bounded->tie_upper_num);
+    assert(bounded->loss_lower_num <= exact_loss);
+    assert(exact_loss <= bounded->loss_upper_num);
+    if (bounded->win_upper_num < bounded->outcome_den) {
+      saw_contracted_exchange = true;
+    }
+    exchanges_checked++;
+  }
+  assert(exchanges_checked > 0);
+  assert(saw_contracted_exchange);
+  cpeg_wtl_certified_result_destroy(&exchange_bounds);
+  cpeg_wtl_result_destroy(&exchange_oracle);
+  config_destroy(config);
+}
+
+void test_cpeg_wtl_certified_senator_acceptance(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 6");
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  const CpegWtlCertifiedArgs args = {
+      .bag = 4,
+      .allow_exchanges = true,
+      .num_threads = 6,
+      .initial_lead = -51,
+      .budget_seconds = 42.0,
+  };
+  CpegWtlCertifiedResult result = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config), &args,
+                                              &result) == 1314);
+  assert(result.status == CPEG_PRE_CERTIFIED);
+  assert(result.unique_best);
+  assert_strings_equal(result.cands[result.best_index].label, "13F TOSA");
+  assert(result.cands[result.best_index].win_lower_num == 42);
+  assert(result.cands[result.best_index].win_upper_num == 42);
+  assert(result.cands[result.best_index].outcome_den == 330);
+  assert(result.coverage.placements == 1215);
+  assert(result.coverage.exchanges == 98);
+  assert(result.coverage.passes == 1);
+  assert(result.coverage.total == 1314);
+  assert(result.coverage.generation_complete);
+  assert(result.regret_num == 0);
+  assert(result.regret_den == 1);
+  cpeg_wtl_certified_result_destroy(&result);
+  config_destroy(config);
+}
+
 void test_cpeg(void) {
   test_cpeg_endgame();
   test_cpeg_wtl_value_core();
