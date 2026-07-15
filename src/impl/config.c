@@ -3385,11 +3385,17 @@ static void impl_cpeg_endgame(Config *config, ErrorStack *error_stack) {
 static void impl_cpeg_pre_endgame(Config *config, int bag,
                                   bool allow_exchanges) {
   Game *game = config->game;
-  CpegPreResult result;
+  CpegPreResult result = {0};
   cpeg_solve_pre_endgame(game, bag, allow_exchanges,
                          config_get_num_threads(config), &result);
 
   StringBuilder *line = string_builder_create();
+  string_builder_add_formatted_string(
+      line,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
   for (int cand_idx = 0; cand_idx < result.count; cand_idx++) {
     const CpegPreCand *cand = &result.cands[cand_idx];
     string_builder_add_formatted_string(line, "cpeg-cand %d %s %d %.4f\n",
@@ -3400,6 +3406,59 @@ static void impl_cpeg_pre_endgame(Config *config, int bag,
   string_builder_destroy(line);
   thread_control_print(config->thread_control, out);
   free(out);
+  cpeg_pre_result_destroy(&result);
+}
+
+// Stable, full-precision score-aware exact output. Probabilities and expected
+// margin are emitted with enough significant digits to round-trip through the
+// Python service's 1e-9 probability-mass validation.
+static void impl_cpeg_wtl(Config *config, int bag, bool allow_exchanges,
+                          int64_t initial_lead, ErrorStack *error_stack) {
+  CpegWtlResult result = {0};
+  const CpegWtlArgs args = {
+      .bag = bag,
+      .allow_exchanges = allow_exchanges,
+      .num_threads = config_get_num_threads(config),
+      .initial_lead = initial_lead,
+  };
+  if (cpeg_solve_pre_endgame_wtl(config->game, &args, &result) < 1) {
+    cpeg_wtl_result_destroy(&result);
+    error_stack_push(error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
+                     string_duplicate("cpeg score-aware exact solve failed"));
+    return;
+  }
+
+  const CpegWtlCand *best = &result.cands[0];
+  StringBuilder *lines = string_builder_create();
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-wtl status=EXACT_VALUES objective=strict_win_probability_v1 "
+      "lead=%lld best=%s score=%d win=%.17g tie=%.17g loss=%.17g "
+      "margin=%.17g worlds=%d mass=%lld\n",
+      (long long)initial_lead, best->label, best->score, best->value.win,
+      best->value.tie, best->value.loss, best->value.expected_final_margin,
+      result.worlds_distinct, (long long)result.world_weight_mass);
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
+  for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
+    const CpegWtlCand *candidate = &result.cands[candidate_idx];
+    string_builder_add_formatted_string(
+        lines,
+        "cpeg-wtl-cand %d %s %d win=%.17g tie=%.17g loss=%.17g "
+        "margin=%.17g\n",
+        candidate_idx + 1, candidate->label, candidate->score,
+        candidate->value.win, candidate->value.tie, candidate->value.loss,
+        candidate->value.expected_final_margin);
+  }
+  char *output = string_builder_dump(lines, NULL);
+  string_builder_destroy(lines);
+  thread_control_print(config->thread_control, output);
+  free(output);
+  cpeg_wtl_result_destroy(&result);
 }
 
 static const char *cpeg_certified_status_name(CpegPreStatus status) {
@@ -3408,12 +3467,143 @@ static const char *cpeg_certified_status_name(CpegPreStatus status) {
     return "CERTIFIED";
   case CPEG_PRE_EXACT_VALUES:
     return "EXACT_VALUES";
+  case CPEG_PRE_BOUNDED:
+    return "BOUNDED";
   case CPEG_PRE_ESTIMATED:
     return "ESTIMATED";
   case CPEG_PRE_STATISTICAL:
     return "STATISTICAL";
   }
   return "UNKNOWN";
+}
+
+static bool
+cpeg_wtl_proof_candidate_precedes(const CpegWtlCertifiedResult *result,
+                                  int lhs_idx, int rhs_idx) {
+  if (lhs_idx == result->best_index || rhs_idx == result->best_index) {
+    return lhs_idx == result->best_index;
+  }
+  const CpegWtlCertifiedCand *lhs = &result->cands[lhs_idx];
+  const CpegWtlCertifiedCand *rhs = &result->cands[rhs_idx];
+  if (lhs->outcome.win.hi != rhs->outcome.win.hi) {
+    return lhs->outcome.win.hi > rhs->outcome.win.hi;
+  }
+  if (lhs->score != rhs->score) {
+    return lhs->score > rhs->score;
+  }
+  return strcmp(lhs->label, rhs->label) < 0;
+}
+
+static void impl_cpeg_wtl_certified(Config *config, int bag,
+                                    bool allow_exchanges, int64_t initial_lead,
+                                    double budget_seconds,
+                                    ErrorStack *error_stack) {
+  CpegWtlCertifiedResult result = {0};
+  const CpegWtlCertifiedArgs args = {
+      .bag = bag,
+      .allow_exchanges = allow_exchanges,
+      .num_threads = config_get_num_threads(config),
+      .initial_lead = initial_lead,
+      .budget_seconds = budget_seconds,
+      .batch_size = 0,
+      .max_batches = 0,
+  };
+  if (cpeg_solve_pre_endgame_wtl_certified(config->game, &args, &result) < 1) {
+    cpeg_wtl_certified_result_destroy(&result);
+    error_stack_push(
+        error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
+        string_duplicate("cpeg score-aware certified solve failed"));
+    return;
+  }
+
+  const CpegWtlCertifiedCand *best = &result.cands[result.best_index];
+  StringBuilder *lines = string_builder_create();
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-wtl-proof status=%s objective=strict_win_probability_v1 "
+      "model=world_clairvoyant posterior=uniform_inventory_v1 "
+      "cycle_independent=1 lead=%lld best=%s score=%d "
+      "win=%.17g win_lo=%.17g win_hi=%.17g "
+      "win_lo_num=%lld win_hi_num=%lld "
+      "tie=%.17g tie_lo=%.17g tie_hi=%.17g "
+      "tie_lo_num=%lld tie_hi_num=%lld "
+      "loss=%.17g loss_lo=%.17g loss_hi=%.17g "
+      "loss_lo_num=%lld loss_hi_num=%lld outcome_den=%lld "
+      "margin=%.17g margin_lo=%.17g margin_hi=%.17g "
+      "worlds=%d mass=%lld exact_jobs=%d bound_jobs=%d batches=%d "
+      "regret=%.17g regret_num=%lld regret_den=%lld unique=%d\n",
+      cpeg_certified_status_name(result.status), (long long)initial_lead,
+      best->label, best->score, best->outcome.estimate.win,
+      best->outcome.win.lo, best->outcome.win.hi,
+      (long long)best->win_lower_num, (long long)best->win_upper_num,
+      best->outcome.estimate.tie, best->outcome.tie.lo, best->outcome.tie.hi,
+      (long long)best->tie_lower_num, (long long)best->tie_upper_num,
+      best->outcome.estimate.loss, best->outcome.loss.lo, best->outcome.loss.hi,
+      (long long)best->loss_lower_num, (long long)best->loss_upper_num,
+      (long long)best->outcome_den,
+      best->outcome.estimate.expected_final_margin,
+      best->outcome.expected_final_margin.lo,
+      best->outcome.expected_final_margin.hi, result.worlds_distinct,
+      (long long)result.world_weight_mass, result.exact_jobs, result.bound_jobs,
+      result.batches_completed, result.decision_regret_bound,
+      (long long)result.regret_num, (long long)result.regret_den,
+      result.unique_best ? 1 : 0);
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
+
+  int *order = malloc_or_die((size_t)result.count * sizeof(*order));
+  for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
+    order[candidate_idx] = candidate_idx;
+    int insertion_idx = candidate_idx;
+    while (insertion_idx > 0 &&
+           cpeg_wtl_proof_candidate_precedes(&result, order[insertion_idx],
+                                             order[insertion_idx - 1])) {
+      const int previous = order[insertion_idx - 1];
+      order[insertion_idx - 1] = order[insertion_idx];
+      order[insertion_idx] = previous;
+      insertion_idx--;
+    }
+  }
+  for (int rank_idx = 0; rank_idx < result.count; rank_idx++) {
+    const CpegWtlCertifiedCand *candidate = &result.cands[order[rank_idx]];
+    string_builder_add_formatted_string(
+        lines,
+        "cpeg-wtl-proof-cand %d %s %d "
+        "win=%.17g win_lo=%.17g win_hi=%.17g "
+        "win_lo_num=%lld win_hi_num=%lld "
+        "tie=%.17g tie_lo=%.17g tie_hi=%.17g "
+        "tie_lo_num=%lld tie_hi_num=%lld "
+        "loss=%.17g loss_lo=%.17g loss_hi=%.17g "
+        "loss_lo_num=%lld loss_hi_num=%lld outcome_den=%lld "
+        "margin=%.17g margin_lo=%.17g margin_hi=%.17g "
+        "exact_worlds=%d bounded_worlds=%d unresolved_worlds=%d "
+        "exact_weight=%lld eliminated=%d\n",
+        rank_idx + 1, candidate->label, candidate->score,
+        candidate->outcome.estimate.win, candidate->outcome.win.lo,
+        candidate->outcome.win.hi, (long long)candidate->win_lower_num,
+        (long long)candidate->win_upper_num, candidate->outcome.estimate.tie,
+        candidate->outcome.tie.lo, candidate->outcome.tie.hi,
+        (long long)candidate->tie_lower_num,
+        (long long)candidate->tie_upper_num, candidate->outcome.estimate.loss,
+        candidate->outcome.loss.lo, candidate->outcome.loss.hi,
+        (long long)candidate->loss_lower_num,
+        (long long)candidate->loss_upper_num, (long long)candidate->outcome_den,
+        candidate->outcome.estimate.expected_final_margin,
+        candidate->outcome.expected_final_margin.lo,
+        candidate->outcome.expected_final_margin.hi, candidate->worlds_exact,
+        candidate->worlds_bounded, candidate->worlds_unresolved,
+        (long long)candidate->exact_weight, candidate->eliminated ? 1 : 0);
+  }
+  char *output = string_builder_dump(lines, NULL);
+  string_builder_destroy(lines);
+  thread_control_print(config->thread_control, output);
+  free(output);
+  free(order);
+  cpeg_wtl_certified_result_destroy(&result);
 }
 
 static bool cpeg_certified_candidate_precedes(const CpegCertifiedResult *result,
@@ -3443,7 +3633,7 @@ static bool cpeg_certified_candidate_precedes(const CpegCertifiedResult *result,
 static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
                                 double budget_seconds,
                                 ErrorStack *error_stack) {
-  CpegCertifiedResult result;
+  CpegCertifiedResult result = {0};
   const CpegCertifiedArgs args = {
       .bag = bag,
       .allow_exchanges = allow_exchanges,
@@ -3453,6 +3643,7 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
       .max_batches = 0,
   };
   if (cpeg_solve_pre_endgame_certified(config->game, &args, &result) < 1) {
+    cpeg_certified_result_destroy(&result);
     error_stack_push(error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
                      string_duplicate("cpeg certified solve failed"));
     return;
@@ -3469,8 +3660,14 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
       result.decision_regret_bound, result.unique_best ? 1 : 0,
       result.jobs_completed, result.batches_completed, best->worlds_resolved,
       result.worlds_total);
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
 
-  int order[CPEG_MAX_PRE_CANDS];
+  int *order = malloc_or_die((size_t)result.count * sizeof(*order));
   for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
     order[candidate_idx] = candidate_idx;
     int insertion_idx = candidate_idx;
@@ -3500,6 +3697,8 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
   string_builder_destroy(lines);
   thread_control_print(config->thread_control, out);
   free(out);
+  free(order);
+  cpeg_certified_result_destroy(&result);
 }
 
 static bool
@@ -3525,7 +3724,7 @@ cpeg_statistical_candidate_precedes(const CpegStatisticalResult *result,
 static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
                                   double budget_seconds,
                                   ErrorStack *error_stack) {
-  CpegStatisticalResult result;
+  CpegStatisticalResult result = {0};
   const CpegStatisticalArgs args = {
       .bag = bag,
       .allow_exchanges = allow_exchanges,
@@ -3536,6 +3735,7 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
       .max_worlds = 0,
   };
   if (cpeg_solve_pre_endgame_statistical(config->game, &args, &result) < 1) {
+    cpeg_statistical_result_destroy(&result);
     error_stack_push(error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
                      string_duplicate("cpeg statistical solve failed"));
     return;
@@ -3550,8 +3750,14 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
       best->label, best->score, best->estimate, best->lower, best->upper,
       result.confidence, (unsigned long long)result.seed, result.jobs_completed,
       result.rounds_completed, result.worlds_sampled, result.worlds_total);
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
 
-  int order[CPEG_MAX_PRE_CANDS];
+  int *order = malloc_or_die((size_t)result.count * sizeof(*order));
   for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
     order[candidate_idx] = candidate_idx;
     int insertion_idx = candidate_idx;
@@ -3582,6 +3788,8 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
   string_builder_destroy(lines);
   thread_control_print(config->thread_control, out);
   free(out);
+  free(order);
+  cpeg_statistical_result_destroy(&result);
 }
 
 // Crossplay endgame / pre-endgame solver command.
@@ -3595,6 +3803,10 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
 //   cpeg <bag> [noexch] budget <seconds> -> budgeted certified solver. The
 //                           options are order-free; budget's value follows it.
 //   cpeg <bag> [noexch] estimate <seconds> -> seeded 95% statistical estimate.
+//   cpeg <bag> [noexch] lead <signed-int> -> exact strict-W/T/L solve using the
+//                           explicit mover-minus-opponent score difference.
+//   cpeg <bag> [noexch] lead <signed-int> budget <seconds> -> certified
+//                           strict-W/T/L choice with complete root coverage.
 void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (!config_has_game_data(config)) {
     error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
@@ -3607,6 +3819,8 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   bool allow_exchanges = true;
   bool use_certified = false;
   bool use_statistical = false;
+  bool has_lead = false;
+  int initial_lead = 0;
   double budget_seconds = 0.0;
   const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
   for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
@@ -3616,6 +3830,22 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
     if (strings_equal(value, "noexch")) {
       allow_exchanges = false;
+    } else if (strings_equal(value, "lead")) {
+      if (has_lead || arg_idx + 1 >= n_args) {
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+            string_duplicate("cpeg lead requires exactly one signed integer"));
+        return;
+      }
+      has_lead = true;
+      const char *lead_value =
+          config_get_parg_value(config, ARG_TOKEN_CPEG, ++arg_idx);
+      string_to_int_or_push_error("cpeg lead", lead_value, INT_MIN, INT_MAX,
+                                  ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+                                  &initial_lead, error_stack);
+      if (!error_stack_is_empty(error_stack)) {
+        return;
+      }
     } else if (strings_equal(value, "budget") ||
                strings_equal(value, "estimate")) {
       if (use_certified || use_statistical || arg_idx + 1 >= n_args) {
@@ -3648,7 +3878,19 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
   }
 
+  if (has_lead && use_statistical) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+        string_duplicate("cpeg lead is mutually exclusive with estimate"));
+    return;
+  }
+
   if (bag <= 0) {
+    if (has_lead) {
+      error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+                       string_duplicate("cpeg lead requires a bag size"));
+      return;
+    }
     if (use_certified || use_statistical) {
       error_stack_push(
           error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
@@ -3666,6 +3908,11 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     return;
   }
   if (use_certified) {
+    if (has_lead) {
+      impl_cpeg_wtl_certified(config, bag, allow_exchanges, initial_lead,
+                              budget_seconds, error_stack);
+      return;
+    }
     impl_cpeg_certified(config, bag, allow_exchanges, budget_seconds,
                         error_stack);
     return;
@@ -3673,6 +3920,10 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (use_statistical) {
     impl_cpeg_statistical(config, bag, allow_exchanges, budget_seconds,
                           error_stack);
+    return;
+  }
+  if (has_lead) {
+    impl_cpeg_wtl(config, bag, allow_exchanges, initial_lead, error_stack);
     return;
   }
   impl_cpeg_pre_endgame(config, bag, allow_exchanges);
@@ -8590,7 +8841,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_INFER, "infer", 0, 5, infer, generic, false);
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
-  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 4, cpeg, generic, false);
+  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 6, cpeg, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);
   cmd(ARG_TOKEN_LEAVE_GEN, "leavegen", 2, 2, leave_gen, generic, false);

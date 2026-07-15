@@ -187,8 +187,12 @@ static TestEntry on_demand_test_table[] = {
     {"genpegmore", test_gen_peg_more},
     {"pegpoll", test_peg_poll},
     {"passpegoracle", test_pass_peg_oracle_eval_move},
+    {"cpegroot", test_cpeg_complete_root_collection},
     {"cpegcertify", test_cpeg_certified_bag1},
     {"cpegstat", test_cpeg_statistical_bag1},
+    {"cpegwtl", test_cpeg_wtl_senator},
+    {"cpegwtlproof", test_cpeg_wtl_certified_proof},
+    {"cpegwtlaccept", test_cpeg_wtl_certified_senator_acceptance},
     {NULL, NULL} // Sentinel value to mark end of array
 };
 

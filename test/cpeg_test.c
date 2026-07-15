@@ -18,6 +18,7 @@
 #include "../src/util/string_util.h"
 #include "test_util.h"
 #include <assert.h>
+#include <float.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -40,6 +41,14 @@ static const char *const CPEG_FINAL_TURN_CGP =
     "4S3L6/4O2FOB5/4LO1OPA5/5C1A1R3T1/5HMM1QI1GOT/6AE1UNLIKE/6ID1EN1TEG/"
     "6D6R1/7GALENAS1 IIEAYSI/?TUUVY 0/0 0";
 
+// The same nearly full board with the opponent rack hidden. Treating one of
+// ?TUUVY as the bag gives a compact bag-one position with five distinct worlds
+// and total multiset mass six (the duplicate U carries weight two).
+static const char *const CPEG_WTL_BAG1_CGP =
+    "cgp ZIPs7T2J/I2N6SHAVE/T2aA3C2R2E/H2WE3ONBOARD/E2ER3W2EX2/"
+    "R2DO3F2S3/4S3L6/4O2FOB5/4LO1OPA5/5C1A1R3T1/5HMM1QI1GOT/"
+    "6AE1UNLIKE/6ID1EN1TEG/6D6R1/7GALENAS1 IIEAYSI/ 0/0 0";
+
 // Two real Crossplay pre-endgame positions with the bag holding one tile. The
 // opponent's rack is left empty in the CGP so the solver enumerates the unseen
 // tiles into opponent-rack worlds. Both are cross-checked against the Python
@@ -61,6 +70,13 @@ static const char *const CPEG_PRE_9653_CGP =
     "cgp 7KiNIN3/8G1TORN1/7ON6/7YO6/8R2H3/7BE1BO3/4F2OR1ET1J1/2REAVOW2HE1US/"
     "4TI1SODALITE/4WE1M2V3G/4AD1A1FED2U/CInQS2N1I1E1AE/A2A5L1T1I1/"
     "R2d2ZEAL1O1R1/P2I5Y1X3 DPIATSS/ 0/0 0";
+
+// The incident position that exceeded the old 1024-candidate result array.
+// Complete root accounting is 1215 placements + 98 exchanges + voluntary pass.
+static const char *const CPEG_SENATOR_TOSA_CGP =
+    "cgp 3Z5F1NAIF/3E5I4I/3S1E3A2H1R/1INTERNaLS1VACS/5G3C2KAT/"
+    "4JO3OM1ER1/4E5I2R1/3QUBITS1D2EX/5E1OE2T1LI/5V1PAWPAWs1/"
+    "5Y1HM2B3/7E1EULOGY/10HE1O1/11A1O1/11U1D1 SENATOR/ 329/380 0";
 
 typedef struct CpegTestBranchUndo {
   Bag *bag;
@@ -335,6 +351,89 @@ static void test_cpeg_endgame(void) {
   config_destroy(config);
 }
 
+static void cpeg_assert_wtl_value(const CpegWtlValue *value, double win,
+                                  double tie, double loss, double margin) {
+  assert(fabs(value->win - win) < 1e-12);
+  assert(fabs(value->tie - tie) < 1e-12);
+  assert(fabs(value->loss - loss) < 1e-12);
+  assert(fabs(value->expected_final_margin - margin) < 1e-12);
+}
+
+static void test_cpeg_wtl_value_core(void) {
+  const CpegWtlValue loss = cpeg_wtl_classify_margin(-1);
+  const CpegWtlValue tie = cpeg_wtl_classify_margin(0);
+  const CpegWtlValue win = cpeg_wtl_classify_margin(1);
+  cpeg_assert_wtl_value(&loss, 0.0, 0.0, 1.0, -1.0);
+  cpeg_assert_wtl_value(&tie, 0.0, 1.0, 0.0, 0.0);
+  cpeg_assert_wtl_value(&win, 1.0, 0.0, 0.0, 1.0);
+
+  const CpegWtlValue higher_win = {
+      .win = 0.31, .tie = 0.0, .loss = 0.69, .expected_final_margin = -100.0};
+  const CpegWtlValue lower_win = {
+      .win = 0.30, .tie = 0.6, .loss = 0.10, .expected_final_margin = 100.0};
+  assert(cpeg_wtl_compare(&higher_win, &lower_win) > 0);
+
+  // Equal win probability uses tie probability before expected margin.
+  const CpegWtlValue more_ties = {
+      .win = 0.3, .tie = 0.2, .loss = 0.5, .expected_final_margin = -12.0};
+  const CpegWtlValue fewer_ties = {
+      .win = 0.3, .tie = 0.1, .loss = 0.6, .expected_final_margin = -5.0};
+  assert(cpeg_wtl_compare(&more_ties, &fewer_ties) > 0);
+  const CpegWtlValue better_margin = {
+      .win = 0.3, .tie = 0.2, .loss = 0.5, .expected_final_margin = -11.0};
+  assert(cpeg_wtl_compare(&better_margin, &more_ties) > 0);
+  const CpegWtlValue reduction_noise = {
+      .win = nextafter(more_ties.win, 1.0),
+      .tie = 0.1,
+      .loss = 0.6,
+      .expected_final_margin = -5.0,
+  };
+  assert(cpeg_wtl_compare(&more_ties, &reduction_noise) > 0);
+  CpegWtlValue real_win_delta = reduction_noise;
+  real_win_delta.win = more_ties.win + 1024.0 * DBL_EPSILON;
+  assert(cpeg_wtl_compare(&real_win_delta, &more_ties) > 0);
+
+  const CpegWtlValue values[] = {
+      {.win = 1.0, .tie = 0.0, .loss = 0.0, .expected_final_margin = 10.0},
+      {.win = 0.0, .tie = 1.0, .loss = 0.0, .expected_final_margin = -2.0},
+  };
+  const int64_t weights[] = {1, 3};
+  CpegWtlValue average;
+  assert(cpeg_wtl_weighted_average(values, weights, 2, &average) == 0);
+  cpeg_assert_wtl_value(&average, 0.25, 0.75, 0.0, 1.0);
+  assert(cpeg_wtl_weighted_average(values, weights, 0, &average) == -1);
+}
+
+static void test_cpeg_wtl_endgame_sign(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  load_and_exec_config_or_die(config, CPEG_FINAL_TURN_CGP);
+  Game *game = config_get_game(config);
+  const int on_turn = game_get_player_on_turn_index(game);
+  Game *before = game_duplicate(game);
+  CpegWtlValue value;
+
+  assert(cpeg_solve_endgame_wtl(game, on_turn, -6, &value) == 0);
+  cpeg_assert_wtl_value(&value, 0.0, 0.0, 1.0, -1.0);
+  assert(cpeg_solve_endgame_wtl(game, on_turn, -5, &value) == 0);
+  cpeg_assert_wtl_value(&value, 0.0, 1.0, 0.0, 0.0);
+  assert(cpeg_solve_endgame_wtl(game, on_turn, -4, &value) == 0);
+  cpeg_assert_wtl_value(&value, 1.0, 0.0, 0.0, 1.0);
+
+  assert(cpeg_solve_endgame_wtl(game, 1 - on_turn, 4, &value) == 0);
+  cpeg_assert_wtl_value(&value, 0.0, 0.0, 1.0, -1.0);
+  assert(cpeg_solve_endgame_wtl(game, 1 - on_turn, 5, &value) == 0);
+  cpeg_assert_wtl_value(&value, 0.0, 1.0, 0.0, 0.0);
+  assert(cpeg_solve_endgame_wtl(game, 1 - on_turn, 6, &value) == 0);
+  cpeg_assert_wtl_value(&value, 1.0, 0.0, 0.0, 1.0);
+  assert(cpeg_solve_endgame_wtl(game, on_turn, INT64_MAX, &value) == -1);
+  assert(cpeg_solve_endgame_wtl(game, 1 - on_turn, INT64_MIN, &value) == -1);
+  cpeg_test_assert_state_equal(before, game);
+  game_destroy(before);
+  config_destroy(config);
+}
+
 static void test_cpeg_interval_contains_scalar(void) {
   Config *config = config_create_or_die(
       "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
@@ -371,7 +470,7 @@ static void test_cpeg_pre_endgame(void) {
   // and the exhaustive search's optimum is the blocker 13J TAU.
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   Game *game = config_get_game(config);
-  CpegPreResult result;
+  CpegPreResult result = {0};
   cpeg_solve_pre_endgame(game, /*bag=*/1, /*allow_exchanges=*/false,
                          /*num_threads=*/1, &result);
   assert(result.count > 0);
@@ -381,6 +480,7 @@ static void test_cpeg_pre_endgame(void) {
   // The blocker outranks the high scorer: TAU is the exact optimum here.
   assert_strings_equal(result.cands[0].label, "13J TAU");
   assert(fabs(result.cands[0].expected_spread - 44.125) < 1e-6);
+  cpeg_pre_result_destroy(&result);
 
   // IMG_9653, bag 1, no exchanges: top move and spread match the reference.
   load_and_exec_config_or_die(config, CPEG_PRE_9653_CGP);
@@ -391,7 +491,138 @@ static void test_cpeg_pre_endgame(void) {
   assert_strings_equal(result.cands[0].label, "12G I(N)S(I)D(E)");
   assert(fabs(result.cands[0].expected_spread - 23.0) < 1e-6);
   assert(fabs(cpeg_find_spread(&result, "15F PAST(Y)") - 22.25) < 1e-6);
+  cpeg_pre_result_destroy(&result);
 
+  config_destroy(config);
+}
+
+static void cpeg_assert_wtl_results_equal(const CpegWtlResult *lhs,
+                                          const CpegWtlResult *rhs) {
+  assert(lhs->count == rhs->count);
+  assert(lhs->worlds_distinct == rhs->worlds_distinct);
+  assert(lhs->world_weight_mass == rhs->world_weight_mass);
+  assert(lhs->coverage.placements == rhs->coverage.placements);
+  assert(lhs->coverage.exchanges == rhs->coverage.exchanges);
+  assert(lhs->coverage.passes == rhs->coverage.passes);
+  assert(lhs->coverage.total == rhs->coverage.total);
+  assert(lhs->coverage.generation_complete ==
+         rhs->coverage.generation_complete);
+  for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
+    const CpegWtlCand *lhs_candidate = &lhs->cands[candidate_idx];
+    const CpegWtlCand *rhs_candidate = &rhs->cands[candidate_idx];
+    assert_strings_equal(lhs_candidate->label, rhs_candidate->label);
+    assert(lhs_candidate->score == rhs_candidate->score);
+    assert(lhs_candidate->value.win == rhs_candidate->value.win);
+    assert(lhs_candidate->value.tie == rhs_candidate->value.tie);
+    assert(lhs_candidate->value.loss == rhs_candidate->value.loss);
+    assert(lhs_candidate->value.expected_final_margin ==
+           rhs_candidate->value.expected_final_margin);
+  }
+}
+
+static void test_cpeg_wtl_pre_endgame(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  const Game *game = config_get_game(config);
+
+  const CpegWtlArgs one_thread_args = {
+      .bag = 1,
+      .allow_exchanges = false,
+      .num_threads = 1,
+      .initial_lead = -51,
+  };
+  Game *before = game_duplicate(game);
+  CpegWtlResult one_thread = {0};
+  assert(cpeg_solve_pre_endgame_wtl(game, &one_thread_args, &one_thread) > 0);
+  cpeg_test_assert_state_equal(before, game);
+  game_destroy(before);
+
+  assert(one_thread.count == one_thread.coverage.total);
+  assert(one_thread.coverage.placements > 0);
+  assert(one_thread.coverage.exchanges == 0);
+  assert(one_thread.coverage.passes == 1);
+  assert(one_thread.coverage.generation_complete);
+  assert(one_thread.worlds_distinct == 5);
+  assert(one_thread.world_weight_mass == 6);
+  for (int candidate_idx = 0; candidate_idx < one_thread.count;
+       candidate_idx++) {
+    const CpegWtlCand *candidate = &one_thread.cands[candidate_idx];
+    assert(fabs(candidate->value.win + candidate->value.tie +
+                candidate->value.loss - 1.0) < 1e-12);
+    if (candidate_idx > 0) {
+      const CpegWtlCand *previous = &one_thread.cands[candidate_idx - 1];
+      const int comparison =
+          cpeg_wtl_compare(&previous->value, &candidate->value);
+      assert(comparison >= 0);
+      if (comparison == 0) {
+        assert(strcmp(previous->label, candidate->label) <= 0);
+      }
+    }
+  }
+
+  // The explicit lead is the only score input. Changing both Game scores must
+  // not affect any value; the fixed world reduction also makes 1 and 4 threads
+  // bit-identical.
+  player_set_score(game_get_player(game, 0), int_to_equity(1234));
+  player_set_score(game_get_player(game, 1), int_to_equity(-987));
+  before = game_duplicate(game);
+  CpegWtlArgs four_thread_args = one_thread_args;
+  four_thread_args.num_threads = 4;
+  CpegWtlResult four_threads = {0};
+  assert(cpeg_solve_pre_endgame_wtl(game, &four_thread_args, &four_threads) >
+         0);
+  cpeg_test_assert_state_equal(before, game);
+  game_destroy(before);
+  cpeg_assert_wtl_results_equal(&one_thread, &four_threads);
+
+  cpeg_wtl_result_destroy(&four_threads);
+  cpeg_wtl_result_destroy(&four_threads);
+  cpeg_wtl_result_destroy(&one_thread);
+  cpeg_wtl_result_destroy(&one_thread);
+  config_destroy(config);
+}
+
+static void cpeg_assert_command_error(Config *config, ErrorStack *error_stack,
+                                      const char *command,
+                                      error_code_t expected_error) {
+  config_load_command(config, command, error_stack);
+  if (error_stack_is_empty(error_stack)) {
+    config_execute_command(config, error_stack);
+  }
+  const error_code_t actual_error = error_stack_top(error_stack);
+  if (actual_error != expected_error) {
+    fprintf(stderr, "cpeg command error mismatch: %s expected=%d actual=%d\n",
+            command, expected_error, actual_error);
+  }
+  assert(actual_error == expected_error);
+  error_stack_reset(error_stack);
+}
+
+static void test_cpeg_wtl_command_parsing(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23 -ld english_crossplay -bdn crossplay -bb 40 -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  ErrorStack *error_stack = error_stack_create();
+
+  cpeg_assert_command_error(config, error_stack, "cpeg lead -51",
+                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg 4 lead",
+                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg lead 1 lead 2",
+                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg lead -51 budget 1",
+                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg 4 lead nope",
+                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
+  // A negative lead is consumed as the signed lead value, not mistaken for
+  // the bag; the subsequent error is specifically the unsupported bag size.
+  cpeg_assert_command_error(config, error_stack, "cpeg 5 lead -51",
+                            ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY);
+
+  error_stack_destroy(error_stack);
   config_destroy(config);
 }
 
@@ -462,7 +693,7 @@ static void test_cpeg_candidate_legality(void) {
   assert(tau_is_legal);
 
   // Every cpeg placement candidate must be in the legal set.
-  CpegPreResult result;
+  CpegPreResult result = {0};
   cpeg_solve_pre_endgame(game, /*bag=*/1, /*allow_exchanges=*/false,
                          /*num_threads=*/1, &result);
   assert(result.count > 0);
@@ -481,6 +712,7 @@ static void test_cpeg_candidate_legality(void) {
     assert(found);
   }
 
+  cpeg_pre_result_destroy(&result);
   move_list_destroy(legal);
   config_destroy(config);
 }
@@ -575,6 +807,28 @@ static void test_cpeg_enumeration_capacity_guard(void) {
   // report that the third entry would otherwise have been silently dropped.
   assert(cpeg_submultiset_capacity_overflows(counts, 3, 2, 2));
   assert(!cpeg_submultiset_capacity_overflows(counts, 3, 2, 3));
+}
+
+void test_cpeg_complete_root_collection(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+
+  CpegRootCoverage coverage;
+  const int action_count = cpeg_count_root_actions(
+      config_get_game(config), /*bag=*/4, /*allow_exchanges=*/true, &coverage);
+
+  assert(action_count == 1314);
+  assert(action_count > 1024);
+  assert(coverage.placements == 1215);
+  assert(coverage.exchanges == 98);
+  assert(coverage.passes == 1);
+  assert(coverage.total == action_count);
+  assert(coverage.generation_complete);
+
+  config_destroy(config);
 }
 
 static void cpeg_test_init_states(CpegCandState *states,
@@ -869,7 +1123,7 @@ cpeg_assert_best_interval_contains_oracle(const CpegCertifiedResult *result,
 
 static void cpeg_assert_certified_bag1_exact(Config *config,
                                              bool allow_exchanges) {
-  CpegCertifiedResult result;
+  CpegCertifiedResult result = {0};
   const CpegCertifiedArgs args = {
       .bag = 1,
       .allow_exchanges = allow_exchanges,
@@ -889,10 +1143,11 @@ static void cpeg_assert_certified_bag1_exact(Config *config,
   assert(tau_idx >= 0);
   assert(result.cands[tau_idx].lower <= 44.125);
   assert(result.cands[tau_idx].upper >= 44.125);
+  cpeg_certified_result_destroy(&result);
 }
 
 static void cpeg_assert_certified_bag1_early_stop(Config *config) {
-  CpegPreResult oracle;
+  CpegPreResult oracle = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame(config_get_game(config), /*bag=*/1,
                                 /*allow_exchanges=*/false, /*num_threads=*/4,
@@ -906,7 +1161,7 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
       .batch_size = 16,
       .max_batches = 2,
   };
-  CpegCertifiedResult single_threaded;
+  CpegCertifiedResult single_threaded = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_certified(config_get_game(config), &work_args,
                                           &single_threaded) > 0);
@@ -917,7 +1172,7 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
 
   CpegCertifiedArgs parallel_args = work_args;
   parallel_args.num_threads = 4;
-  CpegCertifiedResult four_threaded;
+  CpegCertifiedResult four_threaded = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_certified(config_get_game(config),
                                           &parallel_args, &four_threaded) > 0);
@@ -927,7 +1182,7 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
   wall_args.num_threads = 4;
   wall_args.budget_seconds = 0.001;
   wall_args.max_batches = 0;
-  CpegCertifiedResult wall_limited;
+  CpegCertifiedResult wall_limited = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   Game *wall_game = config_get_game(config);
   game_gen_all_cross_sets(wall_game);
@@ -941,6 +1196,10 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
          wall_limited.status == CPEG_PRE_CERTIFIED ||
          wall_limited.status == CPEG_PRE_EXACT_VALUES);
   cpeg_assert_best_interval_contains_oracle(&wall_limited, &oracle);
+  cpeg_certified_result_destroy(&wall_limited);
+  cpeg_certified_result_destroy(&four_threaded);
+  cpeg_certified_result_destroy(&single_threaded);
+  cpeg_pre_result_destroy(&oracle);
 }
 
 void test_cpeg_certified_bag1(void) {
@@ -1000,7 +1259,7 @@ void test_cpeg_statistical_bag1(void) {
       .confidence = 0.95,
       .max_worlds = 0,
   };
-  CpegStatisticalResult full;
+  CpegStatisticalResult full = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_statistical(config_get_game(config), &full_args,
                                             &full) > 0);
@@ -1023,8 +1282,8 @@ void test_cpeg_statistical_bag1(void) {
 
   CpegStatisticalArgs subset_args = full_args;
   subset_args.max_worlds = 4;
-  CpegStatisticalResult deterministic_one;
-  CpegStatisticalResult deterministic_two;
+  CpegStatisticalResult deterministic_one = {0};
+  CpegStatisticalResult deterministic_two = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_statistical(
              config_get_game(config), &subset_args, &deterministic_one) > 0);
@@ -1043,7 +1302,7 @@ void test_cpeg_statistical_bag1(void) {
   for (int prefix = 1; prefix <= 7; prefix++) {
     CpegStatisticalArgs prefix_args = full_args;
     prefix_args.max_worlds = prefix;
-    CpegStatisticalResult prefix_result;
+    CpegStatisticalResult prefix_result = {0};
     load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
     assert(cpeg_solve_pre_endgame_statistical(
                config_get_game(config), &prefix_args, &prefix_result) > 0);
@@ -1067,6 +1326,7 @@ void test_cpeg_statistical_bag1(void) {
     tau_weights[world_idx] = weight;
     prior_weighted_sum = weighted_sum;
     prior_weight_sum = weight_sum;
+    cpeg_statistical_result_destroy(&prefix_result);
   }
 
   int covered = 0;
@@ -1088,7 +1348,7 @@ void test_cpeg_statistical_bag1(void) {
     CpegStatisticalArgs best_args = full_args;
     best_args.seed = (uint64_t)seed;
     best_args.max_worlds = 7;
-    CpegStatisticalResult result;
+    CpegStatisticalResult result = {0};
     load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
     assert(cpeg_solve_pre_endgame_statistical(config_get_game(config),
                                               &best_args, &result) > 0);
@@ -1104,22 +1364,320 @@ void test_cpeg_statistical_bag1(void) {
     if (result.best_index == tau_idx) {
       tau_chosen++;
     }
+    cpeg_statistical_result_destroy(&result);
   }
   assert(tau_chosen == best_arm_seeds);
   printf("cpegstat coverage=%d/%d (%.1f%%), best=%d/%d, tau_eliminated=0\n",
          covered, coverage_seeds,
          100.0 * (double)covered / (double)coverage_seeds, tau_chosen,
          best_arm_seeds);
+  cpeg_statistical_result_destroy(&deterministic_two);
+  cpeg_statistical_result_destroy(&deterministic_one);
+  cpeg_statistical_result_destroy(&full);
+  config_destroy(config);
+}
+
+static const CpegWtlCand *cpeg_find_wtl_candidate(const CpegWtlResult *result,
+                                                  const char *label) {
+  for (int candidate_idx = 0; candidate_idx < result->count; candidate_idx++) {
+    if (strcmp(result->cands[candidate_idx].label, label) == 0) {
+      return &result->cands[candidate_idx];
+    }
+  }
+  return NULL;
+}
+
+void test_cpeg_wtl_senator(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 4");
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  const Game *game = config_get_game(config);
+  Game *before = game_duplicate(game);
+  const CpegWtlArgs args = {
+      .bag = 4,
+      .allow_exchanges = true,
+      .num_threads = 4,
+      .initial_lead = -51,
+  };
+  CpegWtlResult result = {0};
+  assert(cpeg_solve_pre_endgame_wtl(game, &args, &result) == 1314);
+  cpeg_test_assert_state_equal(before, game);
+  game_destroy(before);
+
+  assert(result.coverage.placements == 1215);
+  assert(result.coverage.exchanges == 98);
+  assert(result.coverage.passes == 1);
+  assert(result.coverage.total == 1314);
+  assert(result.coverage.generation_complete);
+  assert(result.worlds_distinct == 246);
+  assert(result.world_weight_mass == 330);
+  assert_strings_equal(result.cands[0].label, "13F TOSA");
+
+  const CpegWtlCand *tosa = cpeg_find_wtl_candidate(&result, "13F TOSA");
+  const CpegWtlCand *atoners = cpeg_find_wtl_candidate(&result, "13B ATONERS");
+  assert(tosa != NULL);
+  assert(atoners != NULL);
+  assert(fabs(tosa->value.win - 42.0 / 330.0) < 1e-12);
+  assert(fabs(tosa->value.tie) < 1e-12);
+  assert(fabs(tosa->value.loss - 288.0 / 330.0) < 1e-12);
+  assert(fabs(tosa->value.expected_final_margin - (-43.5333333333333)) < 1e-5);
+  assert(fabs(atoners->value.win - 36.0 / 330.0) < 1e-12);
+  assert(fabs(atoners->value.tie - 3.0 / 330.0) < 1e-12);
+  assert(fabs(atoners->value.loss - 291.0 / 330.0) < 1e-12);
+  assert(fabs(atoners->value.expected_final_margin - (-21.6393939393939)) <
+         1e-5);
+  printf("cpegwtl best=%s worlds=%d mass=%lld\n", result.cands[0].label,
+         result.worlds_distinct, (long long)result.world_weight_mass);
+
+  cpeg_wtl_result_destroy(&result);
+  config_destroy(config);
+}
+
+static void cpeg_assert_wtl_certified_candidate_valid(
+    const CpegWtlCertifiedCand *candidate) {
+  assert(candidate->outcome_den > 0);
+  assert(candidate->win_lower_num >= 0);
+  assert(candidate->win_lower_num <= candidate->win_upper_num);
+  assert(candidate->win_upper_num <= candidate->outcome_den);
+  assert(candidate->tie_lower_num >= 0);
+  assert(candidate->tie_lower_num <= candidate->tie_upper_num);
+  assert(candidate->tie_upper_num <= candidate->outcome_den);
+  assert(candidate->loss_lower_num >= 0);
+  assert(candidate->loss_lower_num <= candidate->loss_upper_num);
+  assert(candidate->loss_upper_num <= candidate->outcome_den);
+  assert(candidate->outcome.estimate.win >= candidate->outcome.win.lo);
+  assert(candidate->outcome.estimate.win <= candidate->outcome.win.hi);
+  assert(candidate->outcome.estimate.tie >= candidate->outcome.tie.lo);
+  assert(candidate->outcome.estimate.tie <= candidate->outcome.tie.hi);
+  assert(candidate->outcome.estimate.loss >= candidate->outcome.loss.lo);
+  assert(candidate->outcome.estimate.loss <= candidate->outcome.loss.hi);
+  assert(fabs(candidate->outcome.estimate.win +
+              candidate->outcome.estimate.tie +
+              candidate->outcome.estimate.loss - 1.0) < 1e-15);
+}
+
+static void
+cpeg_assert_wtl_certified_results_equal(const CpegWtlCertifiedResult *lhs,
+                                        const CpegWtlCertifiedResult *rhs) {
+  assert(lhs->status == rhs->status);
+  assert(lhs->count == rhs->count);
+  assert(lhs->best_index == rhs->best_index);
+  assert(lhs->worlds_distinct == rhs->worlds_distinct);
+  assert(lhs->world_weight_mass == rhs->world_weight_mass);
+  assert(lhs->coverage.total == rhs->coverage.total);
+  for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
+    const CpegWtlCertifiedCand *lhs_candidate = &lhs->cands[candidate_idx];
+    const CpegWtlCertifiedCand *rhs_candidate = &rhs->cands[candidate_idx];
+    assert_strings_equal(lhs_candidate->label, rhs_candidate->label);
+    assert(lhs_candidate->outcome_den == rhs_candidate->outcome_den);
+    assert(lhs_candidate->win_lower_num == rhs_candidate->win_lower_num);
+    assert(lhs_candidate->win_upper_num == rhs_candidate->win_upper_num);
+    assert(lhs_candidate->tie_lower_num == rhs_candidate->tie_lower_num);
+    assert(lhs_candidate->tie_upper_num == rhs_candidate->tie_upper_num);
+    assert(lhs_candidate->loss_lower_num == rhs_candidate->loss_lower_num);
+    assert(lhs_candidate->loss_upper_num == rhs_candidate->loss_upper_num);
+  }
+}
+
+static const CpegWtlCertifiedCand *
+cpeg_find_wtl_certified_candidate(const CpegWtlCertifiedResult *result,
+                                  const char *label) {
+  for (int candidate_idx = 0; candidate_idx < result->count; candidate_idx++) {
+    if (strcmp(result->cands[candidate_idx].label, label) == 0) {
+      return &result->cands[candidate_idx];
+    }
+  }
+  return NULL;
+}
+
+void test_cpeg_wtl_certified_proof(void) {
+  const CpegInterval prior = {.lo = -100.0, .hi = 100.0};
+  const CpegWtlEnvelope proved_loss =
+      cpeg_wtl_envelope_from_margin_upper(-1, prior);
+  assert(proved_loss.win.lo == 0.0 && proved_loss.win.hi == 0.0);
+  assert(proved_loss.tie.lo == 0.0 && proved_loss.tie.hi == 0.0);
+  assert(proved_loss.loss.lo == 1.0 && proved_loss.loss.hi == 1.0);
+  const CpegWtlEnvelope no_strict_win =
+      cpeg_wtl_envelope_from_margin_upper(0, prior);
+  assert(no_strict_win.win.lo == 0.0 && no_strict_win.win.hi == 0.0);
+  assert(!cpeg_wtl_envelope_dominates(&no_strict_win, &proved_loss));
+  assert(!cpeg_wtl_envelope_dominates(&proved_loss, &no_strict_win));
+  const CpegWtlEnvelope exact_tie = {
+      .estimate = {.tie = 1.0},
+      .win = {.lo = 0.0, .hi = 0.0},
+      .tie = {.lo = 1.0, .hi = 1.0},
+      .loss = {.lo = 0.0, .hi = 0.0},
+      .expected_final_margin = {.lo = 0.0, .hi = 0.0},
+  };
+  assert(cpeg_wtl_envelope_dominates(&exact_tie, &proved_loss));
+
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 1");
+  const CpegWtlCertifiedArgs one_thread_args = {
+      .bag = 4,
+      .allow_exchanges = true,
+      .num_threads = 1,
+      .initial_lead = -51,
+      .budget_seconds = 0.0,
+      .batch_size = 1,
+      .max_batches = 1,
+  };
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  CpegWtlCertifiedResult one_thread = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &one_thread_args, &one_thread) == 1314);
+  assert(one_thread.status == CPEG_PRE_BOUNDED);
+  assert(one_thread.coverage.placements == 1215);
+  assert(one_thread.coverage.exchanges == 98);
+  assert(one_thread.coverage.passes == 1);
+  assert(one_thread.coverage.total == 1314);
+  assert(one_thread.coverage.generation_complete);
+  assert(one_thread.worlds_distinct == 246);
+  assert(one_thread.world_weight_mass == 330);
+  for (int candidate_idx = 0; candidate_idx < one_thread.count;
+       candidate_idx++) {
+    cpeg_assert_wtl_certified_candidate_valid(&one_thread.cands[candidate_idx]);
+  }
+
+  CpegWtlCertifiedArgs four_thread_args = one_thread_args;
+  four_thread_args.num_threads = 4;
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  CpegWtlCertifiedResult four_threads = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config),
+                                              &four_thread_args,
+                                              &four_threads) == 1314);
+  cpeg_assert_wtl_certified_results_equal(&one_thread, &four_threads);
+  cpeg_wtl_certified_result_destroy(&four_threads);
+  cpeg_wtl_certified_result_destroy(&one_thread);
+
+  const CpegWtlCertifiedArgs compact_args = {
+      .bag = 1,
+      .allow_exchanges = false,
+      .num_threads = 4,
+      .initial_lead = -50,
+      .budget_seconds = 10.0,
+  };
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  CpegWtlCertifiedResult compact = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config),
+                                              &compact_args, &compact) > 0);
+  assert(compact.status == CPEG_PRE_CERTIFIED);
+  assert(compact.unique_best);
+  assert_strings_equal(compact.cands[compact.best_index].label, "15J BEET");
+  assert(compact.cands[compact.best_index].win_lower_num == 1);
+  assert(compact.cands[compact.best_index].win_upper_num == 1);
+  assert(compact.cands[compact.best_index].outcome_den == 8);
+  assert(compact.regret_num == 0);
+  assert(compact.regret_den == 1);
+  cpeg_wtl_certified_result_destroy(&compact);
+
+  // Exchange draws come from the pre-exchange bag: returned tiles are not
+  // eligible to be redrawn on the same turn. Check every bag-one exchange
+  // enclosure against the exact W/T/L oracle, and require a contracted bound
+  // so this is not satisfied by an untouched [0, 1] prior.
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  const CpegWtlArgs exchange_oracle_args = {
+      .bag = 1,
+      .allow_exchanges = true,
+      .num_threads = 4,
+      .initial_lead = -51,
+  };
+  CpegWtlResult exchange_oracle = {0};
+  assert(cpeg_solve_pre_endgame_wtl(config_get_game(config),
+                                    &exchange_oracle_args,
+                                    &exchange_oracle) > 0);
+  const CpegWtlCertifiedArgs exchange_bound_args = {
+      .bag = 1,
+      .allow_exchanges = true,
+      .num_threads = 4,
+      .initial_lead = -51,
+      .budget_seconds = 10.0,
+  };
+  CpegWtlCertifiedResult exchange_bounds = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config),
+                                              &exchange_bound_args,
+                                              &exchange_bounds) > 0);
+  int exchanges_checked = 0;
+  bool saw_contracted_exchange = false;
+  for (int candidate_idx = 0; candidate_idx < exchange_oracle.count;
+       candidate_idx++) {
+    const CpegWtlCand *exact = &exchange_oracle.cands[candidate_idx];
+    if (strncmp(exact->label, "exch:", 5) != 0) {
+      continue;
+    }
+    const CpegWtlCertifiedCand *bounded =
+        cpeg_find_wtl_certified_candidate(&exchange_bounds, exact->label);
+    assert(bounded != NULL);
+    const int64_t exact_win =
+        (int64_t)llround(exact->value.win * (double)bounded->outcome_den);
+    const int64_t exact_tie_mass =
+        (int64_t)llround(exact->value.tie * (double)bounded->outcome_den);
+    const int64_t exact_loss =
+        (int64_t)llround(exact->value.loss * (double)bounded->outcome_den);
+    assert(bounded->win_lower_num <= exact_win);
+    assert(exact_win <= bounded->win_upper_num);
+    assert(bounded->tie_lower_num <= exact_tie_mass);
+    assert(exact_tie_mass <= bounded->tie_upper_num);
+    assert(bounded->loss_lower_num <= exact_loss);
+    assert(exact_loss <= bounded->loss_upper_num);
+    if (bounded->win_upper_num < bounded->outcome_den) {
+      saw_contracted_exchange = true;
+    }
+    exchanges_checked++;
+  }
+  assert(exchanges_checked > 0);
+  assert(saw_contracted_exchange);
+  cpeg_wtl_certified_result_destroy(&exchange_bounds);
+  cpeg_wtl_result_destroy(&exchange_oracle);
+  config_destroy(config);
+}
+
+void test_cpeg_wtl_certified_senator_acceptance(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 6");
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  const CpegWtlCertifiedArgs args = {
+      .bag = 4,
+      .allow_exchanges = true,
+      .num_threads = 6,
+      .initial_lead = -51,
+      .budget_seconds = 42.0,
+  };
+  CpegWtlCertifiedResult result = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config), &args,
+                                              &result) == 1314);
+  assert(result.status == CPEG_PRE_CERTIFIED);
+  assert(result.unique_best);
+  assert_strings_equal(result.cands[result.best_index].label, "13F TOSA");
+  assert(result.cands[result.best_index].win_lower_num == 42);
+  assert(result.cands[result.best_index].win_upper_num == 42);
+  assert(result.cands[result.best_index].outcome_den == 330);
+  assert(result.coverage.placements == 1215);
+  assert(result.coverage.exchanges == 98);
+  assert(result.coverage.passes == 1);
+  assert(result.coverage.total == 1314);
+  assert(result.coverage.generation_complete);
+  assert(result.regret_num == 0);
+  assert(result.regret_den == 1);
+  cpeg_wtl_certified_result_destroy(&result);
   config_destroy(config);
 }
 
 void test_cpeg(void) {
   test_cpeg_endgame();
+  test_cpeg_wtl_value_core();
+  test_cpeg_wtl_endgame_sign();
+  test_cpeg_wtl_command_parsing();
   test_cpeg_interval_contains_scalar();
   test_cpeg_pre_endgame();
+  test_cpeg_wtl_pre_endgame();
   test_cpeg_candidate_legality();
   test_cpeg_score_upper_bound();
   test_cpeg_enumeration_capacity_guard();
+  test_cpeg_complete_root_collection();
   test_cpeg_coordinator();
   test_cpeg_incremental_round_trip();
 }
