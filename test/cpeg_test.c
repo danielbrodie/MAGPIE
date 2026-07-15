@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -621,6 +622,17 @@ static void test_cpeg_wtl_command_parsing(void) {
   // the bag; the subsequent error is specifically the unsupported bag size.
   cpeg_assert_command_error(config, error_stack, "cpeg 5 lead -51",
                             ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY);
+
+  // Exercise the real command adapter, not only the C solver API. With no
+  // `belief` argument all four weighted-input fields must be the NULL/zero
+  // tuple; an inline zeroed manifest's fixed-size unseen array is non-NULL and
+  // used to make this otherwise-valid uniform command fail tuple validation.
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  config_load_command(config, "cpeg 1 noexch lead -51 budget 0.001",
+                      error_stack);
+  assert(error_stack_is_empty(error_stack));
+  config_execute_command(config, error_stack);
+  assert(error_stack_is_empty(error_stack));
 
   error_stack_destroy(error_stack);
   config_destroy(config);
@@ -1480,6 +1492,96 @@ cpeg_assert_wtl_certified_results_equal(const CpegWtlCertifiedResult *lhs,
   }
 }
 
+static void test_cpeg_belief_manifest_parser(const LetterDistribution *ld) {
+  char *path = string_duplicate("cpeg_belief_manifest_test.txt");
+  FILE *stream = fopen(path, "w");
+  assert(stream != NULL);
+  int write_result =
+      fputs("cpeg-belief-v1\n"
+            "posterior test_mid_v1\n"
+            "unseen ?TUUVY\n"
+            "bag 1\n"
+            "worlds 2\n"
+            "mass 8\n"
+            "digest "
+            "8e733a69153f247f23cbd35bb786d6c3cb9720e0920b004ee6f764896d6112b6\n"
+            "world T 1\n"
+            "world ? 7\n",
+            stream);
+  assert(write_result >= 0);
+  int close_result = fclose(stream);
+  assert(close_result == 0);
+
+  CpegBeliefManifest manifest = {0};
+  assert(cpeg_belief_manifest_load(path, ld, 1, &manifest));
+  assert(manifest.world_count == 2);
+  assert(manifest.weight_mass == 8);
+  assert_strings_equal(manifest.posterior_id, "test_mid_v1");
+  assert_strings_equal(manifest.unseen_tiles, "?TUUVY");
+  cpeg_belief_manifest_destroy(&manifest);
+
+  stream = fopen(path, "w");
+  assert(stream != NULL);
+  // Keep the declared count and mass but alter the weighted support. The
+  // canonical world digest must bind the rows the solver will actually use.
+  write_result =
+      fputs("cpeg-belief-v1\n"
+            "posterior test_mid_v1\n"
+            "unseen ?TUUVY\n"
+            "bag 1\n"
+            "worlds 2\n"
+            "mass 8\n"
+            "digest "
+            "8e733a69153f247f23cbd35bb786d6c3cb9720e0920b004ee6f764896d6112b6\n"
+            "world T 2\n"
+            "world ? 6\n",
+            stream);
+  assert(write_result >= 0);
+  close_result = fclose(stream);
+  assert(close_result == 0);
+  assert(!cpeg_belief_manifest_load(path, ld, 1, &manifest));
+
+  stream = fopen(path, "w");
+  assert(stream != NULL);
+  // Upper-case hex is intentionally outside the canonical Python/C wire
+  // contract, so a caller cannot spell one digest two different ways.
+  write_result =
+      fputs("cpeg-belief-v1\n"
+            "posterior test_mid_v1\n"
+            "unseen ?TUUVY\n"
+            "bag 1\n"
+            "worlds 1\n"
+            "mass 1\n"
+            "digest "
+            "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n"
+            "world ? 1\n",
+            stream);
+  assert(write_result >= 0);
+  close_result = fclose(stream);
+  assert(close_result == 0);
+  assert(!cpeg_belief_manifest_load(path, ld, 1, &manifest));
+
+  stream = fopen(path, "w");
+  assert(stream != NULL);
+  write_result =
+      fputs("cpeg-belief-v1\n"
+            "posterior test_mid_v1\n"
+            "unseen ?TUUVY\n"
+            "bag 1\n"
+            "worlds 1\n"
+            "mass 999999999999999999999999999999999999\n"
+            "digest "
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+            "world ? 1\n",
+            stream);
+  assert(write_result >= 0);
+  close_result = fclose(stream);
+  assert(close_result == 0);
+  assert(!cpeg_belief_manifest_load(path, ld, 1, &manifest));
+  delete_file(path);
+  free(path);
+}
+
 static const CpegWtlCertifiedCand *
 cpeg_find_wtl_certified_candidate(const CpegWtlCertifiedResult *result,
                                   const char *label) {
@@ -1551,6 +1653,70 @@ void test_cpeg_wtl_certified_proof(void) {
   cpeg_assert_wtl_certified_results_equal(&one_thread, &four_threads);
   cpeg_wtl_certified_result_destroy(&four_threads);
   cpeg_wtl_certified_result_destroy(&one_thread);
+
+  // A supplied posterior changes exact world mass without changing the
+  // public inventory. This catches implementations that merely echo a model
+  // label while continuing to enumerate the neutral prior internally.
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  const LetterDistribution *ld = game_get_ld(config_get_game(config));
+  test_cpeg_belief_manifest_parser(ld);
+  CpegWeightedWorld weighted_worlds[2] = {
+      {
+          .bag_tiles = {ld_hl_to_ml(ld, "?")},
+          .bag_count = 1,
+          .weight = 7,
+      },
+      {
+          .bag_tiles = {ld_hl_to_ml(ld, "T")},
+          .bag_count = 1,
+          .weight = 1,
+      },
+  };
+  MachineLetter weighted_unseen[RACK_SIZE + PEG_MAX_BAG] = {0};
+  const int weighted_unseen_count = ld_str_to_mls(
+      ld, "?TUUVY", false, weighted_unseen, RACK_SIZE + PEG_MAX_BAG);
+  assert(weighted_unseen_count == 6);
+  const CpegWtlCertifiedArgs weighted_args = {
+      .bag = 1,
+      .allow_exchanges = false,
+      .num_threads = 1,
+      .initial_lead = -51,
+      .budget_seconds = 0.0,
+      .batch_size = 1,
+      .max_batches = 1,
+      .weighted_worlds = weighted_worlds,
+      .weighted_world_count = 2,
+      .weighted_unseen_tiles = weighted_unseen,
+      .weighted_unseen_count = weighted_unseen_count,
+  };
+  CpegWtlCertifiedResult weighted_result = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &weighted_args, &weighted_result) > 0);
+  assert(weighted_result.worlds_distinct == 2);
+  assert(weighted_result.world_weight_mass == 8);
+  cpeg_wtl_certified_result_destroy(&weighted_result);
+
+  CpegWeightedWorld duplicate_worlds[2] = {
+      weighted_worlds[0],
+      weighted_worlds[0],
+  };
+  CpegWtlCertifiedArgs duplicate_args = weighted_args;
+  duplicate_args.weighted_worlds = duplicate_worlds;
+  CpegWtlCertifiedResult duplicate_result = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &duplicate_args, &duplicate_result) < 0);
+  cpeg_wtl_certified_result_destroy(&duplicate_result);
+
+  MachineLetter wrong_unseen[RACK_SIZE + PEG_MAX_BAG] = {0};
+  memcpy(wrong_unseen, weighted_unseen, sizeof(weighted_unseen));
+  wrong_unseen[0] = ld_hl_to_ml(ld, "Z");
+  CpegWtlCertifiedArgs wrong_inventory_args = weighted_args;
+  wrong_inventory_args.weighted_unseen_tiles = wrong_unseen;
+  CpegWtlCertifiedResult wrong_inventory_result = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config),
+                                              &wrong_inventory_args,
+                                              &wrong_inventory_result) < 0);
+  cpeg_wtl_certified_result_destroy(&wrong_inventory_result);
 
   const CpegWtlCertifiedArgs compact_args = {
       .bag = 1,

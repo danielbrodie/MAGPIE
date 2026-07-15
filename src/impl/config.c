@@ -3432,7 +3432,8 @@ static void impl_cpeg_wtl(Config *config, int bag, bool allow_exchanges,
   StringBuilder *lines = string_builder_create();
   string_builder_add_formatted_string(
       lines,
-      "cpeg-wtl status=EXACT_VALUES objective=strict_win_probability_v1 "
+      "cpeg-wtl status=EXACT_VALUES "
+      "objective=lexicographic_win_tie_margin_v1 "
       "lead=%lld best=%s score=%d win=%.17g tie=%.17g loss=%.17g "
       "margin=%.17g worlds=%d mass=%lld\n",
       (long long)initial_lead, best->label, best->score, best->value.win,
@@ -3497,7 +3498,16 @@ cpeg_wtl_proof_candidate_precedes(const CpegWtlCertifiedResult *result,
 static void impl_cpeg_wtl_certified(Config *config, int bag,
                                     bool allow_exchanges, int64_t initial_lead,
                                     double budget_seconds,
+                                    const char *belief_path,
                                     ErrorStack *error_stack) {
+  CpegBeliefManifest belief = {0};
+  if (belief_path != NULL &&
+      !cpeg_belief_manifest_load(belief_path, config->ld, bag, &belief)) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_RACK_ARG,
+        string_duplicate("cpeg belief manifest is invalid or incomplete"));
+    return;
+  }
   CpegWtlCertifiedResult result = {0};
   const CpegWtlCertifiedArgs args = {
       .bag = bag,
@@ -3507,9 +3517,14 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
       .budget_seconds = budget_seconds,
       .batch_size = 0,
       .max_batches = 0,
+      .weighted_worlds = belief_path != NULL ? belief.worlds : NULL,
+      .weighted_world_count = belief_path != NULL ? belief.world_count : 0,
+      .weighted_unseen_tiles = belief_path != NULL ? belief.unseen_mls : NULL,
+      .weighted_unseen_count = belief_path != NULL ? belief.unseen_count : 0,
   };
   if (cpeg_solve_pre_endgame_wtl_certified(config->game, &args, &result) < 1) {
     cpeg_wtl_certified_result_destroy(&result);
+    cpeg_belief_manifest_destroy(&belief);
     error_stack_push(
         error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
         string_duplicate("cpeg score-aware certified solve failed"));
@@ -3520,8 +3535,9 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
   StringBuilder *lines = string_builder_create();
   string_builder_add_formatted_string(
       lines,
-      "cpeg-wtl-proof status=%s objective=strict_win_probability_v1 "
-      "model=world_clairvoyant posterior=uniform_inventory_v1 "
+      "cpeg-wtl-proof status=%s "
+      "objective=lexicographic_win_tie_margin_v1 "
+      "model=world_clairvoyant posterior=%s belief_digest=%s "
       "cycle_independent=1 lead=%lld best=%s score=%d "
       "win=%.17g win_lo=%.17g win_hi=%.17g "
       "win_lo_num=%lld win_hi_num=%lld "
@@ -3532,7 +3548,9 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
       "margin=%.17g margin_lo=%.17g margin_hi=%.17g "
       "worlds=%d mass=%lld exact_jobs=%d bound_jobs=%d batches=%d "
       "regret=%.17g regret_num=%lld regret_den=%lld unique=%d\n",
-      cpeg_certified_status_name(result.status), (long long)initial_lead,
+      cpeg_certified_status_name(result.status),
+      belief_path != NULL ? belief.posterior_id : "uniform_inventory_v1",
+      belief_path != NULL ? belief.digest : "none", (long long)initial_lead,
       best->label, best->score, best->outcome.estimate.win,
       best->outcome.win.lo, best->outcome.win.hi,
       (long long)best->win_lower_num, (long long)best->win_upper_num,
@@ -3604,6 +3622,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
   free(output);
   free(order);
   cpeg_wtl_certified_result_destroy(&result);
+  cpeg_belief_manifest_destroy(&belief);
 }
 
 static bool cpeg_certified_candidate_precedes(const CpegCertifiedResult *result,
@@ -3803,10 +3822,14 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
 //   cpeg <bag> [noexch] budget <seconds> -> budgeted certified solver. The
 //                           options are order-free; budget's value follows it.
 //   cpeg <bag> [noexch] estimate <seconds> -> seeded 95% statistical estimate.
-//   cpeg <bag> [noexch] lead <signed-int> -> exact strict-W/T/L solve using the
-//                           explicit mover-minus-opponent score difference.
+//   cpeg <bag> [noexch] lead <signed-int> -> exact lexicographic W/T/L/margin
+//                           solve using the explicit mover-minus-opponent score
+//                           difference.
 //   cpeg <bag> [noexch] lead <signed-int> budget <seconds> -> certified
-//                           strict-W/T/L choice with complete root coverage.
+//                           lexicographic W/T/L/margin choice with complete
+//                           root coverage.
+//   cpeg <bag> lead <signed-int> budget <seconds> belief <path> -> the same
+//                           proof over an exact integer-weight posterior file.
 void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (!config_has_game_data(config)) {
     error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
@@ -3822,6 +3845,7 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   bool has_lead = false;
   int initial_lead = 0;
   double budget_seconds = 0.0;
+  const char *belief_path = NULL;
   const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
   for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
     const char *value = config_get_parg_value(config, ARG_TOKEN_CPEG, arg_idx);
@@ -3830,6 +3854,14 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
     if (strings_equal(value, "noexch")) {
       allow_exchanges = false;
+    } else if (strings_equal(value, "belief")) {
+      if (belief_path != NULL || arg_idx + 1 >= n_args) {
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+            string_duplicate("cpeg belief requires exactly one file path"));
+        return;
+      }
+      belief_path = config_get_parg_value(config, ARG_TOKEN_CPEG, ++arg_idx);
     } else if (strings_equal(value, "lead")) {
       if (has_lead || arg_idx + 1 >= n_args) {
         error_stack_push(
@@ -3884,6 +3916,13 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
         string_duplicate("cpeg lead is mutually exclusive with estimate"));
     return;
   }
+  if (belief_path != NULL && !(has_lead && use_certified)) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+        string_duplicate(
+            "cpeg belief requires the certified lead/budget solver"));
+    return;
+  }
 
   if (bag <= 0) {
     if (has_lead) {
@@ -3910,7 +3949,7 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (use_certified) {
     if (has_lead) {
       impl_cpeg_wtl_certified(config, bag, allow_exchanges, initial_lead,
-                              budget_seconds, error_stack);
+                              budget_seconds, belief_path, error_stack);
       return;
     }
     impl_cpeg_certified(config, bag, allow_exchanges, budget_seconds,
@@ -8841,7 +8880,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_INFER, "infer", 0, 5, infer, generic, false);
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
-  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 6, cpeg, generic, false);
+  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 8, cpeg, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);
   cmd(ARG_TOKEN_LEAVE_GEN, "leavegen", 2, 2, leave_gen, generic, false);

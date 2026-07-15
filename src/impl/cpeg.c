@@ -262,6 +262,9 @@ static int cpeg_wtl_compare_component(double lhs, double rhs) {
 }
 
 int cpeg_wtl_compare(const CpegWtlValue *lhs, const CpegWtlValue *rhs) {
+  // Wire objective lexicographic_win_tie_margin_v1: these components are
+  // compared in order. There is deliberately no scalar value assigned to a
+  // tie and no weighted sum that could trade tie mass against win mass.
   int comparison = cpeg_wtl_compare_component(lhs->win, rhs->win);
   if (comparison != 0) {
     return comparison;
@@ -2955,6 +2958,117 @@ static void cpeg_sort_scheduled_worlds(CpegScheduledWorld *worlds,
   }
 }
 
+// Build the hidden-world schedule from either the neutral physical inventory
+// prior or a caller-supplied exact integer posterior. The supplied form is
+// deliberately bag-only: the opponent rack is the unique unseen complement.
+// Invalid, duplicate, nonconserving, or overflowing worlds fail closed.
+static int cpeg_prepare_scheduled_worlds(
+    const int unseen[MAX_ALPHABET_SIZE], int ld_size, int bag_size,
+    const CpegWeightedWorld *weighted_worlds, int weighted_world_count,
+    CpegScheduledWorld **worlds_out, int64_t *mass_out) {
+  if (worlds_out == NULL || mass_out == NULL || bag_size < 1 ||
+      bag_size > PEG_MAX_BAG || weighted_world_count < 0 ||
+      weighted_world_count > CPEG_WORLD_CAP ||
+      ((weighted_worlds == NULL) != (weighted_world_count == 0))) {
+    return -1;
+  }
+
+  int64_t maximum_draw_mass = 1;
+  for (int draw_count = 0; draw_count <= bag_size; draw_count++) {
+    const int64_t draw_mass = peg_binomial(bag_size, draw_count);
+    if (draw_mass > maximum_draw_mass) {
+      maximum_draw_mass = draw_mass;
+    }
+  }
+  const int64_t safe_world_mass = INT64_MAX / maximum_draw_mass;
+
+  if (weighted_worlds == NULL) {
+    CpegMultiset enumerated_worlds[CPEG_WORLD_CAP];
+    bool world_overflow = false;
+    const int world_count =
+        cpeg_enum_submultisets(unseen, ld_size, bag_size, enumerated_worlds,
+                               CPEG_WORLD_CAP, &world_overflow);
+    if (world_overflow || world_count < 1) {
+      return -1;
+    }
+    CpegScheduledWorld *worlds =
+        malloc_or_die((size_t)world_count * sizeof(*worlds));
+    int64_t mass = 0;
+    for (int world_idx = 0; world_idx < world_count; world_idx++) {
+      if (enumerated_worlds[world_idx].weight <= 0 ||
+          safe_world_mass - mass < enumerated_worlds[world_idx].weight) {
+        free(worlds);
+        return -1;
+      }
+      worlds[world_idx] = (CpegScheduledWorld){
+          .multiset = enumerated_worlds[world_idx],
+          .generation_index = world_idx,
+      };
+      mass += enumerated_worlds[world_idx].weight;
+    }
+    cpeg_sort_scheduled_worlds(worlds, world_count);
+    *worlds_out = worlds;
+    *mass_out = mass;
+    return world_count;
+  }
+
+  if (weighted_world_count < 1) {
+    return -1;
+  }
+  CpegScheduledWorld *worlds =
+      malloc_or_die((size_t)weighted_world_count * sizeof(*worlds));
+  int64_t mass = 0;
+  for (int world_idx = 0; world_idx < weighted_world_count; world_idx++) {
+    const CpegWeightedWorld *supplied = &weighted_worlds[world_idx];
+    if (supplied->bag_count != bag_size || supplied->weight <= 0 ||
+        safe_world_mass - mass < supplied->weight) {
+      free(worlds);
+      return -1;
+    }
+    int used[MAX_ALPHABET_SIZE] = {0};
+    MachineLetter previous = 0;
+    for (int tile_idx = 0; tile_idx < supplied->bag_count; tile_idx++) {
+      const MachineLetter tile = supplied->bag_tiles[tile_idx];
+      if ((int)tile >= ld_size || (tile_idx > 0 && tile < previous) ||
+          ++used[tile] > unseen[tile]) {
+        free(worlds);
+        return -1;
+      }
+      previous = tile;
+    }
+    for (int prior_idx = 0; prior_idx < world_idx; prior_idx++) {
+      bool duplicate = true;
+      for (int tile_idx = 0; tile_idx < bag_size; tile_idx++) {
+        if (weighted_worlds[prior_idx].bag_tiles[tile_idx] !=
+            supplied->bag_tiles[tile_idx]) {
+          duplicate = false;
+          break;
+        }
+      }
+      if (duplicate) {
+        free(worlds);
+        return -1;
+      }
+    }
+    CpegMultiset multiset = {
+        .n = supplied->bag_count,
+        .weight = supplied->weight,
+    };
+    for (int tile_idx = 0; tile_idx < supplied->bag_count; tile_idx++) {
+      multiset.tiles[tile_idx] = supplied->bag_tiles[tile_idx];
+    }
+    worlds[world_idx] = (CpegScheduledWorld){
+        .multiset = multiset,
+        .generation_index = world_idx,
+    };
+    mass += supplied->weight;
+  }
+  cpeg_sort_scheduled_worlds(worlds, weighted_world_count);
+  *worlds_out = worlds;
+  *mass_out = mass;
+  return weighted_world_count;
+}
+
 typedef struct CpegWtlProofWorld {
   CpegWtlEnvelope envelope;
   CpegWtlProofKind proof;
@@ -3636,6 +3750,18 @@ static bool cpeg_wtl_fraction_less(int64_t lhs_num, int64_t lhs_den,
     return false;
   }
   return lhs_num * rhs_den < rhs_num * lhs_den;
+}
+
+static bool cpeg_wtl_fraction_equal(int64_t lhs_num, int64_t lhs_den,
+                                    int64_t rhs_num, int64_t rhs_den,
+                                    bool *valid) {
+  if (lhs_num < 0 || rhs_num < 0 || lhs_den <= 0 || rhs_den <= 0 ||
+      (lhs_num > 0 && rhs_den > INT64_MAX / lhs_num) ||
+      (rhs_num > 0 && lhs_den > INT64_MAX / rhs_num)) {
+    *valid = false;
+    return false;
+  }
+  return lhs_num * rhs_den == rhs_num * lhs_den;
 }
 
 static bool cpeg_wtl_candidate_precedes(const CpegRootCand *candidates, int bag,
@@ -5157,7 +5283,13 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
   out->best_index = -1;
   if (game == NULL || args == NULL || args->bag < 1 ||
       args->bag > PEG_MAX_BAG || !isfinite(args->budget_seconds) ||
-      args->budget_seconds < 0.0 || args->max_batches < 0) {
+      args->budget_seconds < 0.0 || args->max_batches < 0 ||
+      args->weighted_world_count < 0 ||
+      ((args->weighted_worlds == NULL) != (args->weighted_world_count == 0)) ||
+      ((args->weighted_unseen_tiles == NULL) !=
+       (args->weighted_unseen_count == 0)) ||
+      ((args->weighted_worlds == NULL) !=
+       (args->weighted_unseen_tiles == NULL))) {
     return -1;
   }
 
@@ -5176,6 +5308,27 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
   if (total_unseen - args->bag < 0 || total_unseen - args->bag > RACK_SIZE) {
     game_destroy(root_game);
     return -1;
+  }
+  if (args->weighted_worlds != NULL) {
+    if (args->weighted_unseen_count != total_unseen) {
+      game_destroy(root_game);
+      return -1;
+    }
+    int supplied_unseen[MAX_ALPHABET_SIZE] = {0};
+    for (int tile_idx = 0; tile_idx < args->weighted_unseen_count; tile_idx++) {
+      const MachineLetter tile = args->weighted_unseen_tiles[tile_idx];
+      if ((int)tile >= ld_size) {
+        game_destroy(root_game);
+        return -1;
+      }
+      supplied_unseen[tile]++;
+    }
+    for (int ml = 0; ml < ld_size; ml++) {
+      if (supplied_unseen[ml] != unseen[ml]) {
+        game_destroy(root_game);
+        return -1;
+      }
+    }
   }
 
   CpegRootCollection root_collection = {0};
@@ -5221,24 +5374,13 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
     }
   }
 
-  CpegMultiset enumerated_worlds[CPEG_WORLD_CAP];
-  bool world_overflow = false;
-  const int world_count =
-      cpeg_enum_submultisets(unseen, ld_size, args->bag, enumerated_worlds,
-                             CPEG_WORLD_CAP, &world_overflow);
-  if (world_overflow || world_count < 1) {
+  int64_t world_mass = 0;
+  const int world_count = cpeg_prepare_scheduled_worlds(
+      unseen, ld_size, args->bag, args->weighted_worlds,
+      args->weighted_world_count, &worlds, &world_mass);
+  if (world_count < 1) {
     goto cleanup;
   }
-  worlds = malloc_or_die((size_t)world_count * sizeof(*worlds));
-  int64_t world_mass = 0;
-  for (int world_idx = 0; world_idx < world_count; world_idx++) {
-    worlds[world_idx] = (CpegScheduledWorld){
-        .multiset = enumerated_worlds[world_idx],
-        .generation_index = world_idx,
-    };
-    world_mass += enumerated_worlds[world_idx].weight;
-  }
-  cpeg_sort_scheduled_worlds(worlds, world_count);
   out->worlds_distinct = world_count;
   out->world_weight_mass = world_mass;
   const int root_score_bound =
@@ -5312,8 +5454,7 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
     if (candidate->kind != 0) {
       continue;
     }
-    const bool horizon =
-        move_get_tiles_played(&candidate->move) >= args->bag;
+    const bool horizon = move_get_tiles_played(&candidate->move) >= args->bag;
     const bool bootstrap = incumbent_idx < 0 && horizon;
     Game *template_game =
         candidate->kind == 0
@@ -5471,9 +5612,14 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
       if (!proof_valid) {
         break;
       }
-      const bool equal_upper =
-          challenger_state->win_upper_mass * candidate_state->outcome_mass ==
-          candidate_state->win_upper_mass * challenger_state->outcome_mass;
+      const bool equal_upper = cpeg_wtl_fraction_equal(
+          challenger_state->win_upper_mass, challenger_state->outcome_mass,
+          candidate_state->win_upper_mass, candidate_state->outcome_mass,
+          &proof_valid);
+      if (!proof_valid) {
+        stopped = true;
+        break;
+      }
       if (candidate_has_higher_upper ||
           (equal_upper && candidate_idx < challenger_idx)) {
         challenger_idx = candidate_idx;

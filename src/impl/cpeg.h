@@ -1,6 +1,7 @@
 #ifndef CPEG_H
 #define CPEG_H
 
+#include "../ent/cpeg_belief.h"
 #include "../ent/game.h"
 #include "../ent/move.h"
 #include <stdbool.h>
@@ -343,6 +344,16 @@ typedef struct CpegWtlCertifiedArgs {
   int batch_size;
   // Internal/test-only deterministic batch budget; zero is unbounded.
   int max_batches;
+  // Optional exact posterior support. NULL + zero preserves the neutral
+  // physical-inventory prior; otherwise every supplied world is validated and
+  // used verbatim. This axis is independent of the policy/observation model.
+  const CpegWeightedWorld *weighted_worlds;
+  int weighted_world_count;
+  // Exact unseen inventory bound by the supplied posterior manifest. Requiring
+  // it prevents a valid bag table for one position from being replayed against
+  // a different Game whose visible inventory happens to admit those bags.
+  const MachineLetter *weighted_unseen_tiles;
+  int weighted_unseen_count;
 } CpegWtlCertifiedArgs;
 
 typedef struct CpegWtlCertifiedCand {
