@@ -601,15 +601,45 @@ SimmedPlay *sim_results_get_display_simmed_play(const SimResults *sim_results,
   return sim_results->display_simmed_plays[play_index];
 }
 
+static bool placement_moves_have_identical_board_effect(const Move *move1,
+                                                        const Move *move2) {
+  if (move_get_row_start(move1) != move_get_row_start(move2) ||
+      move_get_col_start(move1) != move_get_col_start(move2) ||
+      move_get_dir(move1) != move_get_dir(move2) ||
+      move_get_tiles_length(move1) != move_get_tiles_length(move2) ||
+      move_get_score(move1) != move_get_score(move2)) {
+    return false;
+  }
+  for (int tile_idx = 0; tile_idx < move_get_tiles_length(move1); tile_idx++) {
+    if (move_get_tile(move1, tile_idx) != move_get_tile(move2, tile_idx)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool sim_results_simmed_plays_are_similar_internal(
     const SimResults *sim_results, SimmedPlay *sp1, SimmedPlay *sp2) {
+  const Move *move1 = simmed_play_get_move(sp1);
+  const Move *move2 = simmed_play_get_move(sp2);
+  if (move_get_type(move1) != move_get_type(move2)) {
+    return false;
+  }
+  if (move_get_type(move1) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+    // The generic similarity key deliberately collapses anagrams that use the
+    // same physical tiles at the same coordinate for move-list/PEG purposes.
+    // That is unsafe for simulation best-arm stopping: different ordered
+    // letters create different boards and therefore different future moves.
+    // Only placements with the exact same board effect may share an arm.
+    return placement_moves_have_identical_board_effect(move1, move2);
+  }
   if (sp1->similarity_key == 0) {
-    sp1->similarity_key = move_get_similarity_key(
-        simmed_play_get_move(sp1), sim_results_get_rack(sim_results));
+    sp1->similarity_key =
+        move_get_similarity_key(move1, sim_results_get_rack(sim_results));
   }
   if (sp2->similarity_key == 0) {
-    sp2->similarity_key = move_get_similarity_key(
-        simmed_play_get_move(sp2), sim_results_get_rack(sim_results));
+    sp2->similarity_key =
+        move_get_similarity_key(move2, sim_results_get_rack(sim_results));
   }
   return sp1->similarity_key == sp2->similarity_key;
 }
