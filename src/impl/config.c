@@ -1145,7 +1145,7 @@ void add_help_arg_to_string_builder(const Config *config, int token,
              "(bag empty). Emits a machine-readable one-line result.";
       break;
     case ARG_TOKEN_CROSSPLAY_ORACLE:
-      usages[0] = "<bag> <asset_manifest> [noexch]";
+      usages[0] = "<bag> <asset_manifest> [noexch] [apply <action_id>]";
       text = "Emits every legal Crossplay action in canonical action-id order "
              "after verifying the exact rules and native data assets. This "
              "neutral command never chooses or ranks a policy.";
@@ -4054,18 +4054,25 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
     return;
   }
   bool allow_exchanges = true;
+  const char *apply_action_id = NULL;
   const int arg_count =
       config_get_parg_num_set_values(config, ARG_TOKEN_CROSSPLAY_ORACLE);
-  if (arg_count == 3) {
+  for (int arg_idx = 2; arg_idx < arg_count; arg_idx++) {
     const char *option =
-        config_get_parg_value(config, ARG_TOKEN_CROSSPLAY_ORACLE, 2);
-    if (!strings_equal(option, "noexch")) {
+        config_get_parg_value(config, ARG_TOKEN_CROSSPLAY_ORACLE, arg_idx);
+    if (strings_equal(option, "noexch")) {
+      allow_exchanges = false;
+    } else if (strings_equal(option, "apply") && apply_action_id == NULL &&
+               arg_idx + 1 < arg_count) {
+      apply_action_id = config_get_parg_value(
+          config, ARG_TOKEN_CROSSPLAY_ORACLE, ++arg_idx);
+    } else {
       error_stack_push(
           error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
-          string_duplicate("crossplayoracle only accepts optional noexch"));
+          string_duplicate(
+              "crossplayoracle options are noexch and apply <action_id>"));
       return;
     }
-    allow_exchanges = false;
   }
 
   CrossplayOracleAssetManifest manifest;
@@ -4082,6 +4089,80 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
         error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
         get_formatted_string("crossplayoracle %s",
                              crossplay_oracle_status_name(status)));
+    return;
+  }
+
+  if (apply_action_id != NULL) {
+    const CrossplayOracleAction *selected = NULL;
+    for (int action_idx = 0; action_idx < actions.count; action_idx++) {
+      if (strings_equal(actions.actions[action_idx].id, apply_action_id)) {
+        selected = &actions.actions[action_idx];
+        break;
+      }
+    }
+    if (selected == NULL || bag_get_letters(game_get_bag(config->game)) != bag) {
+      crossplay_oracle_action_set_destroy(&actions);
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+          string_duplicate(
+              "crossplayoracle apply requires a legal action and exact concrete bag"));
+      return;
+    }
+    CrossplayOracleTransitionSet transitions;
+    const CrossplayOracleStatus transition_status =
+        crossplay_oracle_apply_action(config->game, selected, &transitions);
+    if (transition_status != CROSSPLAY_ORACLE_OK || !transitions.complete) {
+      crossplay_oracle_transition_set_destroy(&transitions);
+      crossplay_oracle_action_set_destroy(&actions);
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+          get_formatted_string("crossplayoracle transition %s",
+                               crossplay_oracle_status_name(transition_status)));
+      return;
+    }
+    StringBuilder *output = string_builder_create();
+    string_builder_add_formatted_string(
+        output,
+        "crossplay-oracle-transition protocol=crossplay-oracle-transition-v1 "
+        "action=%s action_space_count=%d action_space_digest=%s count=%d "
+        "weight_mass=%lld complete=1 rules=%s rules_digest=%s lexicon=%s "
+        "lexicon_digest=%s layout=%s layout_digest=%s distribution=%s "
+        "distribution_digest=%s blocklist_digest=%s\n",
+        selected->id, actions.count, actions.digest, transitions.count,
+        (long long)transitions.weight_mass, manifest.rules_id,
+        manifest.rules_digest, manifest.lexicon_id, manifest.lexicon_digest,
+        manifest.layout_id, manifest.layout_digest, manifest.distribution_id,
+        manifest.distribution_digest, manifest.blocklist_digest);
+    const LetterDistribution *ld = game_get_ld(config->game);
+    for (int transition_idx = 0; transition_idx < transitions.count;
+         transition_idx++) {
+      const CrossplayOracleTransition *transition =
+          &transitions.transitions[transition_idx];
+      StringBuilder *draw = string_builder_create();
+      if (transition->draw.count == 0) {
+        string_builder_add_string(draw, "-");
+      } else {
+        for (int tile_idx = 0; tile_idx < transition->draw.count; tile_idx++) {
+          string_builder_add_string(
+              draw, ld->ld_ml_to_hl[transition->draw.tiles[tile_idx]]);
+        }
+      }
+      char *cgp = game_get_cgp(transition->game, true);
+      string_builder_add_formatted_string(
+          output,
+          "crossplay-oracle-transition-row %d weight=%lld bag_emptied=%d "
+          "draw=%s cgp=%s\n",
+          transition_idx, (long long)transition->draw.weight,
+          transition->bag_emptied ? 1 : 0, string_builder_peek(draw), cgp);
+      free(cgp);
+      string_builder_destroy(draw);
+    }
+    char *rendered = string_builder_dump(output, NULL);
+    string_builder_destroy(output);
+    thread_control_print(config->thread_control, rendered);
+    free(rendered);
+    crossplay_oracle_transition_set_destroy(&transitions);
+    crossplay_oracle_action_set_destroy(&actions);
     return;
   }
 
@@ -9033,7 +9114,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
   cmd(ARG_TOKEN_CPEG, "cpeg", 0, 8, cpeg, generic, false);
-  cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 3,
+  cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 5,
       crossplay_oracle, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);

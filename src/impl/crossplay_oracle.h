@@ -2,14 +2,17 @@
 #define CROSSPLAY_ORACLE_H
 
 #include "../def/letter_distribution_defs.h"
+#include "../ent/bag.h"
 #include "../ent/game.h"
 #include "../ent/move.h"
 #include "../util/sha256.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 enum {
   CROSSPLAY_ORACLE_ACTION_CAPACITY = 16384,
   CROSSPLAY_ORACLE_EXCHANGE_CAPACITY = 128,
+  CROSSPLAY_ORACLE_DRAW_CAPACITY = 128,
 };
 
 typedef enum CrossplayOracleStatus {
@@ -50,10 +53,43 @@ typedef struct CrossplayOracleActionSet {
   char digest[SHA256_HEX_SIZE];
 } CrossplayOracleActionSet;
 
+typedef struct CrossplayOracleDraw {
+  MachineLetter tiles[RACK_SIZE];
+  int count;
+  int64_t weight;
+} CrossplayOracleDraw;
+
+typedef struct CrossplayOracleDrawSet {
+  CrossplayOracleDraw draws[CROSSPLAY_ORACLE_DRAW_CAPACITY];
+  int count;
+  int64_t weight_mass;
+  bool complete;
+} CrossplayOracleDrawSet;
+
+typedef struct CrossplayOracleTransition {
+  Game *game;
+  CrossplayOracleDraw draw;
+  bool bag_emptied;
+} CrossplayOracleTransition;
+
+typedef struct CrossplayOracleTransitionSet {
+  CrossplayOracleTransition transitions[CROSSPLAY_ORACLE_DRAW_CAPACITY];
+  int count;
+  int64_t weight_mass;
+  bool complete;
+} CrossplayOracleTransitionSet;
+
 CrossplayOracleStatus crossplay_oracle_generate_actions(
     const Game *game, int bag_count, bool allow_exchanges,
     CrossplayOracleActionSet *result);
 void crossplay_oracle_action_set_destroy(CrossplayOracleActionSet *result);
 const char *crossplay_oracle_status_name(CrossplayOracleStatus status);
+CrossplayOracleStatus crossplay_oracle_enumerate_draws(
+    const Bag *bag, int draw_count, int ld_size, CrossplayOracleDrawSet *result);
+CrossplayOracleStatus crossplay_oracle_apply_action(
+    const Game *game, const CrossplayOracleAction *action,
+    CrossplayOracleTransitionSet *result);
+void crossplay_oracle_transition_set_destroy(
+    CrossplayOracleTransitionSet *result);
 
 #endif

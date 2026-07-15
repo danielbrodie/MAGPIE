@@ -1,6 +1,10 @@
 #include "crossplay_oracle_test.h"
 
+#include "../src/ent/equity.h"
 #include "../src/ent/game.h"
+#include "../src/ent/letter_distribution.h"
+#include "../src/ent/player.h"
+#include "../src/ent/rack.h"
 #include "../src/impl/config.h"
 #include "../src/impl/crossplay_oracle.h"
 #include "../src/impl/crossplay_oracle_assets.h"
@@ -19,6 +23,12 @@ static const char *const SENATOR_TOSA_CGP =
 static const char *const BLANK_OPENING_CGP =
     "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 "
     "?AEINRT/ 0/0 0";
+
+static const char *const CONCRETE_SENATOR_CGP =
+    "cgp 3Z5F1NAIF/3E5I4I/3S1E3A2H1R/1INTERNaLS1VACS/5G3C2KAT/"
+    "4JO3OM1ER1/4E5I2R1/3QUBITS1D2EX/5E1OE2T1LI/5V1PAWPAWs1/"
+    "5Y1HM2B3/7E1EULOGY/10HE1O1/11A1O1/11U1D1 SENATOR/ADGLNRT "
+    "329/380 0";
 
 static Config *crossplay_oracle_test_config(void) {
   return config_create_or_die(
@@ -180,9 +190,155 @@ static void test_blank_encoding_and_exchange_policy(void) {
   config_destroy(config);
 }
 
+static void test_duplicate_draw_weights(void) {
+  Config *config = crossplay_oracle_test_config();
+  load_and_exec_config_or_die(config, BLANK_OPENING_CGP);
+  Game *game = config_get_game(config);
+  const LetterDistribution *ld = game_get_ld(game);
+  const MachineLetter tiles[] = {
+      ld_hl_to_ml(ld, "A"),
+      ld_hl_to_ml(ld, "A"),
+      ld_hl_to_ml(ld, "B"),
+  };
+  bag_set_to_tiles(game_get_bag(game), tiles, 3);
+
+  CrossplayOracleDrawSet draws;
+  assert(crossplay_oracle_enumerate_draws(game_get_bag(game), 2,
+                                          ld_get_size(ld), &draws) ==
+         CROSSPLAY_ORACLE_OK);
+  assert(draws.complete);
+  assert(draws.count == 2);
+  assert(draws.weight_mass == 3);
+  bool found_aa = false;
+  bool found_ab = false;
+  for (int draw_idx = 0; draw_idx < draws.count; draw_idx++) {
+    const CrossplayOracleDraw *draw = &draws.draws[draw_idx];
+    if (draw->tiles[0] == ld_hl_to_ml(ld, "A") &&
+        draw->tiles[1] == ld_hl_to_ml(ld, "A")) {
+      assert(draw->weight == 1);
+      found_aa = true;
+    } else if (draw->tiles[0] == ld_hl_to_ml(ld, "A") &&
+               draw->tiles[1] == ld_hl_to_ml(ld, "B")) {
+      assert(draw->weight == 2);
+      found_ab = true;
+    }
+  }
+  assert(found_aa);
+  assert(found_ab);
+  config_destroy(config);
+}
+
+static void test_clone_based_action_transitions(void) {
+  Config *config = crossplay_oracle_test_config();
+  load_and_exec_config_or_die(config, CONCRETE_SENATOR_CGP);
+  const Game *game = config_get_game(config);
+  Game *before = game_duplicate(game);
+  const LetterDistribution *ld = game_get_ld(game);
+
+  CrossplayOracleActionSet actions;
+  assert(crossplay_oracle_generate_actions(game, 4, true, &actions) ==
+         CROSSPLAY_ORACLE_OK);
+  const CrossplayOracleAction *tosa = NULL;
+  const CrossplayOracleAction *exchange_a = NULL;
+  const CrossplayOracleAction *pass = NULL;
+  for (int action_idx = 0; action_idx < actions.count; action_idx++) {
+    const CrossplayOracleAction *action = &actions.actions[action_idx];
+    if (strstr(action->canonical_json,
+               "\"start_col\":5,\"start_row\":12,\"word\":\"TOSA\"") !=
+        NULL) {
+      tosa = action;
+    } else if (strcmp(action->canonical_json,
+                      "{\"kind\":\"exchange\",\"tiles\":\"A\"}") == 0) {
+      exchange_a = action;
+    } else if (action->kind == CROSSPLAY_ORACLE_PASS) {
+      pass = action;
+    }
+  }
+  assert(tosa != NULL);
+  assert(exchange_a != NULL);
+  assert(pass != NULL);
+
+  CrossplayOracleTransitionSet transitions;
+  assert(crossplay_oracle_apply_action(game, tosa, &transitions) ==
+         CROSSPLAY_ORACLE_OK);
+  assert(transitions.complete);
+  assert(transitions.count == 1);
+  assert(transitions.weight_mass == 1);
+  assert(transitions.transitions[0].bag_emptied);
+  const Game *after_tosa = transitions.transitions[0].game;
+  assert(bag_is_empty(game_get_bag(after_tosa)));
+  assert(game_get_player_on_turn_index(after_tosa) == 1);
+  assert(game_get_game_end_reason(after_tosa) == GAME_END_REASON_NONE);
+  assert(player_get_score(game_get_player(after_tosa, 0)) ==
+         int_to_equity(343));
+  assert(player_get_score(game_get_player(after_tosa, 1)) ==
+         int_to_equity(380));
+  assert_rack_equals_string(
+      ld, player_get_rack(game_get_player(after_tosa, 0)), "DEINOR?");
+  assert_rack_equals_string(
+      ld, player_get_rack(game_get_player(after_tosa, 1)), "ADGLNRT");
+  crossplay_oracle_transition_set_destroy(&transitions);
+  assert_games_are_equal(before, game, true);
+
+  assert(crossplay_oracle_apply_action(game, exchange_a, &transitions) ==
+         CROSSPLAY_ORACLE_OK);
+  assert(transitions.count == 4);
+  assert(transitions.weight_mass == 4);
+  CrossplayOracleTransitionSet repeated_transitions;
+  assert(crossplay_oracle_apply_action(game, exchange_a,
+                                       &repeated_transitions) ==
+         CROSSPLAY_ORACLE_OK);
+  assert(repeated_transitions.count == transitions.count);
+  for (int transition_idx = 0; transition_idx < transitions.count;
+       transition_idx++) {
+    Game *child = transitions.transitions[transition_idx].game;
+    Game *repeated = repeated_transitions.transitions[transition_idx].game;
+    assert(bag_get_letters(game_get_bag(child)) == 4);
+    assert(game_get_player_on_turn_index(child) == 1);
+    assert(rack_get_total_letters(
+               player_get_rack(game_get_player(child, 0))) == RACK_SIZE);
+    assert(!transitions.transitions[transition_idx].bag_emptied);
+    assert_games_are_equal(child, repeated, true);
+    MachineLetter child_order[MAX_BAG_SIZE];
+    MachineLetter repeated_order[MAX_BAG_SIZE];
+    int child_count = bag_peek_tiles(game_get_bag(child), child_order);
+    int repeated_count =
+        bag_peek_tiles(game_get_bag(repeated), repeated_order);
+    assert(child_count == repeated_count);
+    assert(memcmp(child_order, repeated_order,
+                  (size_t)child_count * sizeof(*child_order)) == 0);
+    const MachineLetter probe = ld_hl_to_ml(ld, "E");
+    bag_add_letter(game_get_bag(child), probe, 0);
+    bag_add_letter(game_get_bag(repeated), probe, 0);
+    child_count = bag_peek_tiles(game_get_bag(child), child_order);
+    repeated_count = bag_peek_tiles(game_get_bag(repeated), repeated_order);
+    assert(child_count == repeated_count);
+    assert(memcmp(child_order, repeated_order,
+                  (size_t)child_count * sizeof(*child_order)) == 0);
+  }
+  crossplay_oracle_transition_set_destroy(&repeated_transitions);
+  crossplay_oracle_transition_set_destroy(&transitions);
+  assert_games_are_equal(before, game, true);
+
+  assert(crossplay_oracle_apply_action(game, pass, &transitions) ==
+         CROSSPLAY_ORACLE_OK);
+  assert(transitions.count == 1);
+  assert(game_get_player_on_turn_index(transitions.transitions[0].game) == 1);
+  assert(game_get_consecutive_scoreless_turns(
+             transitions.transitions[0].game) == 1);
+  crossplay_oracle_transition_set_destroy(&transitions);
+  assert_games_are_equal(before, game, true);
+
+  crossplay_oracle_action_set_destroy(&actions);
+  game_destroy(before);
+  config_destroy(config);
+}
+
 void test_crossplay_oracle(void) {
   test_sha256_known_vector();
   test_asset_manifest_verification();
   test_complete_canonical_action_set();
   test_blank_encoding_and_exchange_policy();
+  test_duplicate_draw_weights();
+  test_clone_based_action_transitions();
 }

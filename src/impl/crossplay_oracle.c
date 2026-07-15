@@ -10,7 +10,9 @@
 #include "../ent/rack.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
+#include "gameplay.h"
 #include "move_gen.h"
+#include "peg_combinatorics.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -237,6 +239,182 @@ static void crossplay_oracle_action_space_digest(
     sha256_update(&sha, "\n", 1);
   }
   sha256_final_hex(&sha, result->digest);
+}
+
+typedef struct CrossplayOracleDrawCollector {
+  CrossplayOracleDrawSet *result;
+  bool overflow;
+} CrossplayOracleDrawCollector;
+
+static void crossplay_oracle_draw_rec(
+    const int *counts, int ld_size, int start_ml, int tiles_left,
+    int64_t weight, MachineLetter *chosen, int chosen_count,
+    CrossplayOracleDrawCollector *collector) {
+  if (collector->overflow) {
+    return;
+  }
+  if (tiles_left == 0) {
+    if (collector->result->count >= CROSSPLAY_ORACLE_DRAW_CAPACITY) {
+      collector->overflow = true;
+      return;
+    }
+    CrossplayOracleDraw *draw =
+        &collector->result->draws[collector->result->count++];
+    memcpy(draw->tiles, chosen, (size_t)chosen_count * sizeof(*chosen));
+    draw->count = chosen_count;
+    draw->weight = weight;
+    collector->result->weight_mass += weight;
+    return;
+  }
+  for (int ml = start_ml; ml < ld_size; ml++) {
+    const int available = counts[ml];
+    const int maximum_take =
+        available < tiles_left ? available : tiles_left;
+    for (int take = 1; take <= maximum_take; take++) {
+      for (int tile_idx = 0; tile_idx < take; tile_idx++) {
+        chosen[chosen_count + tile_idx] = (MachineLetter)ml;
+      }
+      crossplay_oracle_draw_rec(
+          counts, ld_size, ml + 1, tiles_left - take,
+          weight * peg_binomial(available, take), chosen, chosen_count + take,
+          collector);
+    }
+  }
+}
+
+CrossplayOracleStatus crossplay_oracle_enumerate_draws(
+    const Bag *bag, int draw_count, int ld_size,
+    CrossplayOracleDrawSet *result) {
+  if (result == NULL) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  memset(result, 0, sizeof(*result));
+  if (bag == NULL || draw_count < 0 || draw_count > RACK_SIZE || ld_size < 1 ||
+      ld_size > MAX_ALPHABET_SIZE || draw_count > bag_get_letters(bag)) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  MachineLetter chosen[RACK_SIZE];
+  CrossplayOracleDrawCollector collector = {.result = result};
+  crossplay_oracle_draw_rec(counts, ld_size, 0, draw_count, 1, chosen, 0,
+                            &collector);
+  if (collector.overflow) {
+    memset(result, 0, sizeof(*result));
+    return CROSSPLAY_ORACLE_CAPACITY_EXCEEDED;
+  }
+  result->complete = true;
+  return CROSSPLAY_ORACLE_OK;
+}
+
+static bool crossplay_oracle_exchange_available(
+    const Game *game, const CrossplayOracleAction *action) {
+  const int actor = game_get_player_on_turn_index(game);
+  const Rack *rack = player_get_rack(game_get_player(game, actor));
+  int needed[MAX_ALPHABET_SIZE] = {0};
+  for (int tile_idx = 0; tile_idx < action->exchange_count; tile_idx++) {
+    needed[action->exchange_tiles[tile_idx]]++;
+  }
+  for (int ml = 0; ml < ld_get_size(game_get_ld(game)); ml++) {
+    if (needed[ml] > rack_get_letter(rack, (MachineLetter)ml)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void crossplay_oracle_apply_draw(Game *game, int actor,
+                                        const CrossplayOracleDraw *draw) {
+  Bag *bag = game_get_bag(game);
+  Rack *rack = player_get_rack(game_get_player(game, actor));
+  for (int tile_idx = 0; tile_idx < draw->count; tile_idx++) {
+    const MachineLetter tile = draw->tiles[tile_idx];
+    bag_draw_letter(bag, tile, actor);
+    rack_add_letter(rack, tile);
+  }
+}
+
+CrossplayOracleStatus crossplay_oracle_apply_action(
+    const Game *game, const CrossplayOracleAction *action,
+    CrossplayOracleTransitionSet *result) {
+  if (result == NULL) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  memset(result, 0, sizeof(*result));
+  if (game == NULL || action == NULL ||
+      bag_get_letters(game_get_bag(game)) > PEG_MAX_BAG) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  const int actor = game_get_player_on_turn_index(game);
+  const int bag_before = bag_get_letters(game_get_bag(game));
+  if (action->kind == CROSSPLAY_ORACLE_EXCHANGE &&
+      (action->exchange_count < 1 || action->exchange_count > bag_before ||
+       !crossplay_oracle_exchange_available(game, action))) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+
+  int draw_count = 0;
+  if (action->kind == CROSSPLAY_ORACLE_PLACEMENT) {
+    draw_count = move_get_tiles_played(&action->move);
+    if (draw_count > bag_before) {
+      draw_count = bag_before;
+    }
+  } else if (action->kind == CROSSPLAY_ORACLE_EXCHANGE) {
+    draw_count = action->exchange_count;
+  }
+  CrossplayOracleDrawSet draws;
+  const CrossplayOracleStatus draw_status = crossplay_oracle_enumerate_draws(
+      game_get_bag(game), draw_count, ld_get_size(game_get_ld(game)), &draws);
+  if (draw_status != CROSSPLAY_ORACLE_OK) {
+    return draw_status;
+  }
+
+  for (int draw_idx = 0; draw_idx < draws.count; draw_idx++) {
+    CrossplayOracleTransition *transition =
+        &result->transitions[result->count++];
+    transition->game = game_duplicate(game);
+    transition->draw = draws.draws[draw_idx];
+    if (action->kind == CROSSPLAY_ORACLE_PLACEMENT) {
+      play_move_without_drawing_tiles(&action->move, transition->game);
+      crossplay_oracle_apply_draw(transition->game, actor, &transition->draw);
+      game_set_consecutive_scoreless_turns(transition->game, 0);
+    } else if (action->kind == CROSSPLAY_ORACLE_EXCHANGE) {
+      crossplay_oracle_apply_draw(transition->game, actor, &transition->draw);
+      Bag *bag = game_get_bag(transition->game);
+      Rack *rack =
+          player_get_rack(game_get_player(transition->game, actor));
+      for (int tile_idx = 0; tile_idx < action->exchange_count; tile_idx++) {
+        const MachineLetter tile = action->exchange_tiles[tile_idx];
+        rack_take_letter(rack, tile);
+        bag_add_letter(bag, tile, actor);
+      }
+      game_start_next_player_turn(transition->game);
+      game_increment_consecutive_scoreless_turns(transition->game);
+    } else {
+      game_start_next_player_turn(transition->game);
+      game_increment_consecutive_scoreless_turns(transition->game);
+    }
+    game_set_game_end_reason(transition->game, GAME_END_REASON_NONE);
+    transition->bag_emptied =
+        bag_before > 0 && bag_is_empty(game_get_bag(transition->game));
+  }
+  result->weight_mass = draws.weight_mass;
+  result->complete = true;
+  return CROSSPLAY_ORACLE_OK;
+}
+
+void crossplay_oracle_transition_set_destroy(
+    CrossplayOracleTransitionSet *result) {
+  if (result == NULL) {
+    return;
+  }
+  for (int transition_idx = 0; transition_idx < result->count;
+       transition_idx++) {
+    game_destroy(result->transitions[transition_idx].game);
+  }
+  memset(result, 0, sizeof(*result));
 }
 
 CrossplayOracleStatus crossplay_oracle_generate_actions(
