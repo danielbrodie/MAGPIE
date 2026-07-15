@@ -184,6 +184,39 @@ typedef struct CpegPreResult {
   CpegRootCoverage coverage;
 } CpegPreResult;
 
+// Root-perspective strict-outcome value. Chance nodes average all four
+// components; choice nodes compare win probability first, then tie
+// probability, then expected final margin.
+typedef struct CpegWtlValue {
+  double win;
+  double tie;
+  double loss;
+  double expected_final_margin;
+} CpegWtlValue;
+
+typedef struct CpegWtlArgs {
+  int bag;
+  bool allow_exchanges;
+  int num_threads;
+  // Root mover score minus opponent score before the candidate is played.
+  // This is explicit: the solver deliberately never reads Game player scores.
+  int64_t initial_lead;
+} CpegWtlArgs;
+
+typedef struct CpegWtlCand {
+  char label[CPEG_MOVE_STR_LEN];
+  int score;
+  CpegWtlValue value;
+} CpegWtlCand;
+
+typedef struct CpegWtlResult {
+  CpegWtlCand *cands;
+  int count;
+  int worlds_distinct;
+  int64_t world_weight_mass;
+  CpegRootCoverage coverage;
+} CpegWtlResult;
+
 typedef enum CpegPreStatus {
   CPEG_PRE_CERTIFIED,
   CPEG_PRE_EXACT_VALUES,
@@ -249,6 +282,27 @@ typedef struct CpegCertifiedResult {
 int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
                            int num_threads, CpegPreResult *out);
 
+// Exact score-aware Crossplay pre-endgame solve. Every recursive value is
+// carried from the original mover's perspective. The mover maximizes and the
+// opponent minimizes the lexicographic tuple (P(win), P(tie), expected final
+// margin). Returns the complete ranked root action count, or -1 on invalid
+// input or an explicitly detected incomplete search.
+int cpeg_solve_pre_endgame_wtl(const Game *game, const CpegWtlArgs *args,
+                               CpegWtlResult *out);
+
+// Pure outcome helpers, also useful for focused tests and callers that need to
+// combine exact chance branches.
+CpegWtlValue cpeg_wtl_classify_margin(int64_t final_margin);
+int cpeg_wtl_compare(const CpegWtlValue *lhs, const CpegWtlValue *rhs);
+int cpeg_wtl_weighted_average(const CpegWtlValue *values,
+                              const int64_t *weights, int count,
+                              CpegWtlValue *out);
+
+// Classify the exact two-ply empty-bag result from root_player_idx's
+// perspective, starting from the supplied explicit lead.
+int cpeg_solve_endgame_wtl(Game *game, int root_player_idx,
+                           int64_t initial_lead, CpegWtlValue *out);
+
 // Deterministic batched certified solve. A zero wall-clock or work budget is
 // unbounded. Wall-clock ESTIMATED results are not bit-identical across machines
 // or load because different complete-batch prefixes may finish; the schedule is
@@ -260,6 +314,7 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
 // Release dynamically allocated candidate storage. The result may be zeroed or
 // already destroyed; after return it is reset to an empty state.
 void cpeg_pre_result_destroy(CpegPreResult *result);
+void cpeg_wtl_result_destroy(CpegWtlResult *result);
 void cpeg_certified_result_destroy(CpegCertifiedResult *result);
 
 typedef struct CpegStatisticalArgs {

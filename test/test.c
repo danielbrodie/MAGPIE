@@ -190,6 +190,7 @@ static TestEntry on_demand_test_table[] = {
     {"cpegroot", test_cpeg_complete_root_collection},
     {"cpegcertify", test_cpeg_certified_bag1},
     {"cpegstat", test_cpeg_statistical_bag1},
+    {"cpegwtl", test_cpeg_wtl_senator},
     {NULL, NULL} // Sentinel value to mark end of array
 };
 

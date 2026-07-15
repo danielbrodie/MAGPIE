@@ -25,6 +25,7 @@
 #include "move_gen.h"
 #include "peg_combinatorics.h"
 #include "peg_pool.h"
+#include <float.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -82,7 +83,7 @@ static void cpeg_render_move(char *dest, size_t dest_size, const Board *board,
 // per-leaf allocation. Fills *result and returns the swing (in points).
 static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
                              MoveList *reply_moves, MoveUndo *undo,
-                             CpegResult *result) {
+                             CpegResult *result, bool *capacity_exceeded) {
   memset(result, 0, sizeof(*result));
 
   const LetterDistribution *ld = game_get_ld(game);
@@ -106,6 +107,13 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
   };
   generate_moves(&mover_args);
   move_list_sort_moves(mover_moves);
+
+  if (move_list_get_count(mover_moves) > CPEG_MOVE_LIST_CAP) {
+    if (capacity_exceeded != NULL) {
+      *capacity_exceeded = true;
+    }
+    return 0;
+  }
 
   int best_swing = 0;
   int best_mover_score = 0;
@@ -200,15 +208,135 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
 }
 
 int cpeg_solve_endgame(Game *game, CpegResult *result) {
-  MoveList *mover_moves = move_list_create(CPEG_MOVE_LIST_CAP);
+  MoveList *mover_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
   MoveList *reply_moves = move_list_create(CPEG_MOVE_LIST_CAP);
   MoveUndo *undo = malloc_or_die(sizeof(MoveUndo));
-  const int swing =
-      cpeg_endgame_core(game, mover_moves, reply_moves, undo, result);
+  const int swing = cpeg_endgame_core(game, mover_moves, reply_moves, undo,
+                                      result, /*capacity_exceeded=*/NULL);
   free(undo);
   move_list_destroy(reply_moves);
   move_list_destroy(mover_moves);
   return swing;
+}
+
+CpegWtlValue cpeg_wtl_classify_margin(int64_t final_margin) {
+  CpegWtlValue value = {
+      .expected_final_margin = (double)final_margin,
+  };
+  if (final_margin > 0) {
+    value.win = 1.0;
+  } else if (final_margin == 0) {
+    value.tie = 1.0;
+  } else {
+    value.loss = 1.0;
+  }
+  return value;
+}
+
+static bool cpeg_checked_margin_add(int64_t margin, int64_t delta,
+                                    int64_t *result) {
+  if ((delta > 0 && margin > INT64_MAX - delta) ||
+      (delta < 0 && margin < INT64_MIN - delta)) {
+    return false;
+  }
+  *result = margin + delta;
+  return true;
+}
+
+static int cpeg_wtl_compare_component(double lhs, double rhs) {
+  // Equal rational probabilities can reach a node through different nested
+  // chance-denominator shapes. Their floating-point reconstructions may differ
+  // by a handful of ulps even though the mathematical values are equal. The
+  // reachable CPEG tree is shallow, so 256 scaled ulps comfortably absorbs
+  // that reduction noise while remaining many orders below the smallest
+  // meaningful bag-1..4 outcome-mass increment.
+  const double scale = fmax(1.0, fmax(fabs(lhs), fabs(rhs)));
+  const double tolerance = 256.0 * DBL_EPSILON * scale;
+  if (lhs > rhs + tolerance) {
+    return 1;
+  }
+  if (lhs < rhs - tolerance) {
+    return -1;
+  }
+  return 0;
+}
+
+int cpeg_wtl_compare(const CpegWtlValue *lhs, const CpegWtlValue *rhs) {
+  int comparison = cpeg_wtl_compare_component(lhs->win, rhs->win);
+  if (comparison != 0) {
+    return comparison;
+  }
+  comparison = cpeg_wtl_compare_component(lhs->tie, rhs->tie);
+  if (comparison != 0) {
+    return comparison;
+  }
+  comparison = cpeg_wtl_compare_component(lhs->expected_final_margin,
+                                          rhs->expected_final_margin);
+  if (comparison != 0) {
+    return comparison;
+  }
+  return 0;
+}
+
+int cpeg_wtl_weighted_average(const CpegWtlValue *values,
+                              const int64_t *weights, int count,
+                              CpegWtlValue *out) {
+  if (values == NULL || weights == NULL || out == NULL || count < 1) {
+    return -1;
+  }
+  CpegWtlValue weighted = {0};
+  int64_t weight_total = 0;
+  for (int value_idx = 0; value_idx < count; value_idx++) {
+    const int64_t weight = weights[value_idx];
+    if (weight <= 0 || INT64_MAX - weight_total < weight) {
+      return -1;
+    }
+    weighted.win += (double)weight * values[value_idx].win;
+    weighted.tie += (double)weight * values[value_idx].tie;
+    weighted.loss += (double)weight * values[value_idx].loss;
+    weighted.expected_final_margin +=
+        (double)weight * values[value_idx].expected_final_margin;
+    weight_total += weight;
+  }
+  const double denominator = (double)weight_total;
+  *out = (CpegWtlValue){
+      .win = weighted.win / denominator,
+      .tie = weighted.tie / denominator,
+      .loss = weighted.loss / denominator,
+      .expected_final_margin = weighted.expected_final_margin / denominator,
+  };
+  return 0;
+}
+
+int cpeg_solve_endgame_wtl(Game *game, int root_player_idx,
+                           int64_t initial_lead, CpegWtlValue *out) {
+  if (game == NULL || out == NULL || root_player_idx < 0 ||
+      root_player_idx > 1 || !bag_is_empty(game_get_bag(game))) {
+    return -1;
+  }
+  const int on_turn = game_get_player_on_turn_index(game);
+  MoveList *mover_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
+  MoveList *reply_moves = move_list_create(CPEG_MOVE_LIST_CAP);
+  MoveUndo *undo = malloc_or_die(sizeof(MoveUndo));
+  CpegResult result;
+  bool capacity_exceeded = false;
+  const int on_turn_swing = cpeg_endgame_core(
+      game, mover_moves, reply_moves, undo, &result, &capacity_exceeded);
+  free(undo);
+  move_list_destroy(reply_moves);
+  move_list_destroy(mover_moves);
+  if (capacity_exceeded) {
+    return -1;
+  }
+  const int64_t root_swing = on_turn == root_player_idx
+                                 ? (int64_t)on_turn_swing
+                                 : -(int64_t)on_turn_swing;
+  int64_t final_margin;
+  if (!cpeg_checked_margin_add(initial_lead, root_swing, &final_margin)) {
+    return -1;
+  }
+  *out = cpeg_wtl_classify_margin(final_margin);
+  return 0;
 }
 
 CpegInterval cpeg_solve_endgame_interval(Game *game) {
@@ -797,7 +925,7 @@ typedef struct CpegBranchUndo {
 
 static MoveList *cpeg_get_movelist(CpegPreCtx *ctx, int depth) {
   if (ctx->movelists[depth] == NULL) {
-    ctx->movelists[depth] = move_list_create(CPEG_MOVE_LIST_CAP);
+    ctx->movelists[depth] = move_list_create(CPEG_MOVE_LIST_CAP + 1);
   }
   return ctx->movelists[depth];
 }
@@ -849,6 +977,46 @@ static Game *cpeg_child_game(CpegPreCtx *ctx, int depth, const Game *src) {
 static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless, int depth);
 static CpegInterval cpeg_value_interval(CpegPreCtx *ctx, Game *game,
                                         int scoreless, int depth);
+static CpegWtlValue cpeg_wtl_value(CpegPreCtx *ctx, Game *game,
+                                   int64_t root_margin, int scoreless,
+                                   int depth);
+
+static bool cpeg_wtl_accumulate(CpegWtlValue *weighted_sum,
+                                int64_t *weight_total,
+                                const CpegWtlValue *value, int64_t weight) {
+  if (weight <= 0 || INT64_MAX - *weight_total < weight) {
+    return false;
+  }
+  weighted_sum->win += (double)weight * value->win;
+  weighted_sum->tie += (double)weight * value->tie;
+  weighted_sum->loss += (double)weight * value->loss;
+  weighted_sum->expected_final_margin +=
+      (double)weight * value->expected_final_margin;
+  *weight_total += weight;
+  return true;
+}
+
+static CpegWtlValue cpeg_wtl_normalize(const CpegWtlValue *weighted_sum,
+                                       int64_t weight_total) {
+  if (weight_total <= 0) {
+    return (CpegWtlValue){0};
+  }
+  const double denominator = (double)weight_total;
+  return (CpegWtlValue){
+      .win = weighted_sum->win / denominator,
+      .tie = weighted_sum->tie / denominator,
+      .loss = weighted_sum->loss / denominator,
+      .expected_final_margin =
+          weighted_sum->expected_final_margin / denominator,
+  };
+}
+
+static bool cpeg_wtl_should_take(const CpegWtlValue *candidate,
+                                 const CpegWtlValue *incumbent,
+                                 bool root_turn) {
+  const int comparison = cpeg_wtl_compare(candidate, incumbent);
+  return root_turn ? comparison > 0 : comparison < 0;
+}
 
 // Value to the on-turn player of committing to placement `move`: its score
 // minus the draw-averaged value of the resulting opponent-to-move position
@@ -983,6 +1151,80 @@ static CpegInterval cpeg_eval_place_interval(CpegPreCtx *ctx, Game *game,
       .lo = cpeg_down_add((double)score, -child_expectation.hi),
       .hi = cpeg_up_add((double)score, -child_expectation.lo),
   };
+}
+
+// Root-perspective counterpart of cpeg_eval_place. The move score updates the
+// explicit root margin according to the actor, and chance branches average a
+// fully normalized outcome vector at this draw node.
+static CpegWtlValue cpeg_eval_place_wtl(CpegPreCtx *ctx, Game *game,
+                                        const Move *move, int64_t root_margin,
+                                        int depth) {
+  const int on_turn = game_get_player_on_turn_index(game);
+  const Bag *bag = game_get_bag(game);
+  const int bag_count = bag_get_letters(bag);
+  const int tiles_played = move_get_tiles_played(move);
+  const int k_drawn = tiles_played < bag_count ? tiles_played : bag_count;
+  const int score = equity_to_int(move_get_score(move));
+  int64_t next_margin;
+  const int64_t score_delta =
+      on_turn == ctx->mover_idx ? (int64_t)score : -(int64_t)score;
+  if (!cpeg_checked_margin_add(root_margin, score_delta, &next_margin)) {
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  bool overflow = false;
+  const int n_draws = cpeg_enum_submultisets(counts, ctx->ld_size, k_drawn,
+                                             draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow) {
+    ctx->capacity_exceeded = true;
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+
+  MoveUndo *move_undo = cpeg_get_move_undo(ctx, depth);
+  play_move_incremental(move, game, move_undo);
+  CpegBranchUndo branch_undo;
+  cpeg_save_branch(ctx, game, on_turn, depth, &branch_undo);
+
+  CpegWtlValue weighted_sum = {0};
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    if (cpeg_interval_should_cancel(ctx)) {
+      unplay_move_incremental(game, move_undo);
+      return (CpegWtlValue){0};
+    }
+    const CpegMultiset *draw = &draws[draw_idx];
+    Bag *child_bag = game_get_bag(game);
+    Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
+    for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+      bag_draw_letter(child_bag, draw->tiles[tile_idx], on_turn);
+      rack_add_letter(mover_rack, draw->tiles[tile_idx]);
+    }
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    const CpegWtlValue child =
+        cpeg_wtl_value(ctx, game, next_margin, 0, depth + 1);
+    if (!ctx->complete || !cpeg_wtl_accumulate(&weighted_sum, &weight_total,
+                                               &child, draw->weight)) {
+      ctx->complete = false;
+      cpeg_restore_branch(ctx, game, depth, &branch_undo);
+      unplay_move_incremental(game, move_undo);
+      return (CpegWtlValue){0};
+    }
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+  }
+  unplay_move_incremental(game, move_undo);
+  if (weight_total <= 0) {
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+  return cpeg_wtl_normalize(&weighted_sum, weight_total);
 }
 
 // Value to the on-turn player of a scoreless move: a pass (exch_n == 0, no
@@ -1149,6 +1391,83 @@ cpeg_eval_scoreless_interval(CpegPreCtx *ctx, Game *game,
                         .hi = -child_expectation.lo};
 }
 
+static CpegWtlValue cpeg_eval_scoreless_wtl(CpegPreCtx *ctx, Game *game,
+                                            const MachineLetter *exch_tiles,
+                                            int exch_n, int64_t root_margin,
+                                            int scoreless, int depth) {
+  // The model's second consecutive scoreless action ends the game without
+  // changing the score. Classify the accumulated margin, not a neutral value.
+  if (scoreless + 1 >= CPEG_SCORELESS_CAP) {
+    return cpeg_wtl_classify_margin(root_margin);
+  }
+  const int on_turn = game_get_player_on_turn_index(game);
+  CpegBranchUndo branch_undo;
+  cpeg_save_branch(ctx, game, on_turn, depth, &branch_undo);
+
+  if (exch_n == 0) {
+    game_start_next_player_turn(game);
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    const CpegWtlValue value =
+        cpeg_wtl_value(ctx, game, root_margin, scoreless + 1, depth + 1);
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+    return ctx->complete ? value : (CpegWtlValue){0};
+  }
+
+  const Bag *bag = game_get_bag(game);
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  bool overflow = false;
+  const int n_draws = cpeg_enum_submultisets(counts, ctx->ld_size, exch_n,
+                                             draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow) {
+    ctx->capacity_exceeded = true;
+    ctx->complete = false;
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+    return (CpegWtlValue){0};
+  }
+
+  CpegWtlValue weighted_sum = {0};
+  int64_t weight_total = 0;
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    if (cpeg_interval_should_cancel(ctx)) {
+      cpeg_restore_branch(ctx, game, depth, &branch_undo);
+      return (CpegWtlValue){0};
+    }
+    const CpegMultiset *draw = &draws[draw_idx];
+    Bag *child_bag = game_get_bag(game);
+    Rack *mover_rack = player_get_rack(game_get_player(game, on_turn));
+    for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+      bag_draw_letter(child_bag, draw->tiles[tile_idx], on_turn);
+      rack_add_letter(mover_rack, draw->tiles[tile_idx]);
+    }
+    for (int tile_idx = 0; tile_idx < exch_n; tile_idx++) {
+      rack_take_letter(mover_rack, exch_tiles[tile_idx]);
+      bag_add_letter(child_bag, exch_tiles[tile_idx], on_turn);
+    }
+    game_start_next_player_turn(game);
+    game_set_consecutive_scoreless_turns(game, 0);
+    game_set_game_end_reason(game, GAME_END_REASON_NONE);
+    const CpegWtlValue child =
+        cpeg_wtl_value(ctx, game, root_margin, scoreless + 1, depth + 1);
+    if (!ctx->complete || !cpeg_wtl_accumulate(&weighted_sum, &weight_total,
+                                               &child, draw->weight)) {
+      ctx->complete = false;
+      cpeg_restore_branch(ctx, game, depth, &branch_undo);
+      return (CpegWtlValue){0};
+    }
+    cpeg_restore_branch(ctx, game, depth, &branch_undo);
+  }
+  if (weight_total <= 0) {
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+  return cpeg_wtl_normalize(&weighted_sum, weight_total);
+}
+
 // Enumerate the mover's distinct exchange multisets (1..min(rack, bag) tiles)
 // into out; returns the count. Shared by the recursion and the root candidate
 // list so both search the same exchange set.
@@ -1190,8 +1509,9 @@ static double cpeg_value(CpegPreCtx *ctx, Game *game, int scoreless,
   const int bag_count = bag_get_letters(bag);
   if (bag_count == 0) {
     CpegResult leaf;
-    const double value = (double)cpeg_endgame_core(
-        game, ctx->eg_mover, ctx->eg_reply, ctx->eg_undo, &leaf);
+    const double value =
+        (double)cpeg_endgame_core(game, ctx->eg_mover, ctx->eg_reply,
+                                  ctx->eg_undo, &leaf, &ctx->capacity_exceeded);
     return cpeg_interval_should_cancel(ctx) ? 0.0 : value;
   }
   if (depth >= CPEG_MAX_DEPTH - 1) {
@@ -1291,8 +1611,9 @@ static CpegInterval cpeg_value_interval(CpegPreCtx *ctx, Game *game,
   const int bag_count = bag_get_letters(bag);
   if (bag_count == 0) {
     CpegResult leaf;
-    const int swing = cpeg_endgame_core(game, ctx->eg_mover, ctx->eg_reply,
-                                        ctx->eg_undo, &leaf);
+    const int swing =
+        cpeg_endgame_core(game, ctx->eg_mover, ctx->eg_reply, ctx->eg_undo,
+                          &leaf, &ctx->capacity_exceeded);
     if (cpeg_interval_should_cancel(ctx)) {
       return (CpegInterval){.lo = 0.0, .hi = 0.0};
     }
@@ -1393,6 +1714,137 @@ static CpegInterval cpeg_value_interval(CpegPreCtx *ctx, Game *game,
   return have_best ? best : (CpegInterval){.lo = 0.0, .hi = 0.0};
 }
 
+// Strict-outcome expectiminimax from the original root mover's perspective.
+// Root turns maximize and opponent turns minimize the same lexicographic W/T/L
+// objective; values are never negated when the side to move changes.
+static CpegWtlValue cpeg_wtl_value(CpegPreCtx *ctx, Game *game,
+                                   int64_t root_margin, int scoreless,
+                                   int depth) {
+  if (cpeg_interval_should_cancel(ctx) || ctx->capacity_exceeded) {
+    return (CpegWtlValue){0};
+  }
+  const Bag *bag = game_get_bag(game);
+  const int bag_count = bag_get_letters(bag);
+  if (bag_count == 0) {
+    CpegResult leaf;
+    bool capacity_exceeded = false;
+    const int on_turn_swing =
+        cpeg_endgame_core(game, ctx->eg_mover, ctx->eg_reply, ctx->eg_undo,
+                          &leaf, &capacity_exceeded);
+    if (capacity_exceeded) {
+      ctx->capacity_exceeded = true;
+      ctx->complete = false;
+      return (CpegWtlValue){0};
+    }
+    const int on_turn = game_get_player_on_turn_index(game);
+    const int64_t root_swing = on_turn == ctx->mover_idx
+                                   ? (int64_t)on_turn_swing
+                                   : -(int64_t)on_turn_swing;
+    int64_t final_margin;
+    if (!cpeg_checked_margin_add(root_margin, root_swing, &final_margin)) {
+      ctx->complete = false;
+      return (CpegWtlValue){0};
+    }
+    return cpeg_wtl_classify_margin(final_margin);
+  }
+  if (depth >= CPEG_MAX_DEPTH - 1) {
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+
+  MoveList *move_list = cpeg_get_movelist(ctx, depth);
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = move_list,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&args);
+  const int count = move_list_get_count(move_list);
+  if (count > CPEG_MOVE_LIST_CAP) {
+    ctx->capacity_exceeded = true;
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+
+  const bool root_turn = game_get_player_on_turn_index(game) == ctx->mover_idx;
+  CpegWtlValue best = {0};
+  bool have_best = false;
+  bool any_placement = false;
+  for (int move_idx = 0; move_idx < count; move_idx++) {
+    const Move *move = move_list_get_move(move_list, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    if (cpeg_interval_should_cancel(ctx)) {
+      return (CpegWtlValue){0};
+    }
+    any_placement = true;
+    const CpegWtlValue value =
+        cpeg_eval_place_wtl(ctx, game, move, root_margin, depth);
+    if (!ctx->complete) {
+      return (CpegWtlValue){0};
+    }
+    if (!have_best || cpeg_wtl_should_take(&value, &best, root_turn)) {
+      best = value;
+      have_best = true;
+    }
+  }
+
+  // Preserve the legacy model: deeper voluntary pass is searched only when no
+  // placement exists. Root pass remains part of the complete root collector.
+  if (!any_placement) {
+    const CpegWtlValue value = cpeg_eval_scoreless_wtl(
+        ctx, game, NULL, 0, root_margin, scoreless, depth);
+    if (!ctx->complete) {
+      return (CpegWtlValue){0};
+    }
+    if (!have_best || cpeg_wtl_should_take(&value, &best, root_turn)) {
+      best = value;
+      have_best = true;
+    }
+  }
+
+  if (ctx->allow_exchanges) {
+    const Rack *mover_rack = player_get_rack(
+        game_get_player(game, game_get_player_on_turn_index(game)));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    bool overflow = false;
+    const int n_exch = cpeg_enum_exchanges(ctx->ld_size, mover_rack, bag_count,
+                                           exchanges, CPEG_ENUM_CAP, &overflow);
+    if (overflow) {
+      ctx->capacity_exceeded = true;
+      ctx->complete = false;
+      return (CpegWtlValue){0};
+    }
+    for (int exch_idx = 0; exch_idx < n_exch; exch_idx++) {
+      if (cpeg_interval_should_cancel(ctx)) {
+        return (CpegWtlValue){0};
+      }
+      const CpegWtlValue value = cpeg_eval_scoreless_wtl(
+          ctx, game, exchanges[exch_idx].tiles, exchanges[exch_idx].n,
+          root_margin, scoreless, depth);
+      if (!ctx->complete) {
+        return (CpegWtlValue){0};
+      }
+      if (!have_best || cpeg_wtl_should_take(&value, &best, root_turn)) {
+        best = value;
+        have_best = true;
+      }
+    }
+  }
+
+  if (!have_best) {
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+  return best;
+}
+
 // Tiles not visible to the mover: full distribution minus mover's rack minus
 // the board. Returns the total count.
 static int cpeg_compute_unseen(const Game *game, int mover_idx,
@@ -1439,7 +1891,7 @@ static void cpeg_ctx_init(CpegPreCtx *ctx, const LetterDistribution *ld,
   ctx->allow_exchanges = allow_exchanges;
   ctx->complete = true;
   ctx->deadline_ns = deadline_ns;
-  ctx->eg_mover = move_list_create(CPEG_MOVE_LIST_CAP);
+  ctx->eg_mover = move_list_create(CPEG_MOVE_LIST_CAP + 1);
   ctx->eg_reply = move_list_create(CPEG_MOVE_LIST_CAP);
   ctx->eg_undo = malloc_or_die(sizeof(MoveUndo));
 }
@@ -1542,13 +1994,12 @@ static bool cpeg_collect_root_candidates(Game *game, int bag,
   int exchange_count = 0;
   if (allow_exchanges) {
     const int mover_idx = game_get_player_on_turn_index(game);
-    const Rack *mover_rack =
-        player_get_rack(game_get_player(game, mover_idx));
+    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
     CpegMultiset exchanges[CPEG_ENUM_CAP];
     bool exchange_overflow = false;
-    exchange_count = cpeg_enum_exchanges(
-        ld_get_size(game_get_ld(game)), mover_rack, bag, exchanges,
-        CPEG_ENUM_CAP, &exchange_overflow);
+    exchange_count =
+        cpeg_enum_exchanges(ld_get_size(game_get_ld(game)), mover_rack, bag,
+                            exchanges, CPEG_ENUM_CAP, &exchange_overflow);
     if (exchange_overflow) {
       free(candidates);
       move_list_destroy(root_moves);
@@ -1559,7 +2010,8 @@ static bool cpeg_collect_root_candidates(Game *game, int bag,
       candidate->kind = 2;
       candidate->exch_n = exchanges[exchange_idx].n;
       for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
-        candidate->exch_tiles[tile_idx] = exchanges[exchange_idx].tiles[tile_idx];
+        candidate->exch_tiles[tile_idx] =
+            exchanges[exchange_idx].tiles[tile_idx];
       }
     }
   }
@@ -1719,6 +2171,64 @@ static CpegInterval cpeg_eval_post_place_interval(CpegPreCtx *ctx,
   };
 }
 
+static CpegWtlValue cpeg_eval_post_place_wtl(CpegPreCtx *ctx,
+                                             const Game *post_place_game,
+                                             int tiles_played, int score,
+                                             int64_t initial_lead, int depth) {
+  const Bag *bag = game_get_bag(post_place_game);
+  const int bag_count = bag_get_letters(bag);
+  const int k_drawn = tiles_played < bag_count ? tiles_played : bag_count;
+
+  int counts[MAX_ALPHABET_SIZE] = {0};
+  for (int ml = 0; ml < ctx->ld_size; ml++) {
+    counts[ml] = bag_get_letter(bag, (MachineLetter)ml);
+  }
+  CpegMultiset draws[CPEG_ENUM_CAP];
+  bool overflow = false;
+  const int n_draws = cpeg_enum_submultisets(counts, ctx->ld_size, k_drawn,
+                                             draws, CPEG_ENUM_CAP, &overflow);
+  if (overflow) {
+    ctx->capacity_exceeded = true;
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+
+  CpegWtlValue weighted_sum = {0};
+  int64_t weight_total = 0;
+  int64_t root_margin;
+  if (!cpeg_checked_margin_add(initial_lead, (int64_t)score, &root_margin)) {
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+  for (int draw_idx = 0; draw_idx < n_draws; draw_idx++) {
+    if (cpeg_interval_should_cancel(ctx)) {
+      return (CpegWtlValue){0};
+    }
+    const CpegMultiset *draw = &draws[draw_idx];
+    Game *child = cpeg_child_game(ctx, depth, post_place_game);
+    Bag *child_bag = game_get_bag(child);
+    Rack *mover_rack = player_get_rack(game_get_player(child, ctx->mover_idx));
+    for (int tile_idx = 0; tile_idx < draw->n; tile_idx++) {
+      bag_draw_letter(child_bag, draw->tiles[tile_idx], ctx->mover_idx);
+      rack_add_letter(mover_rack, draw->tiles[tile_idx]);
+    }
+    game_set_consecutive_scoreless_turns(child, 0);
+    game_set_game_end_reason(child, GAME_END_REASON_NONE);
+    const CpegWtlValue child_value =
+        cpeg_wtl_value(ctx, child, root_margin, 0, depth + 1);
+    if (!ctx->complete || !cpeg_wtl_accumulate(&weighted_sum, &weight_total,
+                                               &child_value, draw->weight)) {
+      ctx->complete = false;
+      return (CpegWtlValue){0};
+    }
+  }
+  if (weight_total <= 0) {
+    ctx->complete = false;
+    return (CpegWtlValue){0};
+  }
+  return cpeg_wtl_normalize(&weighted_sum, weight_total);
+}
+
 // In-world value to the mover of committing to one root candidate (its first
 // move). The world_game is on the mover's turn with both racks and the bag set.
 static double cpeg_eval_root_scoreless(CpegPreCtx *ctx, Game *world_game,
@@ -1743,6 +2253,19 @@ cpeg_eval_root_scoreless_interval(CpegPreCtx *ctx, Game *world_game,
                                       /*depth=*/0);
 }
 
+static CpegWtlValue cpeg_eval_root_scoreless_wtl(CpegPreCtx *ctx,
+                                                 Game *world_game,
+                                                 const CpegRootCand *cand,
+                                                 int64_t initial_lead) {
+  if (cand->kind == 1) {
+    return cpeg_eval_scoreless_wtl(ctx, world_game, NULL, 0, initial_lead,
+                                   /*scoreless=*/0, /*depth=*/0);
+  }
+  return cpeg_eval_scoreless_wtl(ctx, world_game, cand->exch_tiles,
+                                 cand->exch_n, initial_lead,
+                                 /*scoreless=*/0, /*depth=*/0);
+}
+
 // Per-pool-worker scratch. Pool jobs are independent (candidate, world) pairs;
 // worker_idx selects one context and mutable game so no hot-path locking is
 // needed.
@@ -1761,6 +2284,8 @@ typedef struct CpegRootJob {
   const CpegRootCand *cand;
   double value;
   CpegInterval interval;
+  CpegWtlValue wtl_value;
+  int64_t initial_lead;
   bool complete;
 } CpegRootJob;
 
@@ -1820,6 +2345,24 @@ static void cpeg_root_interval_job_run(void *arg, int worker_idx) {
   job->complete = worker->ctx.complete;
 }
 
+static void cpeg_root_wtl_job_run(void *arg, int worker_idx) {
+  CpegRootJob *job = (CpegRootJob *)arg;
+  CpegWorker *worker = &job->workers[worker_idx];
+  worker->ctx.complete = true;
+  cpeg_set_world(worker->world_game, job->source_game, job->world, job->unseen,
+                 job->ld_size, job->opp_idx);
+  if (job->cand->kind == 0) {
+    job->wtl_value = cpeg_eval_post_place_wtl(
+        &worker->ctx, worker->world_game,
+        move_get_tiles_played(&job->cand->move), job->cand->score,
+        job->initial_lead, /*depth=*/0);
+  } else {
+    job->wtl_value = cpeg_eval_root_scoreless_wtl(
+        &worker->ctx, worker->world_game, job->cand, job->initial_lead);
+  }
+  job->complete = worker->ctx.complete && !worker->ctx.capacity_exceeded;
+}
+
 // Descending sort: expected spread, then first-move score, then label order so
 // the ranking is deterministic. Ties on all three keep insertion order.
 static int cpeg_cand_compare(const void *lhs, const void *rhs) {
@@ -1838,6 +2381,14 @@ static int cpeg_cand_compare(const void *lhs, const void *rhs) {
 }
 
 void cpeg_pre_result_destroy(CpegPreResult *result) {
+  if (result == NULL) {
+    return;
+  }
+  free(result->cands);
+  memset(result, 0, sizeof(*result));
+}
+
+void cpeg_wtl_result_destroy(CpegWtlResult *result) {
   if (result == NULL) {
     return;
   }
@@ -2093,6 +2644,200 @@ static void cpeg_render_root_candidate(char dest[CPEG_MOVE_STR_LEN],
   memcpy(dest, rendered, copy_len);
   dest[copy_len] = '\0';
   string_builder_destroy(builder);
+}
+
+int cpeg_solve_pre_endgame_wtl(const Game *game, const CpegWtlArgs *args,
+                               CpegWtlResult *out) {
+  if (game == NULL || args == NULL || out == NULL || args->bag < 1 ||
+      args->bag > PEG_MAX_BAG) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+
+  int result = -1;
+  Game *root_game = game_duplicate(game);
+  const LetterDistribution *ld = game_get_ld(root_game);
+  const int ld_size = ld_get_size(ld);
+  Board *board = game_get_board(root_game);
+  game_gen_all_cross_sets(root_game);
+  board_set_cross_sets_valid(board, true);
+  const int mover_idx = game_get_player_on_turn_index(root_game);
+  const int opp_idx = 1 - mover_idx;
+
+  CpegRootCollection root_collection = {0};
+  CpegMultiset *worlds = NULL;
+  Game **templates = NULL;
+  PegPool *pool = NULL;
+  CpegWorker *workers = NULL;
+  CpegRootJob *jobs = NULL;
+  void **job_ptrs = NULL;
+  int n_scratch = 0;
+
+  int unseen[MAX_ALPHABET_SIZE];
+  const int total_unseen = cpeg_compute_unseen(root_game, mover_idx, unseen);
+  const int opp_size = total_unseen - args->bag;
+  if (opp_size < 0 || opp_size > RACK_SIZE ||
+      !cpeg_collect_root_candidates(root_game, args->bag, args->allow_exchanges,
+                                    &root_collection)) {
+    goto cleanup;
+  }
+  CpegRootCand *candidates = root_collection.candidates;
+  const int candidate_count = root_collection.count;
+
+  worlds = malloc_or_die(CPEG_WORLD_CAP * sizeof(*worlds));
+  bool world_overflow = false;
+  const int world_count = cpeg_enum_submultisets(
+      unseen, ld_size, args->bag, worlds, CPEG_WORLD_CAP, &world_overflow);
+  if (world_overflow || world_count < 1) {
+    goto cleanup;
+  }
+
+  int64_t world_weight_mass = 0;
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    if (worlds[world_idx].weight <= 0 ||
+        INT64_MAX - world_weight_mass < worlds[world_idx].weight) {
+      goto cleanup;
+    }
+    world_weight_mass += worlds[world_idx].weight;
+  }
+
+  templates = calloc_or_die((size_t)candidate_count, sizeof(*templates));
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    if (candidates[candidate_idx].kind == 0) {
+      templates[candidate_idx] =
+          cpeg_build_root_template(root_game, &candidates[candidate_idx].move);
+    }
+  }
+
+  const int thread_count = args->num_threads < 1 ? 1 : args->num_threads;
+  pool = thread_count > 1 ? peg_pool_create(thread_count, 0) : NULL;
+  if (pool != NULL) {
+    peg_pool_set_stuck_timeout_seconds(pool, 0);
+  }
+  n_scratch = pool != NULL ? thread_count + 1 : 1;
+  workers = malloc_or_die((size_t)n_scratch * sizeof(*workers));
+  for (int worker_idx = 0; worker_idx < n_scratch; worker_idx++) {
+    cpeg_ctx_init(&workers[worker_idx].ctx, ld, ld_size, mover_idx,
+                  args->allow_exchanges, /*deadline_ns=*/0);
+    workers[worker_idx].world_game = game_duplicate(root_game);
+  }
+
+  const int job_count = candidate_count * world_count;
+  jobs = calloc_or_die((size_t)job_count, sizeof(*jobs));
+  job_ptrs = malloc_or_die((size_t)job_count * sizeof(*job_ptrs));
+  for (int world_idx = 0; world_idx < world_count; world_idx++) {
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      const int job_idx = world_idx * candidate_count + candidate_idx;
+      CpegRootJob *job = &jobs[job_idx];
+      job->workers = workers;
+      job->source_game = templates[candidate_idx] != NULL
+                             ? templates[candidate_idx]
+                             : root_game;
+      job->world = &worlds[world_idx];
+      job->unseen = unseen;
+      job->ld_size = ld_size;
+      job->opp_idx = opp_idx;
+      job->cand = &candidates[candidate_idx];
+      job->initial_lead = args->initial_lead;
+      job_ptrs[job_idx] = job;
+    }
+  }
+  const int helper_worker_idx = pool != NULL ? thread_count : 0;
+  peg_pool_submit_and_wait(pool, cpeg_root_wtl_job_run, job_ptrs, job_count,
+                           helper_worker_idx);
+
+  for (int worker_idx = 0; worker_idx < n_scratch; worker_idx++) {
+    if (!workers[worker_idx].ctx.complete ||
+        workers[worker_idx].ctx.capacity_exceeded) {
+      goto cleanup;
+    }
+  }
+  for (int job_idx = 0; job_idx < job_count; job_idx++) {
+    if (!jobs[job_idx].complete) {
+      goto cleanup;
+    }
+  }
+
+  out->cands = calloc_or_die((size_t)candidate_count, sizeof(*out->cands));
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       candidate_idx++) {
+    CpegWtlValue weighted_sum = {0};
+    int64_t weight_total = 0;
+    // Fixed generation-order reduction makes results independent of worker
+    // completion order and thread count.
+    for (int world_idx = 0; world_idx < world_count; world_idx++) {
+      const int job_idx = world_idx * candidate_count + candidate_idx;
+      if (!cpeg_wtl_accumulate(&weighted_sum, &weight_total,
+                               &jobs[job_idx].wtl_value,
+                               worlds[world_idx].weight)) {
+        goto cleanup;
+      }
+    }
+    if (weight_total != world_weight_mass) {
+      goto cleanup;
+    }
+    CpegWtlCand *slot = &out->cands[candidate_idx];
+    slot->score = candidates[candidate_idx].score;
+    slot->value = cpeg_wtl_normalize(&weighted_sum, weight_total);
+    cpeg_render_root_candidate(slot->label, &candidates[candidate_idx], board,
+                               ld);
+  }
+
+  // Stable insertion sort: exact objective ties use the rendered action label
+  // as a stable identity; duplicate identities retain generation order.
+  for (int candidate_idx = 1; candidate_idx < candidate_count;
+       candidate_idx++) {
+    const CpegWtlCand candidate = out->cands[candidate_idx];
+    int insertion_idx = candidate_idx;
+    while (insertion_idx > 0) {
+      const CpegWtlCand *previous = &out->cands[insertion_idx - 1];
+      const int objective_comparison =
+          cpeg_wtl_compare(&candidate.value, &previous->value);
+      if (objective_comparison < 0 ||
+          (objective_comparison == 0 &&
+           strcmp(candidate.label, previous->label) >= 0)) {
+        break;
+      }
+      out->cands[insertion_idx] = out->cands[insertion_idx - 1];
+      insertion_idx--;
+    }
+    out->cands[insertion_idx] = candidate;
+  }
+  out->count = candidate_count;
+  out->worlds_distinct = world_count;
+  out->world_weight_mass = world_weight_mass;
+  out->coverage = root_collection.coverage;
+  result = candidate_count;
+
+cleanup:
+  free(job_ptrs);
+  free(jobs);
+  peg_pool_destroy(pool);
+  if (workers != NULL) {
+    for (int worker_idx = 0; worker_idx < n_scratch; worker_idx++) {
+      game_destroy(workers[worker_idx].world_game);
+      cpeg_ctx_destroy(&workers[worker_idx].ctx);
+    }
+  }
+  free(workers);
+  if (templates != NULL) {
+    for (int candidate_idx = 0; candidate_idx < root_collection.count;
+         candidate_idx++) {
+      if (templates[candidate_idx] != NULL) {
+        game_destroy(templates[candidate_idx]);
+      }
+    }
+  }
+  free(templates);
+  free(worlds);
+  cpeg_root_collection_destroy(&root_collection);
+  game_destroy(root_game);
+  if (result < 0) {
+    cpeg_wtl_result_destroy(out);
+  }
+  return result;
 }
 
 static CpegCandKind cpeg_root_candidate_kind(const CpegRootCand *candidate) {
@@ -2603,8 +3348,7 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
 
   if (search_ok &&
       (coordinator.status != CPEG_COORDINATOR_PENDING || budget_exhausted)) {
-    out->cands =
-        calloc_or_die((size_t)candidate_count, sizeof(*out->cands));
+    out->cands = calloc_or_die((size_t)candidate_count, sizeof(*out->cands));
     if (coordinator.status == CPEG_COORDINATOR_EXACT_VALUES) {
       out->status = CPEG_PRE_EXACT_VALUES;
     } else if (coordinator.status == CPEG_COORDINATOR_CERTIFIED) {

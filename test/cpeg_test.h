@@ -5,5 +5,6 @@ void test_cpeg(void);
 void test_cpeg_complete_root_collection(void);
 void test_cpeg_certified_bag1(void);
 void test_cpeg_statistical_bag1(void);
+void test_cpeg_wtl_senator(void);
 
 #endif

@@ -3409,6 +3409,58 @@ static void impl_cpeg_pre_endgame(Config *config, int bag,
   cpeg_pre_result_destroy(&result);
 }
 
+// Stable, full-precision score-aware exact output. Probabilities and expected
+// margin are emitted with enough significant digits to round-trip through the
+// Python service's 1e-9 probability-mass validation.
+static void impl_cpeg_wtl(Config *config, int bag, bool allow_exchanges,
+                          int64_t initial_lead, ErrorStack *error_stack) {
+  CpegWtlResult result = {0};
+  const CpegWtlArgs args = {
+      .bag = bag,
+      .allow_exchanges = allow_exchanges,
+      .num_threads = config_get_num_threads(config),
+      .initial_lead = initial_lead,
+  };
+  if (cpeg_solve_pre_endgame_wtl(config->game, &args, &result) < 1) {
+    cpeg_wtl_result_destroy(&result);
+    error_stack_push(error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
+                     string_duplicate("cpeg score-aware exact solve failed"));
+    return;
+  }
+
+  const CpegWtlCand *best = &result.cands[0];
+  StringBuilder *lines = string_builder_create();
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-wtl status=EXACT_VALUES objective=strict_win_probability_v1 "
+      "lead=%lld best=%s score=%d win=%.17g tie=%.17g loss=%.17g "
+      "margin=%.17g worlds=%d mass=%lld\n",
+      (long long)initial_lead, best->label, best->score, best->value.win,
+      best->value.tie, best->value.loss, best->value.expected_final_margin,
+      result.worlds_distinct, (long long)result.world_weight_mass);
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
+  for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
+    const CpegWtlCand *candidate = &result.cands[candidate_idx];
+    string_builder_add_formatted_string(
+        lines,
+        "cpeg-wtl-cand %d %s %d win=%.17g tie=%.17g loss=%.17g "
+        "margin=%.17g\n",
+        candidate_idx + 1, candidate->label, candidate->score,
+        candidate->value.win, candidate->value.tie, candidate->value.loss,
+        candidate->value.expected_final_margin);
+  }
+  char *output = string_builder_dump(lines, NULL);
+  string_builder_destroy(lines);
+  thread_control_print(config->thread_control, output);
+  free(output);
+  cpeg_wtl_result_destroy(&result);
+}
+
 static const char *cpeg_certified_status_name(CpegPreStatus status) {
   switch (status) {
   case CPEG_PRE_CERTIFIED:
@@ -3620,6 +3672,8 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
 //   cpeg <bag> [noexch] budget <seconds> -> budgeted certified solver. The
 //                           options are order-free; budget's value follows it.
 //   cpeg <bag> [noexch] estimate <seconds> -> seeded 95% statistical estimate.
+//   cpeg <bag> [noexch] lead <signed-int> -> exact strict-W/T/L solve using the
+//                           explicit mover-minus-opponent score difference.
 void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (!config_has_game_data(config)) {
     error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
@@ -3632,6 +3686,8 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   bool allow_exchanges = true;
   bool use_certified = false;
   bool use_statistical = false;
+  bool has_lead = false;
+  int initial_lead = 0;
   double budget_seconds = 0.0;
   const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
   for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
@@ -3641,6 +3697,22 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
     if (strings_equal(value, "noexch")) {
       allow_exchanges = false;
+    } else if (strings_equal(value, "lead")) {
+      if (has_lead || arg_idx + 1 >= n_args) {
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+            string_duplicate("cpeg lead requires exactly one signed integer"));
+        return;
+      }
+      has_lead = true;
+      const char *lead_value =
+          config_get_parg_value(config, ARG_TOKEN_CPEG, ++arg_idx);
+      string_to_int_or_push_error("cpeg lead", lead_value, INT_MIN, INT_MAX,
+                                  ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+                                  &initial_lead, error_stack);
+      if (!error_stack_is_empty(error_stack)) {
+        return;
+      }
     } else if (strings_equal(value, "budget") ||
                strings_equal(value, "estimate")) {
       if (use_certified || use_statistical || arg_idx + 1 >= n_args) {
@@ -3673,7 +3745,20 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
   }
 
+  if (has_lead && (use_certified || use_statistical)) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+        string_duplicate(
+            "cpeg lead is mutually exclusive with budget/estimate"));
+    return;
+  }
+
   if (bag <= 0) {
+    if (has_lead) {
+      error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+                       string_duplicate("cpeg lead requires a bag size"));
+      return;
+    }
     if (use_certified || use_statistical) {
       error_stack_push(
           error_stack, ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
@@ -3698,6 +3783,10 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (use_statistical) {
     impl_cpeg_statistical(config, bag, allow_exchanges, budget_seconds,
                           error_stack);
+    return;
+  }
+  if (has_lead) {
+    impl_cpeg_wtl(config, bag, allow_exchanges, initial_lead, error_stack);
     return;
   }
   impl_cpeg_pre_endgame(config, bag, allow_exchanges);
