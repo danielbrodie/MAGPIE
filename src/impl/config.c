@@ -3385,11 +3385,17 @@ static void impl_cpeg_endgame(Config *config, ErrorStack *error_stack) {
 static void impl_cpeg_pre_endgame(Config *config, int bag,
                                   bool allow_exchanges) {
   Game *game = config->game;
-  CpegPreResult result;
+  CpegPreResult result = {0};
   cpeg_solve_pre_endgame(game, bag, allow_exchanges,
                          config_get_num_threads(config), &result);
 
   StringBuilder *line = string_builder_create();
+  string_builder_add_formatted_string(
+      line,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
   for (int cand_idx = 0; cand_idx < result.count; cand_idx++) {
     const CpegPreCand *cand = &result.cands[cand_idx];
     string_builder_add_formatted_string(line, "cpeg-cand %d %s %d %.4f\n",
@@ -3400,6 +3406,7 @@ static void impl_cpeg_pre_endgame(Config *config, int bag,
   string_builder_destroy(line);
   thread_control_print(config->thread_control, out);
   free(out);
+  cpeg_pre_result_destroy(&result);
 }
 
 static const char *cpeg_certified_status_name(CpegPreStatus status) {
@@ -3443,7 +3450,7 @@ static bool cpeg_certified_candidate_precedes(const CpegCertifiedResult *result,
 static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
                                 double budget_seconds,
                                 ErrorStack *error_stack) {
-  CpegCertifiedResult result;
+  CpegCertifiedResult result = {0};
   const CpegCertifiedArgs args = {
       .bag = bag,
       .allow_exchanges = allow_exchanges,
@@ -3453,6 +3460,7 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
       .max_batches = 0,
   };
   if (cpeg_solve_pre_endgame_certified(config->game, &args, &result) < 1) {
+    cpeg_certified_result_destroy(&result);
     error_stack_push(error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
                      string_duplicate("cpeg certified solve failed"));
     return;
@@ -3469,8 +3477,14 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
       result.decision_regret_bound, result.unique_best ? 1 : 0,
       result.jobs_completed, result.batches_completed, best->worlds_resolved,
       result.worlds_total);
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
 
-  int order[CPEG_MAX_PRE_CANDS];
+  int *order = malloc_or_die((size_t)result.count * sizeof(*order));
   for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
     order[candidate_idx] = candidate_idx;
     int insertion_idx = candidate_idx;
@@ -3500,6 +3514,8 @@ static void impl_cpeg_certified(Config *config, int bag, bool allow_exchanges,
   string_builder_destroy(lines);
   thread_control_print(config->thread_control, out);
   free(out);
+  free(order);
+  cpeg_certified_result_destroy(&result);
 }
 
 static bool
@@ -3525,7 +3541,7 @@ cpeg_statistical_candidate_precedes(const CpegStatisticalResult *result,
 static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
                                   double budget_seconds,
                                   ErrorStack *error_stack) {
-  CpegStatisticalResult result;
+  CpegStatisticalResult result = {0};
   const CpegStatisticalArgs args = {
       .bag = bag,
       .allow_exchanges = allow_exchanges,
@@ -3536,6 +3552,7 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
       .max_worlds = 0,
   };
   if (cpeg_solve_pre_endgame_statistical(config->game, &args, &result) < 1) {
+    cpeg_statistical_result_destroy(&result);
     error_stack_push(error_stack, ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
                      string_duplicate("cpeg statistical solve failed"));
     return;
@@ -3550,8 +3567,14 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
       best->label, best->score, best->estimate, best->lower, best->upper,
       result.confidence, (unsigned long long)result.seed, result.jobs_completed,
       result.rounds_completed, result.worlds_sampled, result.worlds_total);
+  string_builder_add_formatted_string(
+      lines,
+      "cpeg-coverage placements=%d exchanges=%d pass=%d total=%d complete=%d\n",
+      result.coverage.placements, result.coverage.exchanges,
+      result.coverage.passes, result.coverage.total,
+      result.coverage.generation_complete ? 1 : 0);
 
-  int order[CPEG_MAX_PRE_CANDS];
+  int *order = malloc_or_die((size_t)result.count * sizeof(*order));
   for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
     order[candidate_idx] = candidate_idx;
     int insertion_idx = candidate_idx;
@@ -3582,6 +3605,8 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
   string_builder_destroy(lines);
   thread_control_print(config->thread_control, out);
   free(out);
+  free(order);
+  cpeg_statistical_result_destroy(&result);
 }
 
 // Crossplay endgame / pre-endgame solver command.

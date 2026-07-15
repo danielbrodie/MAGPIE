@@ -676,8 +676,8 @@ void cpeg_coordinator_recompute(CpegCandState *states, int candidate_count,
 //     exchange) are capped at CPEG_SCORELESS_CAP: two in a row make the
 //     position terminal at the current spread. This cap is a stated modelling
 //     choice with no analogue in the real game; it is the only thing that keeps
-//     the exchange search finite. Pass is searched only when there is no legal
-//     placement.
+//     the exchange search finite. At the root voluntary pass is included;
+//     below the root pass is searched only when there is no legal placement.
 // ---------------------------------------------------------------------------
 
 // A distinct submultiset produced by cpeg_enum_submultisets, with its
@@ -1473,6 +1473,126 @@ typedef struct CpegRootCand {
   double weighted_spread; // sum over worlds of world_weight * in-world value
 } CpegRootCand;
 
+typedef struct CpegRootCollection {
+  CpegRootCand *candidates;
+  int count;
+  CpegRootCoverage coverage;
+} CpegRootCollection;
+
+static void cpeg_root_collection_destroy(CpegRootCollection *collection) {
+  free(collection->candidates);
+  memset(collection, 0, sizeof(*collection));
+}
+
+// Build the complete root action set once for every solver mode. Placement
+// storage is sized from the generated count; exchanges have the proven
+// CPEG_ENUM_CAP bound; voluntary pass is always a root action.
+static bool cpeg_collect_root_candidates(Game *game, int bag,
+                                         bool allow_exchanges,
+                                         CpegRootCollection *collection) {
+  memset(collection, 0, sizeof(*collection));
+  if (game == NULL || bag < 1 || bag > PEG_MAX_BAG) {
+    return false;
+  }
+
+  Board *board = game_get_board(game);
+  game_gen_all_cross_sets(game);
+  board_set_cross_sets_valid(board, true);
+
+  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
+  const MoveGenArgs root_args = {
+      .game = game,
+      .move_list = root_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&root_args);
+  const int root_count = move_list_get_count(root_moves);
+  if (root_count > CPEG_MOVE_LIST_CAP) {
+    move_list_destroy(root_moves);
+    return false;
+  }
+
+  const size_t candidate_capacity =
+      (size_t)root_count + 1U + (allow_exchanges ? CPEG_ENUM_CAP : 0U);
+  CpegRootCand *candidates =
+      calloc_or_die(candidate_capacity, sizeof(*candidates));
+  int candidate_count = 0;
+  int placement_count = 0;
+  for (int move_idx = 0; move_idx < root_count; move_idx++) {
+    const Move *move = move_list_get_move(root_moves, move_idx);
+    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      continue;
+    }
+    CpegRootCand *candidate = &candidates[candidate_count++];
+    candidate->kind = 0;
+    move_copy(&candidate->move, move);
+    candidate->score = equity_to_int(move_get_score(move));
+    placement_count++;
+  }
+
+  // Pass is a legal root choice even when placements exist. Deeper voluntary
+  // pass policy remains a separate model question; this closes root accounting.
+  candidates[candidate_count++].kind = 1;
+
+  int exchange_count = 0;
+  if (allow_exchanges) {
+    const int mover_idx = game_get_player_on_turn_index(game);
+    const Rack *mover_rack =
+        player_get_rack(game_get_player(game, mover_idx));
+    CpegMultiset exchanges[CPEG_ENUM_CAP];
+    bool exchange_overflow = false;
+    exchange_count = cpeg_enum_exchanges(
+        ld_get_size(game_get_ld(game)), mover_rack, bag, exchanges,
+        CPEG_ENUM_CAP, &exchange_overflow);
+    if (exchange_overflow) {
+      free(candidates);
+      move_list_destroy(root_moves);
+      return false;
+    }
+    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
+      CpegRootCand *candidate = &candidates[candidate_count++];
+      candidate->kind = 2;
+      candidate->exch_n = exchanges[exchange_idx].n;
+      for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
+        candidate->exch_tiles[tile_idx] = exchanges[exchange_idx].tiles[tile_idx];
+      }
+    }
+  }
+
+  move_list_destroy(root_moves);
+  collection->candidates = candidates;
+  collection->count = candidate_count;
+  collection->coverage = (CpegRootCoverage){
+      .placements = placement_count,
+      .exchanges = exchange_count,
+      .passes = 1,
+      .total = candidate_count,
+      .generation_complete = true,
+  };
+  return true;
+}
+
+int cpeg_count_root_actions(Game *game, int bag, bool allow_exchanges,
+                            CpegRootCoverage *coverage) {
+  if (coverage == NULL) {
+    return -1;
+  }
+  memset(coverage, 0, sizeof(*coverage));
+  CpegRootCollection collection;
+  if (!cpeg_collect_root_candidates(game, bag, allow_exchanges, &collection)) {
+    return -1;
+  }
+  *coverage = collection.coverage;
+  const int count = collection.count;
+  cpeg_root_collection_destroy(&collection);
+  return count;
+}
+
 // Build the immutable post-placement state shared by every world for one root
 // candidate. The board, mover leave, side to move, and cross-sets are identical
 // across worlds; only the bag and opponent rack vary.
@@ -1717,8 +1837,37 @@ static int cpeg_cand_compare(const void *lhs, const void *rhs) {
   return strcmp(a->label, b->label);
 }
 
+void cpeg_pre_result_destroy(CpegPreResult *result) {
+  if (result == NULL) {
+    return;
+  }
+  free(result->cands);
+  memset(result, 0, sizeof(*result));
+}
+
+void cpeg_certified_result_destroy(CpegCertifiedResult *result) {
+  if (result == NULL) {
+    return;
+  }
+  free(result->cands);
+  memset(result, 0, sizeof(*result));
+  result->best_index = -1;
+}
+
+void cpeg_statistical_result_destroy(CpegStatisticalResult *result) {
+  if (result == NULL) {
+    return;
+  }
+  free(result->cands);
+  memset(result, 0, sizeof(*result));
+  result->best_index = -1;
+}
+
 int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
                            int num_threads, CpegPreResult *out) {
+  if (game == NULL || out == NULL) {
+    return -1;
+  }
   memset(out, 0, sizeof(*out));
 
   const LetterDistribution *ld = game_get_ld(game);
@@ -1737,77 +1886,14 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
     return -1;
   }
 
-  // Root candidates (the mover's fixed first moves). Placements come from
-  // move generation on the root board+rack; pass and exchanges are synthesized.
-  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
-  const MoveGenArgs root_args = {
-      .game = game,
-      .move_list = root_moves,
-      .move_record_type = MOVE_RECORD_ALL,
-      .move_sort_type = MOVE_SORT_SCORE,
-      .override_kwg = NULL,
-      .eq_margin_movegen = 0,
-      .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-  };
-  generate_moves(&root_args);
-
-  const int root_count = move_list_get_count(root_moves);
-  if (root_count > CPEG_MOVE_LIST_CAP) {
-    move_list_destroy(root_moves);
+  CpegRootCollection root_collection;
+  if (!cpeg_collect_root_candidates(game, bag, allow_exchanges,
+                                    &root_collection)) {
     return -1;
   }
-  CpegRootCand *cands =
-      malloc_or_die((size_t)(root_count + 1 + CPEG_ENUM_CAP) * sizeof(*cands));
-  int n_cands = 0;
-  bool any_placement = false;
-  for (int move_idx = 0; move_idx < root_count; move_idx++) {
-    const Move *move = move_list_get_move(root_moves, move_idx);
-    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
-      continue;
-    }
-    any_placement = true;
-    CpegRootCand *cand = &cands[n_cands++];
-    cand->kind = 0;
-    move_copy(&cand->move, move);
-    cand->exch_n = 0;
-    cand->score = equity_to_int(move_get_score(move));
-    cand->weighted_spread = 0.0;
-  }
-  if (!any_placement) {
-    CpegRootCand *cand = &cands[n_cands++];
-    cand->kind = 1;
-    cand->exch_n = 0;
-    cand->score = 0;
-    cand->weighted_spread = 0.0;
-  }
-  if (allow_exchanges) {
-    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
-    CpegMultiset exchanges[CPEG_ENUM_CAP];
-    bool overflow = false;
-    const int n_exch = cpeg_enum_exchanges(ld_size, mover_rack, bag, exchanges,
-                                           CPEG_ENUM_CAP, &overflow);
-    if (overflow) {
-      free(cands);
-      move_list_destroy(root_moves);
-      return -1;
-    }
-    for (int exch_idx = 0; exch_idx < n_exch; exch_idx++) {
-      CpegRootCand *cand = &cands[n_cands++];
-      cand->kind = 2;
-      cand->exch_n = exchanges[exch_idx].n;
-      for (int i = 0; i < cand->exch_n; i++) {
-        cand->exch_tiles[i] = exchanges[exch_idx].tiles[i];
-      }
-      cand->score = 0;
-      cand->weighted_spread = 0.0;
-    }
-  }
-  if (n_cands > CPEG_MAX_PRE_CANDS) {
-    free(cands);
-    move_list_destroy(root_moves);
-    return -1;
-  }
+  CpegRootCand *cands = root_collection.candidates;
+  const int n_cands = root_collection.count;
+  out->coverage = root_collection.coverage;
 
   // Enumerate the opponent-rack worlds (distinct bag submultisets of the unseen
   // tiles). Each world is a perfect-information position; the workers evaluate
@@ -1819,7 +1905,6 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
   if (world_overflow) {
     free(worlds);
     free(cands);
-    move_list_destroy(root_moves);
     return -1;
   }
 
@@ -1917,6 +2002,9 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
   // Materialize ranked output.
   const double weight_denom =
       total_world_weight > 0 ? (double)total_world_weight : 1.0;
+  if (!search_capacity_exceeded) {
+    out->cands = calloc_or_die((size_t)n_cands, sizeof(*out->cands));
+  }
   int emitted = 0;
   for (int cand_idx = 0; cand_idx < n_cands && !search_capacity_exceeded;
        cand_idx++) {
@@ -1966,7 +2054,6 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
   free(templates);
   free(worlds);
   free(cands);
-  move_list_destroy(root_moves);
   return search_capacity_exceeded ? -1 : out->count;
 }
 
@@ -2321,69 +2408,14 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
     return -1;
   }
 
-  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
-  const MoveGenArgs root_args = {
-      .game = game,
-      .move_list = root_moves,
-      .move_record_type = MOVE_RECORD_ALL,
-      .move_sort_type = MOVE_SORT_SCORE,
-      .override_kwg = NULL,
-      .eq_margin_movegen = 0,
-      .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-  };
-  generate_moves(&root_args);
-  const int root_count = move_list_get_count(root_moves);
-  if (root_count > CPEG_MOVE_LIST_CAP) {
-    move_list_destroy(root_moves);
+  CpegRootCollection root_collection;
+  if (!cpeg_collect_root_candidates(game, args->bag, args->allow_exchanges,
+                                    &root_collection)) {
     return -1;
   }
-
-  CpegRootCand *candidates = calloc_or_die(
-      (size_t)(root_count + 1 + CPEG_ENUM_CAP), sizeof(*candidates));
-  int candidate_count = 0;
-  bool any_placement = false;
-  for (int move_idx = 0; move_idx < root_count; move_idx++) {
-    const Move *move = move_list_get_move(root_moves, move_idx);
-    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
-      continue;
-    }
-    any_placement = true;
-    CpegRootCand *candidate = &candidates[candidate_count++];
-    candidate->kind = 0;
-    move_copy(&candidate->move, move);
-    candidate->score = equity_to_int(move_get_score(move));
-  }
-  if (!any_placement) {
-    candidates[candidate_count++].kind = 1;
-  }
-  if (args->allow_exchanges) {
-    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
-    CpegMultiset exchanges[CPEG_ENUM_CAP];
-    bool exchange_overflow = false;
-    const int exchange_count =
-        cpeg_enum_exchanges(ld_size, mover_rack, args->bag, exchanges,
-                            CPEG_ENUM_CAP, &exchange_overflow);
-    if (exchange_overflow) {
-      free(candidates);
-      move_list_destroy(root_moves);
-      return -1;
-    }
-    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
-      CpegRootCand *candidate = &candidates[candidate_count++];
-      candidate->kind = 2;
-      candidate->exch_n = exchanges[exchange_idx].n;
-      for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
-        candidate->exch_tiles[tile_idx] =
-            exchanges[exchange_idx].tiles[tile_idx];
-      }
-    }
-  }
-  if (candidate_count < 1 || candidate_count > CPEG_MAX_PRE_CANDS) {
-    free(candidates);
-    move_list_destroy(root_moves);
-    return -1;
-  }
+  CpegRootCand *candidates = root_collection.candidates;
+  const int candidate_count = root_collection.count;
+  out->coverage = root_collection.coverage;
 
   CpegMultiset *enumerated_worlds =
       malloc_or_die(CPEG_WORLD_CAP * sizeof(*enumerated_worlds));
@@ -2394,7 +2426,6 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
   if (world_overflow || world_count < 1) {
     free(enumerated_worlds);
     free(candidates);
-    move_list_destroy(root_moves);
     return -1;
   }
   CpegScheduledWorld *worlds =
@@ -2572,6 +2603,8 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
 
   if (search_ok &&
       (coordinator.status != CPEG_COORDINATOR_PENDING || budget_exhausted)) {
+    out->cands =
+        calloc_or_die((size_t)candidate_count, sizeof(*out->cands));
     if (coordinator.status == CPEG_COORDINATOR_EXACT_VALUES) {
       out->status = CPEG_PRE_EXACT_VALUES;
     } else if (coordinator.status == CPEG_COORDINATOR_CERTIFIED) {
@@ -2633,7 +2666,6 @@ int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
   free(templates);
   free(worlds);
   free(candidates);
-  move_list_destroy(root_moves);
   return out->count > 0 ? out->count : -1;
 }
 
@@ -2881,69 +2913,15 @@ int cpeg_solve_pre_endgame_statistical(Game *game,
     return -1;
   }
 
-  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
-  const MoveGenArgs root_args = {
-      .game = game,
-      .move_list = root_moves,
-      .move_record_type = MOVE_RECORD_ALL,
-      .move_sort_type = MOVE_SORT_SCORE,
-      .override_kwg = NULL,
-      .eq_margin_movegen = 0,
-      .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-  };
-  generate_moves(&root_args);
-  const int root_count = move_list_get_count(root_moves);
-  if (root_count > CPEG_MOVE_LIST_CAP) {
-    move_list_destroy(root_moves);
+  CpegRootCollection root_collection;
+  if (!cpeg_collect_root_candidates(game, args->bag, args->allow_exchanges,
+                                    &root_collection)) {
     return -1;
   }
-
-  CpegRootCand *candidates = calloc_or_die(
-      (size_t)(root_count + 1 + CPEG_ENUM_CAP), sizeof(*candidates));
-  int candidate_count = 0;
-  bool any_placement = false;
-  for (int move_idx = 0; move_idx < root_count; move_idx++) {
-    const Move *move = move_list_get_move(root_moves, move_idx);
-    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
-      continue;
-    }
-    any_placement = true;
-    CpegRootCand *candidate = &candidates[candidate_count++];
-    candidate->kind = 0;
-    move_copy(&candidate->move, move);
-    candidate->score = equity_to_int(move_get_score(move));
-  }
-  if (!any_placement) {
-    candidates[candidate_count++].kind = 1;
-  }
-  if (args->allow_exchanges) {
-    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
-    CpegMultiset exchanges[CPEG_ENUM_CAP];
-    bool exchange_overflow = false;
-    const int exchange_count =
-        cpeg_enum_exchanges(ld_size, mover_rack, args->bag, exchanges,
-                            CPEG_ENUM_CAP, &exchange_overflow);
-    if (exchange_overflow) {
-      free(candidates);
-      move_list_destroy(root_moves);
-      return -1;
-    }
-    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
-      CpegRootCand *candidate = &candidates[candidate_count++];
-      candidate->kind = 2;
-      candidate->exch_n = exchanges[exchange_idx].n;
-      for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
-        candidate->exch_tiles[tile_idx] =
-            exchanges[exchange_idx].tiles[tile_idx];
-      }
-    }
-  }
-  if (candidate_count < 1 || candidate_count > CPEG_MAX_PRE_CANDS) {
-    free(candidates);
-    move_list_destroy(root_moves);
-    return -1;
-  }
+  CpegRootCand *candidates = root_collection.candidates;
+  const int candidate_count = root_collection.count;
+  out->coverage = root_collection.coverage;
+  out->cands = calloc_or_die((size_t)candidate_count, sizeof(*out->cands));
 
   CpegMultiset *enumerated_worlds =
       malloc_or_die(CPEG_WORLD_CAP * sizeof(*enumerated_worlds));
@@ -2954,7 +2932,7 @@ int cpeg_solve_pre_endgame_statistical(Game *game,
   if (world_overflow || world_count < 1) {
     free(enumerated_worlds);
     free(candidates);
-    move_list_destroy(root_moves);
+    cpeg_statistical_result_destroy(out);
     return -1;
   }
   CpegScheduledWorld *worlds =
@@ -3163,7 +3141,9 @@ int cpeg_solve_pre_endgame_statistical(Game *game,
   free(templates);
   free(worlds);
   free(candidates);
-  move_list_destroy(root_moves);
+  if (out->count == 0) {
+    cpeg_statistical_result_destroy(out);
+  }
   return out->count > 0 ? out->count : -1;
 }
 
@@ -3189,72 +3169,13 @@ int cpeg_measure_interval_recursion(Game *game, int bag, bool allow_exchanges,
     return -1;
   }
 
-  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
-  const MoveGenArgs root_args = {
-      .game = game,
-      .move_list = root_moves,
-      .move_record_type = MOVE_RECORD_ALL,
-      .move_sort_type = MOVE_SORT_SCORE,
-      .override_kwg = NULL,
-      .eq_margin_movegen = 0,
-      .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-  };
-  generate_moves(&root_args);
-
-  const int root_count = move_list_get_count(root_moves);
-  if (root_count > CPEG_MOVE_LIST_CAP) {
-    move_list_destroy(root_moves);
+  CpegRootCollection root_collection;
+  if (!cpeg_collect_root_candidates(game, bag, allow_exchanges,
+                                    &root_collection)) {
     return -1;
   }
-  CpegRootCand *cands =
-      malloc_or_die((size_t)(root_count + 1 + CPEG_ENUM_CAP) * sizeof(*cands));
-  int candidate_count = 0;
-  bool any_placement = false;
-  for (int move_idx = 0; move_idx < root_count; move_idx++) {
-    const Move *move = move_list_get_move(root_moves, move_idx);
-    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
-      continue;
-    }
-    any_placement = true;
-    CpegRootCand *cand = &cands[candidate_count++];
-    cand->kind = 0;
-    move_copy(&cand->move, move);
-    cand->exch_n = 0;
-    cand->score = equity_to_int(move_get_score(move));
-  }
-  if (!any_placement) {
-    CpegRootCand *cand = &cands[candidate_count++];
-    cand->kind = 1;
-    cand->exch_n = 0;
-    cand->score = 0;
-  }
-  if (allow_exchanges) {
-    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
-    CpegMultiset exchanges[CPEG_ENUM_CAP];
-    bool overflow = false;
-    const int exchange_count = cpeg_enum_exchanges(
-        ld_size, mover_rack, bag, exchanges, CPEG_ENUM_CAP, &overflow);
-    if (overflow) {
-      free(cands);
-      move_list_destroy(root_moves);
-      return -1;
-    }
-    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
-      CpegRootCand *cand = &cands[candidate_count++];
-      cand->kind = 2;
-      cand->exch_n = exchanges[exchange_idx].n;
-      for (int tile_idx = 0; tile_idx < cand->exch_n; tile_idx++) {
-        cand->exch_tiles[tile_idx] = exchanges[exchange_idx].tiles[tile_idx];
-      }
-      cand->score = 0;
-    }
-  }
-  if (candidate_count > CPEG_MAX_PRE_CANDS) {
-    free(cands);
-    move_list_destroy(root_moves);
-    return -1;
-  }
+  CpegRootCand *cands = root_collection.candidates;
+  const int candidate_count = root_collection.count;
 
   CpegMultiset *worlds = malloc_or_die(CPEG_WORLD_CAP * sizeof(*worlds));
   bool world_overflow = false;
@@ -3263,7 +3184,6 @@ int cpeg_measure_interval_recursion(Game *game, int bag, bool allow_exchanges,
   if (world_overflow) {
     free(worlds);
     free(cands);
-    move_list_destroy(root_moves);
     return -1;
   }
 
@@ -3339,6 +3259,5 @@ int cpeg_measure_interval_recursion(Game *game, int bag, bool allow_exchanges,
   free(templates);
   free(worlds);
   free(cands);
-  move_list_destroy(root_moves);
   return capacity_exceeded ? -1 : stats->pair_count;
 }

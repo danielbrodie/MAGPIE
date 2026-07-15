@@ -155,11 +155,17 @@ void cpeg_coordinator_recompute(CpegCandState *states, int candidate_count,
 // Pre-endgame (bag 1-4): exact expectiminimax under Crossplay rules.
 // ---------------------------------------------------------------------------
 
-// Upper bound on the number of ranked candidates returned by the pre-endgame
-// solver. A pre-endgame rack generates at most a few hundred placements; the
-// synthesized pass and exchange candidates add a bounded handful. 1024 is
-// generous headroom.
-enum { CPEG_MAX_PRE_CANDS = 1024 };
+// Complete accounting for the root actions admitted by a pre-endgame solve.
+// `generation_complete` is false when move generation or a synthesized action
+// class exceeded an internal, explicitly detected capacity; such a collection
+// must never be used to recommend a move.
+typedef struct CpegRootCoverage {
+  int placements;
+  int exchanges;
+  int passes;
+  int total;
+  bool generation_complete;
+} CpegRootCoverage;
 
 // One ranked pre-endgame candidate (your first move), scored by its expected
 // spread over the enumerated opponent-rack worlds and random draws.
@@ -173,8 +179,9 @@ typedef struct CpegPreCand {
 // Result of an exact Crossplay pre-endgame solve: candidates ranked by expected
 // spread, best first.
 typedef struct CpegPreResult {
-  CpegPreCand cands[CPEG_MAX_PRE_CANDS];
+  CpegPreCand *cands;
   int count;
+  CpegRootCoverage coverage;
 } CpegPreResult;
 
 typedef enum CpegPreStatus {
@@ -207,7 +214,7 @@ typedef struct CpegCertifiedCand {
 
 typedef struct CpegCertifiedResult {
   CpegPreStatus status;
-  CpegCertifiedCand cands[CPEG_MAX_PRE_CANDS];
+  CpegCertifiedCand *cands;
   int count;
   int best_index;
   int worlds_total;
@@ -217,6 +224,7 @@ typedef struct CpegCertifiedResult {
   double optimum_upper;
   double decision_regret_bound;
   bool unique_best;
+  CpegRootCoverage coverage;
 } CpegCertifiedResult;
 
 // Exact Crossplay pre-endgame value for the player on turn (the "mover").
@@ -231,8 +239,8 @@ typedef struct CpegCertifiedResult {
 // (worlds, draw weights, the scoreless-ply cap, and the exchange model).
 //
 // When allow_exchanges is false, exchanges are not searched (matching the
-// Python reference solver); pass is searched only when the mover has no legal
-// placement.
+// Python reference solver). Voluntary pass is always included at the root;
+// deeper pass is searched only when the mover has no legal placement.
 //
 // num_threads (>= 1) parallelizes the per-world evaluation. Fills *out with the
 // ranked candidates and returns out->count. Returns -1, with out empty, if an
@@ -248,6 +256,11 @@ int cpeg_solve_pre_endgame(Game *game, int bag, bool allow_exchanges,
 // certified move cannot change except among exact co-optima.
 int cpeg_solve_pre_endgame_certified(Game *game, const CpegCertifiedArgs *args,
                                      CpegCertifiedResult *out);
+
+// Release dynamically allocated candidate storage. The result may be zeroed or
+// already destroyed; after return it is reset to an empty state.
+void cpeg_pre_result_destroy(CpegPreResult *result);
+void cpeg_certified_result_destroy(CpegCertifiedResult *result);
 
 typedef struct CpegStatisticalArgs {
   int bag;
@@ -274,7 +287,7 @@ typedef struct CpegStatisticalCand {
 
 typedef struct CpegStatisticalResult {
   CpegPreStatus status;
-  CpegStatisticalCand cands[CPEG_MAX_PRE_CANDS];
+  CpegStatisticalCand *cands;
   int count;
   int best_index;
   int worlds_sampled;
@@ -285,6 +298,7 @@ typedef struct CpegStatisticalResult {
   uint64_t seed;
   int sampled_world_indices[CPEG_MAX_WORLDS];
   int64_t sampled_world_weights[CPEG_MAX_WORLDS];
+  CpegRootCoverage coverage;
 } CpegStatisticalResult;
 
 // Seeded, paired sampling of outer opponent-rack worlds. Inner draws are still
@@ -293,6 +307,15 @@ typedef struct CpegStatisticalResult {
 int cpeg_solve_pre_endgame_statistical(Game *game,
                                        const CpegStatisticalArgs *args,
                                        CpegStatisticalResult *out);
+
+void cpeg_statistical_result_destroy(CpegStatisticalResult *result);
+
+// Collect and count the exact root action set without evaluating any hidden
+// worlds. This uses the same collector as every production pre-endgame path and
+// is useful for fast completeness checks. Returns -1 on invalid input or an
+// explicitly detected generation-capacity failure.
+int cpeg_count_root_actions(Game *game, int bag, bool allow_exchanges,
+                            CpegRootCoverage *coverage);
 
 // Pure sampling/CI core, exposed for finite-population coverage tests. Values
 // and positive hypergeometric weights describe the complete outer population.

@@ -62,6 +62,13 @@ static const char *const CPEG_PRE_9653_CGP =
     "4TI1SODALITE/4WE1M2V3G/4AD1A1FED2U/CInQS2N1I1E1AE/A2A5L1T1I1/"
     "R2d2ZEAL1O1R1/P2I5Y1X3 DPIATSS/ 0/0 0";
 
+// The incident position that exceeded the old 1024-candidate result array.
+// Complete root accounting is 1215 placements + 98 exchanges + voluntary pass.
+static const char *const CPEG_SENATOR_TOSA_CGP =
+    "cgp 3Z5F1NAIF/3E5I4I/3S1E3A2H1R/1INTERNaLS1VACS/5G3C2KAT/"
+    "4JO3OM1ER1/4E5I2R1/3QUBITS1D2EX/5E1OE2T1LI/5V1PAWPAWs1/"
+    "5Y1HM2B3/7E1EULOGY/10HE1O1/11A1O1/11U1D1 SENATOR/ 329/380 0";
+
 typedef struct CpegTestBranchUndo {
   Bag *bag;
   Rack rack;
@@ -371,7 +378,7 @@ static void test_cpeg_pre_endgame(void) {
   // and the exhaustive search's optimum is the blocker 13J TAU.
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   Game *game = config_get_game(config);
-  CpegPreResult result;
+  CpegPreResult result = {0};
   cpeg_solve_pre_endgame(game, /*bag=*/1, /*allow_exchanges=*/false,
                          /*num_threads=*/1, &result);
   assert(result.count > 0);
@@ -381,6 +388,7 @@ static void test_cpeg_pre_endgame(void) {
   // The blocker outranks the high scorer: TAU is the exact optimum here.
   assert_strings_equal(result.cands[0].label, "13J TAU");
   assert(fabs(result.cands[0].expected_spread - 44.125) < 1e-6);
+  cpeg_pre_result_destroy(&result);
 
   // IMG_9653, bag 1, no exchanges: top move and spread match the reference.
   load_and_exec_config_or_die(config, CPEG_PRE_9653_CGP);
@@ -391,6 +399,7 @@ static void test_cpeg_pre_endgame(void) {
   assert_strings_equal(result.cands[0].label, "12G I(N)S(I)D(E)");
   assert(fabs(result.cands[0].expected_spread - 23.0) < 1e-6);
   assert(fabs(cpeg_find_spread(&result, "15F PAST(Y)") - 22.25) < 1e-6);
+  cpeg_pre_result_destroy(&result);
 
   config_destroy(config);
 }
@@ -462,7 +471,7 @@ static void test_cpeg_candidate_legality(void) {
   assert(tau_is_legal);
 
   // Every cpeg placement candidate must be in the legal set.
-  CpegPreResult result;
+  CpegPreResult result = {0};
   cpeg_solve_pre_endgame(game, /*bag=*/1, /*allow_exchanges=*/false,
                          /*num_threads=*/1, &result);
   assert(result.count > 0);
@@ -481,6 +490,7 @@ static void test_cpeg_candidate_legality(void) {
     assert(found);
   }
 
+  cpeg_pre_result_destroy(&result);
   move_list_destroy(legal);
   config_destroy(config);
 }
@@ -575,6 +585,28 @@ static void test_cpeg_enumeration_capacity_guard(void) {
   // report that the third entry would otherwise have been silently dropped.
   assert(cpeg_submultiset_capacity_overflows(counts, 3, 2, 2));
   assert(!cpeg_submultiset_capacity_overflows(counts, 3, 2, 3));
+}
+
+void test_cpeg_complete_root_collection(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves "
+      "NWL23_crossplay -s1 score -s2 score -threads 1");
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+
+  CpegRootCoverage coverage;
+  const int action_count = cpeg_count_root_actions(
+      config_get_game(config), /*bag=*/4, /*allow_exchanges=*/true, &coverage);
+
+  assert(action_count == 1314);
+  assert(action_count > 1024);
+  assert(coverage.placements == 1215);
+  assert(coverage.exchanges == 98);
+  assert(coverage.passes == 1);
+  assert(coverage.total == action_count);
+  assert(coverage.generation_complete);
+
+  config_destroy(config);
 }
 
 static void cpeg_test_init_states(CpegCandState *states,
@@ -869,7 +901,7 @@ cpeg_assert_best_interval_contains_oracle(const CpegCertifiedResult *result,
 
 static void cpeg_assert_certified_bag1_exact(Config *config,
                                              bool allow_exchanges) {
-  CpegCertifiedResult result;
+  CpegCertifiedResult result = {0};
   const CpegCertifiedArgs args = {
       .bag = 1,
       .allow_exchanges = allow_exchanges,
@@ -889,10 +921,11 @@ static void cpeg_assert_certified_bag1_exact(Config *config,
   assert(tau_idx >= 0);
   assert(result.cands[tau_idx].lower <= 44.125);
   assert(result.cands[tau_idx].upper >= 44.125);
+  cpeg_certified_result_destroy(&result);
 }
 
 static void cpeg_assert_certified_bag1_early_stop(Config *config) {
-  CpegPreResult oracle;
+  CpegPreResult oracle = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame(config_get_game(config), /*bag=*/1,
                                 /*allow_exchanges=*/false, /*num_threads=*/4,
@@ -906,7 +939,7 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
       .batch_size = 16,
       .max_batches = 2,
   };
-  CpegCertifiedResult single_threaded;
+  CpegCertifiedResult single_threaded = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_certified(config_get_game(config), &work_args,
                                           &single_threaded) > 0);
@@ -917,7 +950,7 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
 
   CpegCertifiedArgs parallel_args = work_args;
   parallel_args.num_threads = 4;
-  CpegCertifiedResult four_threaded;
+  CpegCertifiedResult four_threaded = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_certified(config_get_game(config),
                                           &parallel_args, &four_threaded) > 0);
@@ -927,7 +960,7 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
   wall_args.num_threads = 4;
   wall_args.budget_seconds = 0.001;
   wall_args.max_batches = 0;
-  CpegCertifiedResult wall_limited;
+  CpegCertifiedResult wall_limited = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   Game *wall_game = config_get_game(config);
   game_gen_all_cross_sets(wall_game);
@@ -941,6 +974,10 @@ static void cpeg_assert_certified_bag1_early_stop(Config *config) {
          wall_limited.status == CPEG_PRE_CERTIFIED ||
          wall_limited.status == CPEG_PRE_EXACT_VALUES);
   cpeg_assert_best_interval_contains_oracle(&wall_limited, &oracle);
+  cpeg_certified_result_destroy(&wall_limited);
+  cpeg_certified_result_destroy(&four_threaded);
+  cpeg_certified_result_destroy(&single_threaded);
+  cpeg_pre_result_destroy(&oracle);
 }
 
 void test_cpeg_certified_bag1(void) {
@@ -1000,7 +1037,7 @@ void test_cpeg_statistical_bag1(void) {
       .confidence = 0.95,
       .max_worlds = 0,
   };
-  CpegStatisticalResult full;
+  CpegStatisticalResult full = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_statistical(config_get_game(config), &full_args,
                                             &full) > 0);
@@ -1023,8 +1060,8 @@ void test_cpeg_statistical_bag1(void) {
 
   CpegStatisticalArgs subset_args = full_args;
   subset_args.max_worlds = 4;
-  CpegStatisticalResult deterministic_one;
-  CpegStatisticalResult deterministic_two;
+  CpegStatisticalResult deterministic_one = {0};
+  CpegStatisticalResult deterministic_two = {0};
   load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
   assert(cpeg_solve_pre_endgame_statistical(
              config_get_game(config), &subset_args, &deterministic_one) > 0);
@@ -1043,7 +1080,7 @@ void test_cpeg_statistical_bag1(void) {
   for (int prefix = 1; prefix <= 7; prefix++) {
     CpegStatisticalArgs prefix_args = full_args;
     prefix_args.max_worlds = prefix;
-    CpegStatisticalResult prefix_result;
+    CpegStatisticalResult prefix_result = {0};
     load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
     assert(cpeg_solve_pre_endgame_statistical(
                config_get_game(config), &prefix_args, &prefix_result) > 0);
@@ -1067,6 +1104,7 @@ void test_cpeg_statistical_bag1(void) {
     tau_weights[world_idx] = weight;
     prior_weighted_sum = weighted_sum;
     prior_weight_sum = weight_sum;
+    cpeg_statistical_result_destroy(&prefix_result);
   }
 
   int covered = 0;
@@ -1088,7 +1126,7 @@ void test_cpeg_statistical_bag1(void) {
     CpegStatisticalArgs best_args = full_args;
     best_args.seed = (uint64_t)seed;
     best_args.max_worlds = 7;
-    CpegStatisticalResult result;
+    CpegStatisticalResult result = {0};
     load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
     assert(cpeg_solve_pre_endgame_statistical(config_get_game(config),
                                               &best_args, &result) > 0);
@@ -1104,12 +1142,16 @@ void test_cpeg_statistical_bag1(void) {
     if (result.best_index == tau_idx) {
       tau_chosen++;
     }
+    cpeg_statistical_result_destroy(&result);
   }
   assert(tau_chosen == best_arm_seeds);
   printf("cpegstat coverage=%d/%d (%.1f%%), best=%d/%d, tau_eliminated=0\n",
          covered, coverage_seeds,
          100.0 * (double)covered / (double)coverage_seeds, tau_chosen,
          best_arm_seeds);
+  cpeg_statistical_result_destroy(&deterministic_two);
+  cpeg_statistical_result_destroy(&deterministic_one);
+  cpeg_statistical_result_destroy(&full);
   config_destroy(config);
 }
 
@@ -1120,6 +1162,7 @@ void test_cpeg(void) {
   test_cpeg_candidate_legality();
   test_cpeg_score_upper_bound();
   test_cpeg_enumeration_capacity_guard();
+  test_cpeg_complete_root_collection();
   test_cpeg_coordinator();
   test_cpeg_incremental_round_trip();
 }
