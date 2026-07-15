@@ -214,7 +214,7 @@ void test_sim_time_limit(void) {
   config_destroy(config);
 }
 
-void test_all_plays_are_similar(void) {
+void test_distinct_anagrams_are_not_similar(void) {
   Config *config = config_create_or_die(
       "set -lex NWL20 -wmp true -s1 score -s2 score -r1 all -r2 all "
       "-plies 2 -numplays 4 -minp 100 -threads 1 -it 1100 -scond none");
@@ -245,8 +245,11 @@ void test_all_plays_are_similar(void) {
   cpthread_join(thread);
 
   assert(status == ERROR_STATUS_SUCCESS);
+  assert(!sim_results_plays_are_similar(sim_results, 0, 1));
+  assert(!sim_results_plays_are_similar(sim_results, 0, 2));
   assert(bai_result_get_status(sim_results_get_bai_result(
-             config_get_sim_results(config))) == BAI_RESULT_STATUS_THRESHOLD);
+             config_get_sim_results(config))) ==
+         BAI_RESULT_STATUS_SAMPLE_LIMIT);
   config_destroy(config);
 }
 
@@ -1151,7 +1154,7 @@ void test_sim(void) {
     test_sim_single_iteration();
     test_sim_threshold();
     test_sim_time_limit();
-    test_all_plays_are_similar();
+    test_distinct_anagrams_are_not_similar();
     test_more_iterations();
     test_play_similarity();
     perf_test_multithread_sim();
