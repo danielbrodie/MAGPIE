@@ -22,6 +22,7 @@
 #include "../util/io_util.h"
 #include "../util/string_util.h"
 #include "gameplay.h"
+#include "crossplay_oracle.h"
 #include "move_gen.h"
 #include "peg_combinatorics.h"
 #include "peg_pool.h"
@@ -2019,85 +2020,43 @@ static bool cpeg_collect_root_candidates(Game *game, int bag,
     return false;
   }
 
-  Board *board = game_get_board(game);
-  game_gen_all_cross_sets(game);
-  board_set_cross_sets_valid(board, true);
-
-  MoveList *root_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
-  const MoveGenArgs root_args = {
-      .game = game,
-      .move_list = root_moves,
-      .move_record_type = MOVE_RECORD_ALL,
-      .move_sort_type = MOVE_SORT_SCORE,
-      .override_kwg = NULL,
-      .eq_margin_movegen = 0,
-      .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-  };
-  generate_moves(&root_args);
-  const int root_count = move_list_get_count(root_moves);
-  if (root_count > CPEG_MOVE_LIST_CAP) {
-    move_list_destroy(root_moves);
+  CrossplayOracleActionSet actions;
+  const CrossplayOracleStatus status = crossplay_oracle_generate_actions(
+      game, bag, allow_exchanges, &actions);
+  if (status != CROSSPLAY_ORACLE_OK || !actions.coverage.complete) {
+    crossplay_oracle_action_set_destroy(&actions);
     return false;
   }
 
-  const size_t candidate_capacity =
-      (size_t)root_count + 1U + (allow_exchanges ? CPEG_ENUM_CAP : 0U);
   CpegRootCand *candidates =
-      calloc_or_die(candidate_capacity, sizeof(*candidates));
-  int candidate_count = 0;
-  int placement_count = 0;
-  for (int move_idx = 0; move_idx < root_count; move_idx++) {
-    const Move *move = move_list_get_move(root_moves, move_idx);
-    if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
-      continue;
-    }
-    CpegRootCand *candidate = &candidates[candidate_count++];
-    candidate->kind = 0;
-    move_copy(&candidate->move, move);
-    candidate->score = equity_to_int(move_get_score(move));
-    placement_count++;
-  }
-
-  // Pass is a legal root choice even when placements exist. Deeper voluntary
-  // pass policy remains a separate model question; this closes root accounting.
-  candidates[candidate_count++].kind = 1;
-
-  int exchange_count = 0;
-  if (allow_exchanges) {
-    const int mover_idx = game_get_player_on_turn_index(game);
-    const Rack *mover_rack = player_get_rack(game_get_player(game, mover_idx));
-    CpegMultiset exchanges[CPEG_ENUM_CAP];
-    bool exchange_overflow = false;
-    exchange_count =
-        cpeg_enum_exchanges(ld_get_size(game_get_ld(game)), mover_rack, bag,
-                            exchanges, CPEG_ENUM_CAP, &exchange_overflow);
-    if (exchange_overflow) {
-      free(candidates);
-      move_list_destroy(root_moves);
-      return false;
-    }
-    for (int exchange_idx = 0; exchange_idx < exchange_count; exchange_idx++) {
-      CpegRootCand *candidate = &candidates[candidate_count++];
+      calloc_or_die((size_t)actions.count, sizeof(*candidates));
+  for (int action_idx = 0; action_idx < actions.count; action_idx++) {
+    const CrossplayOracleAction *action = &actions.actions[action_idx];
+    CpegRootCand *candidate = &candidates[action_idx];
+    candidate->score = action->score;
+    if (action->kind == CROSSPLAY_ORACLE_PLACEMENT) {
+      candidate->kind = 0;
+      move_copy(&candidate->move, &action->move);
+    } else if (action->kind == CROSSPLAY_ORACLE_PASS) {
+      candidate->kind = 1;
+    } else {
       candidate->kind = 2;
-      candidate->exch_n = exchanges[exchange_idx].n;
-      for (int tile_idx = 0; tile_idx < candidate->exch_n; tile_idx++) {
-        candidate->exch_tiles[tile_idx] =
-            exchanges[exchange_idx].tiles[tile_idx];
-      }
+      candidate->exch_n = action->exchange_count;
+      memcpy(candidate->exch_tiles, action->exchange_tiles,
+             (size_t)candidate->exch_n * sizeof(*candidate->exch_tiles));
     }
   }
 
-  move_list_destroy(root_moves);
   collection->candidates = candidates;
-  collection->count = candidate_count;
+  collection->count = actions.count;
   collection->coverage = (CpegRootCoverage){
-      .placements = placement_count,
-      .exchanges = exchange_count,
-      .passes = 1,
-      .total = candidate_count,
-      .generation_complete = true,
+      .placements = actions.coverage.placements,
+      .exchanges = actions.coverage.exchanges,
+      .passes = actions.coverage.passes,
+      .total = actions.coverage.total,
+      .generation_complete = actions.coverage.complete,
   };
+  crossplay_oracle_action_set_destroy(&actions);
   return true;
 }
 

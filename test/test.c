@@ -22,6 +22,7 @@
 #include "cpeg_test.h"
 #include "create_data_test.h"
 #include "cross_set_test.h"
+#include "crossplay_oracle_test.h"
 #include "dawg_packed_test.h"
 #include "endgame_test.h"
 #include "equity_adjustment_test.h"
@@ -193,6 +194,7 @@ static TestEntry on_demand_test_table[] = {
     {"cpegwtl", test_cpeg_wtl_senator},
     {"cpegwtlproof", test_cpeg_wtl_certified_proof},
     {"cpegwtlaccept", test_cpeg_wtl_certified_senator_acceptance},
+    {"crossplayoracle", test_crossplay_oracle},
     {NULL, NULL} // Sentinel value to mark end of array
 };
 

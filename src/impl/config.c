@@ -29,6 +29,7 @@
 #include "../ent/board.h"
 #include "../ent/board_layout.h"
 #include "../ent/conversion_results.h"
+#include "../ent/data_filepaths.h"
 #include "../ent/endgame_results.h"
 #include "../ent/equity.h"
 #include "../ent/game.h"
@@ -64,6 +65,8 @@
 #include "cgp.h"
 #include "convert.h"
 #include "cpeg.h"
+#include "crossplay_oracle.h"
+#include "crossplay_oracle_assets.h"
 #include "endgame.h"
 #include "gameplay.h"
 #include "gcg.h"
@@ -111,6 +114,7 @@ typedef enum {
   ARG_TOKEN_ENDGAME,
   ARG_TOKEN_PEG,
   ARG_TOKEN_CPEG,
+  ARG_TOKEN_CROSSPLAY_ORACLE,
   ARG_TOKEN_AUTOPLAY,
   ARG_TOKEN_CONVERT,
   ARG_TOKEN_P1_NAME,
@@ -1140,6 +1144,12 @@ void add_help_arg_to_string_builder(const Config *config, int token,
       text = "Runs the exact Crossplay endgame solver on the current position "
              "(bag empty). Emits a machine-readable one-line result.";
       break;
+    case ARG_TOKEN_CROSSPLAY_ORACLE:
+      usages[0] = "<bag> <asset_manifest> [noexch]";
+      text = "Emits every legal Crossplay action in canonical action-id order "
+             "after verifying the exact rules and native data assets. This "
+             "neutral command never chooses or ranks a policy.";
+      break;
     case ARG_TOKEN_AUTOPLAY:
       usages[0] = "<type1> <num_games>";
       usages[1] = "<type1>,<type2>,... <num_games>";
@@ -2154,6 +2164,7 @@ char *impl_help(Config *config, ErrorStack *error_stack) {
         ARG_TOKEN_MOVES,                /* addmoves */
         ARG_TOKEN_ANALYZE,              /* analyze */
         ARG_TOKEN_CPEG,                 /* cpeg */
+        ARG_TOKEN_CROSSPLAY_ORACLE,     /* crossplayoracle */
         ARG_TOKEN_ENDGAME,              /* endgame */
         ARG_TOKEN_GEN,                  /* generate */
         ARG_TOKEN_GEN_AND_SIM,          /* gsimulate */
@@ -3966,6 +3977,138 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     return;
   }
   impl_cpeg_pre_endgame(config, bag, allow_exchanges);
+}
+
+static void crossplay_oracle_asset_error(ErrorStack *error_stack,
+                                         const char *message) {
+  error_stack_push(
+      error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+      get_formatted_string("crossplayoracle ASSET_MISMATCH: %s", message));
+}
+
+static bool crossplay_oracle_config_assets(
+    Config *config, const char *manifest_path,
+    CrossplayOracleAssetManifest *manifest, ErrorStack *error_stack) {
+  if (!crossplay_oracle_asset_manifest_load(manifest_path, manifest)) {
+    crossplay_oracle_asset_error(error_stack,
+                                 "asset manifest is missing or malformed");
+    return false;
+  }
+  const char *p1_lexicon = players_data_get_data_name(
+      config->players_data, PLAYERS_DATA_TYPE_KWG, 0);
+  const char *p2_lexicon = players_data_get_data_name(
+      config->players_data, PLAYERS_DATA_TYPE_KWG, 1);
+  if (p1_lexicon == NULL || p2_lexicon == NULL ||
+      !strings_equal(p1_lexicon, p2_lexicon)) {
+    crossplay_oracle_asset_error(error_stack,
+                                 "both players must use one exact lexicon");
+    return false;
+  }
+
+  char *lexicon_path = data_filepaths_get_readable_filename(
+      config->data_paths, p1_lexicon, DATA_FILEPATH_TYPE_KWG, error_stack);
+  char *layout_path = data_filepaths_get_readable_filename(
+      config->data_paths, board_layout_get_name(config->board_layout),
+      DATA_FILEPATH_TYPE_LAYOUT, error_stack);
+  char *distribution_path = data_filepaths_get_readable_filename(
+      config->data_paths, ld_get_name(config->ld), DATA_FILEPATH_TYPE_LD,
+      error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    free(lexicon_path);
+    free(layout_path);
+    free(distribution_path);
+    return false;
+  }
+  const bool verified = crossplay_oracle_asset_manifest_verify(
+      manifest, p1_lexicon, lexicon_path,
+      board_layout_get_name(config->board_layout), layout_path,
+      ld_get_name(config->ld), distribution_path, config->bingo_bonus);
+  free(lexicon_path);
+  free(layout_path);
+  free(distribution_path);
+  if (!verified) {
+    crossplay_oracle_asset_error(
+        error_stack,
+        "loaded lexicon/layout/distribution/bingo/blocklist content differs");
+  }
+  return verified;
+}
+
+void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
+  if (!config_has_game_data(config)) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+        string_duplicate("cannot run crossplayoracle without game data"));
+    return;
+  }
+  config_init_game(config);
+  const char *bag_value =
+      config_get_parg_value(config, ARG_TOKEN_CROSSPLAY_ORACLE, 0);
+  const char *manifest_path =
+      config_get_parg_value(config, ARG_TOKEN_CROSSPLAY_ORACLE, 1);
+  int bag = -1;
+  string_to_int_or_push_error(
+      "crossplayoracle bag", bag_value, 0, PEG_MAX_BAG,
+      ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG, &bag, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    return;
+  }
+  bool allow_exchanges = true;
+  const int arg_count =
+      config_get_parg_num_set_values(config, ARG_TOKEN_CROSSPLAY_ORACLE);
+  if (arg_count == 3) {
+    const char *option =
+        config_get_parg_value(config, ARG_TOKEN_CROSSPLAY_ORACLE, 2);
+    if (!strings_equal(option, "noexch")) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+          string_duplicate("crossplayoracle only accepts optional noexch"));
+      return;
+    }
+    allow_exchanges = false;
+  }
+
+  CrossplayOracleAssetManifest manifest;
+  if (!crossplay_oracle_config_assets(config, manifest_path, &manifest,
+                                      error_stack)) {
+    return;
+  }
+  CrossplayOracleActionSet actions;
+  const CrossplayOracleStatus status = crossplay_oracle_generate_actions(
+      config->game, bag, allow_exchanges, &actions);
+  if (status != CROSSPLAY_ORACLE_OK || !actions.coverage.complete) {
+    crossplay_oracle_action_set_destroy(&actions);
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+        get_formatted_string("crossplayoracle %s",
+                             crossplay_oracle_status_name(status)));
+    return;
+  }
+
+  StringBuilder *output = string_builder_create();
+  string_builder_add_formatted_string(
+      output,
+      "crossplay-oracle protocol=crossplay-oracle-v1 count=%d digest=%s "
+      "placements=%d exchanges=%d pass=%d complete=1 "
+      "rules=%s rules_digest=%s lexicon=%s lexicon_digest=%s "
+      "layout=%s layout_digest=%s distribution=%s distribution_digest=%s "
+      "blocklist_digest=%s\n",
+      actions.count, actions.digest, actions.coverage.placements,
+      actions.coverage.exchanges, actions.coverage.passes, manifest.rules_id,
+      manifest.rules_digest, manifest.lexicon_id, manifest.lexicon_digest,
+      manifest.layout_id, manifest.layout_digest, manifest.distribution_id,
+      manifest.distribution_digest, manifest.blocklist_digest);
+  for (int action_idx = 0; action_idx < actions.count; action_idx++) {
+    const CrossplayOracleAction *action = &actions.actions[action_idx];
+    string_builder_add_formatted_string(
+        output, "crossplay-oracle-action %s score=%d %s\n", action->id,
+        action->score, action->canonical_json);
+  }
+  char *rendered = string_builder_dump(output, NULL);
+  string_builder_destroy(output);
+  thread_control_print(config->thread_control, rendered);
+  free(rendered);
+  crossplay_oracle_action_set_destroy(&actions);
 }
 
 // Writes the untruncated peg chart to data/pegcharts/outcomes_<ts>.txt, where
@@ -8470,6 +8613,15 @@ char *str_api_cpeg(Config *config, ErrorStack *error_stack) {
   return empty_string();
 }
 
+void execute_crossplay_oracle(Config *config, ErrorStack *error_stack) {
+  impl_crossplay_oracle(config, error_stack);
+}
+
+char *str_api_crossplay_oracle(Config *config, ErrorStack *error_stack) {
+  impl_crossplay_oracle(config, error_stack);
+  return empty_string();
+}
+
 void execute_autoplay(Config *config, ErrorStack *error_stack) {
   impl_autoplay(config, error_stack);
 }
@@ -8881,6 +9033,8 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
   cmd(ARG_TOKEN_CPEG, "cpeg", 0, 8, cpeg, generic, false);
+  cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 3,
+      crossplay_oracle, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);
   cmd(ARG_TOKEN_LEAVE_GEN, "leavegen", 2, 2, leave_gen, generic, false);
@@ -9223,6 +9377,7 @@ void config_add_settings_to_string_builder(const Config *config,
     case ARG_TOKEN_ENDGAME:
     case ARG_TOKEN_PEG:
     case ARG_TOKEN_CPEG:
+    case ARG_TOKEN_CROSSPLAY_ORACLE:
     case ARG_TOKEN_PEG_ONLY:
     case ARG_TOKEN_PEG_NOPRUNE:
     case ARG_TOKEN_PEG_OUTCOMES:
