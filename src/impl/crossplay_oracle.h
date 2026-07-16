@@ -82,6 +82,11 @@ typedef struct CrossplayOracleTransitionSet {
 CrossplayOracleStatus crossplay_oracle_generate_actions(
     const Game *game, int bag_count, bool allow_exchanges,
     CrossplayOracleActionSet *result);
+CrossplayOracleStatus crossplay_oracle_bounded_sequence_commitment(
+    const CrossplayOracleActionSet *actions, const char *selected_action_id,
+    int actor, const char *parent_sequence_digest,
+    const char *information_key_digest,
+    char commitment[SHA256_HEX_SIZE]);
 void crossplay_oracle_action_set_destroy(CrossplayOracleActionSet *result);
 const char *crossplay_oracle_status_name(CrossplayOracleStatus status);
 CrossplayOracleStatus crossplay_oracle_enumerate_draws(

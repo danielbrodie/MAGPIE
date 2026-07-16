@@ -90,6 +90,29 @@ static void test_complete_canonical_action_set(void) {
   assert(found_tosa);
   assert_games_are_equal(before, game, true);
 
+  const CrossplayOracleAction *selected = &actions.actions[0];
+  for (int action_idx = 1; action_idx < actions.count; action_idx++) {
+    if (actions.actions[action_idx].score > selected->score) {
+      selected = &actions.actions[action_idx];
+    }
+  }
+  char bounded_commitment[SHA256_HEX_SIZE];
+  assert(crossplay_oracle_bounded_sequence_commitment(
+             &actions, selected->id, 0,
+             "0000000000000000000000000000000000000000000000000000000000000000",
+             "1111111111111111111111111111111111111111111111111111111111111111",
+             bounded_commitment) == CROSSPLAY_ORACLE_OK);
+  assert(strcmp(bounded_commitment,
+                "8eb61c5047103f59e2c5c9a0433d16c27a53b46a70f2c363fbf5ae"
+                "244eeca7ff") == 0);
+  assert(crossplay_oracle_bounded_sequence_commitment(
+             &actions,
+             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+             0,
+             "0000000000000000000000000000000000000000000000000000000000000000",
+             "1111111111111111111111111111111111111111111111111111111111111111",
+             bounded_commitment) == CROSSPLAY_ORACLE_INVALID_INPUT);
+
   crossplay_oracle_action_set_destroy(&actions);
   game_destroy(before);
   config_destroy(config);

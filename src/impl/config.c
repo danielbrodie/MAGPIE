@@ -1147,7 +1147,9 @@ void add_help_arg_to_string_builder(const Config *config, int token,
       break;
     case ARG_TOKEN_CROSSPLAY_ORACLE:
       usages[0] = "<bag> <asset_manifest> [noexch] [trustedassets] "
-                  "[apply <action_id>]";
+                  "[best | apply <action_id> | "
+                  "bestcommit <actor> <parent_sequence_digest> "
+                  "<information_key_digest>]";
       text = "Emits every legal Crossplay action in canonical action-id order "
              "after verifying the exact rules and native data assets. This "
              "neutral command never chooses or ranks a policy.";
@@ -4083,6 +4085,10 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
   bool allow_exchanges = true;
   bool reuse_verified_assets = false;
   bool compact_best = false;
+  bool committed_best = false;
+  int commitment_actor = -1;
+  const char *commitment_parent = NULL;
+  const char *commitment_information = NULL;
   const char *apply_action_id = NULL;
   const int arg_count =
       config_get_parg_num_set_values(config, ARG_TOKEN_CROSSPLAY_ORACLE);
@@ -4095,6 +4101,20 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
       reuse_verified_assets = true;
     } else if (strings_equal(option, "best")) {
       compact_best = true;
+    } else if (strings_equal(option, "bestcommit") && !committed_best &&
+               arg_idx + 3 < arg_count) {
+      committed_best = true;
+      compact_best = true;
+      const char *actor_value = config_get_parg_value(
+          config, ARG_TOKEN_CROSSPLAY_ORACLE, ++arg_idx);
+      string_to_int_or_push_error(
+          "crossplayoracle commitment actor", actor_value, 0, 1,
+          ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG, &commitment_actor,
+          error_stack);
+      commitment_parent = config_get_parg_value(
+          config, ARG_TOKEN_CROSSPLAY_ORACLE, ++arg_idx);
+      commitment_information = config_get_parg_value(
+          config, ARG_TOKEN_CROSSPLAY_ORACLE, ++arg_idx);
     } else if (strings_equal(option, "apply") && apply_action_id == NULL &&
                arg_idx + 1 < arg_count) {
       apply_action_id = config_get_parg_value(
@@ -4103,10 +4123,14 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
       error_stack_push(
           error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
           string_duplicate(
-              "crossplayoracle options are noexch, trustedassets, best, and "
-              "apply <action_id>"));
+              "crossplayoracle options are noexch, trustedassets, best, "
+              "bestcommit <actor> <parent_sequence_digest> "
+              "<information_key_digest>, and apply <action_id>"));
       return;
     }
+  }
+  if (!error_stack_is_empty(error_stack)) {
+    return;
   }
 
   CrossplayOracleAssetManifest manifest;
@@ -4216,6 +4240,47 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
       if (candidate->score > selected->score) {
         selected = candidate;
       }
+    }
+    if (committed_best) {
+      char bounded_commitment[SHA256_HEX_SIZE];
+      const CrossplayOracleStatus commitment_status =
+          crossplay_oracle_bounded_sequence_commitment(
+              &actions, selected->id, commitment_actor, commitment_parent,
+              commitment_information, bounded_commitment);
+      if (commitment_status != CROSSPLAY_ORACLE_OK) {
+        crossplay_oracle_action_set_destroy(&actions);
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
+            get_formatted_string(
+                "crossplayoracle commitment %s",
+                crossplay_oracle_status_name(commitment_status)));
+        return;
+      }
+      StringBuilder *output = string_builder_create();
+      string_builder_add_formatted_string(
+          output,
+          "crossplay-oracle-selected-commitment "
+          "protocol=crossplay-oracle-selected-commitment-v1 count=%d "
+          "digest=%s bounded_count=%d bounded_commitment=%s placements=%d "
+          "exchanges=%d pass=%d complete=1 rules=%s rules_digest=%s "
+          "lexicon=%s lexicon_digest=%s layout=%s layout_digest=%s "
+          "distribution=%s distribution_digest=%s blocklist_digest=%s\n",
+          actions.count, actions.digest, actions.count - 1,
+          bounded_commitment, actions.coverage.placements,
+          actions.coverage.exchanges, actions.coverage.passes,
+          manifest.rules_id, manifest.rules_digest, manifest.lexicon_id,
+          manifest.lexicon_digest, manifest.layout_id, manifest.layout_digest,
+          manifest.distribution_id, manifest.distribution_digest,
+          manifest.blocklist_digest);
+      string_builder_add_formatted_string(
+          output, "crossplay-oracle-selected-action %s score=%d %s\n",
+          selected->id, selected->score, selected->canonical_json);
+      char *rendered = string_builder_dump(output, NULL);
+      string_builder_destroy(output);
+      thread_control_print(config->thread_control, rendered);
+      free(rendered);
+      crossplay_oracle_action_set_destroy(&actions);
+      return;
     }
     StringBuilder *output = string_builder_create();
     string_builder_add_formatted_string(
@@ -9197,7 +9262,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
   cmd(ARG_TOKEN_CPEG, "cpeg", 0, 8, cpeg, generic, false);
-  cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 6,
+  cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 10,
       crossplay_oracle, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);
   cmd(ARG_TOKEN_CONVERT, "convert", 2, 3, convert, generic, false);

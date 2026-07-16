@@ -13,6 +13,7 @@
 #include "gameplay.h"
 #include "move_gen.h"
 #include "peg_combinatorics.h"
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -239,6 +240,102 @@ static void crossplay_oracle_action_space_digest(
     sha256_update(&sha, "\n", 1);
   }
   sha256_final_hex(&sha, result->digest);
+}
+
+static bool crossplay_oracle_is_sha256(const char *value) {
+  if (value == NULL || strlen(value) != SHA256_HEX_SIZE - 1) {
+    return false;
+  }
+  for (int char_idx = 0; char_idx < SHA256_HEX_SIZE - 1; char_idx++) {
+    const unsigned char character = (unsigned char)value[char_idx];
+    if (!isdigit(character) && (character < 'a' || character > 'f')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static int crossplay_oracle_digest_compare(const void *lhs, const void *rhs) {
+  return strcmp((const char *)lhs, (const char *)rhs);
+}
+
+CrossplayOracleStatus crossplay_oracle_bounded_sequence_commitment(
+    const CrossplayOracleActionSet *actions, const char *selected_action_id,
+    int actor, const char *parent_sequence_digest,
+    const char *information_key_digest,
+    char commitment[SHA256_HEX_SIZE]) {
+  static const char SEQUENCE_DOMAIN[] = "crossplay-player-sequence-edge-v1";
+  static const char COMMITMENT_DOMAIN[] =
+      "crossplay-bounded-sequence-commitment-v1";
+  static const char ACTION_PREFIX[] = "{\"action_id\":\"";
+  static const char ACTOR_PREFIX[] = "\",\"actor\":";
+  static const char INFORMATION_PREFIX[] =
+      ",\"information_key_digest\":\"";
+  static const char PARENT_PREFIX[] = "\",\"parent_digest\":\"";
+  static const char OBJECT_SUFFIX[] = "\"}";
+  static const char COMMITMENT_PREFIX[] =
+      "{\"child_sequence_digests\":[\"";
+  static const char COMMITMENT_SEPARATOR[] = "\",\"";
+  static const char COMMITMENT_SUFFIX[] = "\"]}";
+  if (actions == NULL || commitment == NULL || actions->count < 2 ||
+      !actions->coverage.complete ||
+      actions->coverage.total != actions->count ||
+      (actor != 0 && actor != 1) ||
+      !crossplay_oracle_is_sha256(selected_action_id) ||
+      !crossplay_oracle_is_sha256(parent_sequence_digest) ||
+      !crossplay_oracle_is_sha256(information_key_digest)) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  bool found_selected = false;
+  char(*child_digests)[SHA256_HEX_SIZE] =
+      calloc_or_die((size_t)(actions->count - 1), sizeof(*child_digests));
+  int child_count = 0;
+  for (int action_idx = 0; action_idx < actions->count; action_idx++) {
+    const char *action_id = actions->actions[action_idx].id;
+    if (strings_equal(action_id, selected_action_id)) {
+      found_selected = true;
+      continue;
+    }
+    if (child_count >= actions->count - 1) {
+      free(child_digests);
+      return CROSSPLAY_ORACLE_INVALID_INPUT;
+    }
+    Sha256 sha;
+    sha256_init(&sha);
+    sha256_update(&sha, SEQUENCE_DOMAIN, sizeof(SEQUENCE_DOMAIN));
+    sha256_update(&sha, ACTION_PREFIX, sizeof(ACTION_PREFIX) - 1);
+    sha256_update(&sha, action_id, SHA256_HEX_SIZE - 1);
+    sha256_update(&sha, ACTOR_PREFIX, sizeof(ACTOR_PREFIX) - 1);
+    const char actor_character = (char)('0' + actor);
+    sha256_update(&sha, &actor_character, 1);
+    sha256_update(&sha, INFORMATION_PREFIX, sizeof(INFORMATION_PREFIX) - 1);
+    sha256_update(&sha, information_key_digest, SHA256_HEX_SIZE - 1);
+    sha256_update(&sha, PARENT_PREFIX, sizeof(PARENT_PREFIX) - 1);
+    sha256_update(&sha, parent_sequence_digest, SHA256_HEX_SIZE - 1);
+    sha256_update(&sha, OBJECT_SUFFIX, sizeof(OBJECT_SUFFIX) - 1);
+    sha256_final_hex(&sha, child_digests[child_count++]);
+  }
+  if (!found_selected || child_count != actions->count - 1) {
+    free(child_digests);
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  qsort(child_digests, (size_t)child_count, sizeof(*child_digests),
+        crossplay_oracle_digest_compare);
+  Sha256 sha;
+  sha256_init(&sha);
+  sha256_update(&sha, COMMITMENT_DOMAIN, sizeof(COMMITMENT_DOMAIN));
+  sha256_update(&sha, COMMITMENT_PREFIX, sizeof(COMMITMENT_PREFIX) - 1);
+  for (int child_idx = 0; child_idx < child_count; child_idx++) {
+    if (child_idx > 0) {
+      sha256_update(&sha, COMMITMENT_SEPARATOR,
+                    sizeof(COMMITMENT_SEPARATOR) - 1);
+    }
+    sha256_update(&sha, child_digests[child_idx], SHA256_HEX_SIZE - 1);
+  }
+  sha256_update(&sha, COMMITMENT_SUFFIX, sizeof(COMMITMENT_SUFFIX) - 1);
+  sha256_final_hex(&sha, commitment);
+  free(child_digests);
+  return CROSSPLAY_ORACLE_OK;
 }
 
 typedef struct CrossplayOracleDrawCollector {
