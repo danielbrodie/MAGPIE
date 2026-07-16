@@ -274,10 +274,11 @@ CrossplayOracleStatus crossplay_oracle_bounded_sequence_commitment(
   static const char PARENT_PREFIX[] = "\",\"parent_digest\":\"";
   static const char OBJECT_SUFFIX[] = "\"}";
   static const char COMMITMENT_PREFIX[] =
-      "{\"child_sequence_digests\":[\"";
-  static const char COMMITMENT_SEPARATOR[] = "\",\"";
-  static const char COMMITMENT_SUFFIX[] = "\"]}";
-  if (actions == NULL || commitment == NULL || actions->count < 2 ||
+      "{\"child_sequence_digests\":[";
+  static const char COMMITMENT_SEPARATOR[] = ",";
+  static const char COMMITMENT_QUOTE[] = "\"";
+  static const char COMMITMENT_SUFFIX[] = "]}";
+  if (actions == NULL || commitment == NULL || actions->count < 1 ||
       !actions->coverage.complete ||
       actions->coverage.total != actions->count ||
       (actor != 0 && actor != 1) ||
@@ -287,8 +288,11 @@ CrossplayOracleStatus crossplay_oracle_bounded_sequence_commitment(
     return CROSSPLAY_ORACLE_INVALID_INPUT;
   }
   bool found_selected = false;
-  char(*child_digests)[SHA256_HEX_SIZE] =
-      calloc_or_die((size_t)(actions->count - 1), sizeof(*child_digests));
+  char(*child_digests)[SHA256_HEX_SIZE] = NULL;
+  if (actions->count > 1) {
+    child_digests =
+        calloc_or_die((size_t)(actions->count - 1), sizeof(*child_digests));
+  }
   int child_count = 0;
   for (int action_idx = 0; action_idx < actions->count; action_idx++) {
     const char *action_id = actions->actions[action_idx].id;
@@ -330,7 +334,9 @@ CrossplayOracleStatus crossplay_oracle_bounded_sequence_commitment(
       sha256_update(&sha, COMMITMENT_SEPARATOR,
                     sizeof(COMMITMENT_SEPARATOR) - 1);
     }
+    sha256_update(&sha, COMMITMENT_QUOTE, sizeof(COMMITMENT_QUOTE) - 1);
     sha256_update(&sha, child_digests[child_idx], SHA256_HEX_SIZE - 1);
+    sha256_update(&sha, COMMITMENT_QUOTE, sizeof(COMMITMENT_QUOTE) - 1);
   }
   sha256_update(&sha, COMMITMENT_SUFFIX, sizeof(COMMITMENT_SUFFIX) - 1);
   sha256_final_hex(&sha, commitment);

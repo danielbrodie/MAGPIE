@@ -105,6 +105,19 @@ static void test_complete_canonical_action_set(void) {
   assert(strcmp(bounded_commitment,
                 "8eb61c5047103f59e2c5c9a0433d16c27a53b46a70f2c363fbf5ae"
                 "244eeca7ff") == 0);
+  CrossplayOracleActionSet singleton = {
+      .actions = (CrossplayOracleAction *)selected,
+      .count = 1,
+      .coverage = {.passes = 1, .total = 1, .complete = true},
+  };
+  assert(crossplay_oracle_bounded_sequence_commitment(
+             &singleton, selected->id, 0,
+             "0000000000000000000000000000000000000000000000000000000000000000",
+             "1111111111111111111111111111111111111111111111111111111111111111",
+             bounded_commitment) == CROSSPLAY_ORACLE_OK);
+  assert(strcmp(bounded_commitment,
+                "f880884dff07a041e745d8ef0c9334f3ce881819e5487eeb89cf9764"
+                "fda10979") == 0);
   assert(crossplay_oracle_bounded_sequence_commitment(
              &actions,
              "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
