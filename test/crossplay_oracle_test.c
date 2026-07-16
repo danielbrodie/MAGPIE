@@ -158,11 +158,15 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
       "f72a97fe20a27d5b498528f238f8a3bd9ea88106dab96a14984bc9f3657eaa34");
   bool found_tosa = false;
   bool found_pass = false;
+  int maximum_action_score = 0;
   uint64_t tosa_generation = 0;
   uint64_t tosa_index = 0;
   const uint8_t tosa[] = {20, 15, 19, 1};
   for (uint64_t action_idx = 0; action_idx < actions.count; action_idx++) {
     const MagpieCrossplayAction *action = &actions.actions[action_idx];
+    if (action->score > maximum_action_score) {
+      maximum_action_score = action->score;
+    }
     if (action->kind == MAGPIE_CROSSPLAY_ACTION_PASS) {
       found_pass = true;
       crossplay_oracle_test_assert_raw_digest(
@@ -216,6 +220,8 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
   }
   assert(opponent_swap_idx >= 0);
   assert(bag_swap_idx >= 0);
+  const int hidden_opponent_swap_idx = opponent_swap_idx;
+  const int hidden_bag_swap_idx = bag_swap_idx;
   const uint8_t saved_opponent_tile = player1_rack[opponent_swap_idx];
   const uint8_t saved_hidden_bag_tile = bag_tiles[bag_swap_idx];
   player1_rack[opponent_swap_idx] = saved_hidden_bag_tile;
@@ -263,6 +269,29 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
   assert(error.status == MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
   player0_rack[actor_swap_idx] = saved_actor_tile;
   player1_rack[opponent_swap_idx] = saved_other_tile;
+
+  MagpieCrossplayMaximumScore maximum_score;
+  assert(magpie_crossplay_maximum_score(oracle, &position, &maximum_score,
+                                        &error) ==
+         MAGPIE_CROSSPLAY_STATUS_OK);
+  assert(maximum_score.complete == 1);
+  assert(maximum_score.score == maximum_action_score);
+  assert(maximum_score.native_generation != 0);
+  player1_rack[opponent_swap_idx] = saved_actor_tile;
+  player0_rack[actor_swap_idx] = saved_other_tile;
+  assert(magpie_crossplay_validate_action_space_position(
+             oracle, maximum_score.native_generation, &position, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
+  player0_rack[actor_swap_idx] = saved_actor_tile;
+  player1_rack[opponent_swap_idx] = saved_other_tile;
+
+  player1_rack[hidden_opponent_swap_idx] = saved_hidden_bag_tile;
+  bag_tiles[hidden_bag_swap_idx] = saved_opponent_tile;
+  assert(magpie_crossplay_validate_action_space_position(
+             oracle, maximum_score.native_generation, &position, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_OK);
+  player1_rack[hidden_opponent_swap_idx] = saved_opponent_tile;
+  bag_tiles[hidden_bag_swap_idx] = saved_hidden_bag_tile;
 
   assert(magpie_crossplay_apply_action(oracle, tosa_generation + 1,
                                         tosa_index, &transitions, &error) ==

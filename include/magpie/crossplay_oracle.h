@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define MAGPIE_CROSSPLAY_ABI_VERSION 2U
+#define MAGPIE_CROSSPLAY_ABI_VERSION 3U
 #define MAGPIE_CROSSPLAY_BOARD_CELLS 225U
 #define MAGPIE_CROSSPLAY_RACK_CAPACITY 7U
 #define MAGPIE_CROSSPLAY_WORD_CAPACITY 15U
@@ -122,6 +122,17 @@ typedef struct MagpieCrossplayActionSet {
   uint8_t reserved[7];
 } MagpieCrossplayActionSet;
 
+// Exact maximum placement/pass score for a position. `complete` certifies that
+// the score came from exhaustive neutral move generation. `native_generation`
+// retains only the action-space basis for validating hidden-world compatibility;
+// it is invalidated by the next action or maximum-score generation.
+typedef struct MagpieCrossplayMaximumScore {
+  int32_t score;
+  uint8_t complete;
+  uint8_t reserved[3];
+  uint64_t native_generation;
+} MagpieCrossplayMaximumScore;
+
 typedef struct MagpieCrossplayOwnedPosition {
   MagpieCrossplayBoardCell board_cells[MAGPIE_CROSSPLAY_BOARD_CELLS];
   uint8_t player_racks[2][MAGPIE_CROSSPLAY_RACK_CAPACITY];
@@ -166,6 +177,10 @@ MagpieCrossplayStatus magpie_crossplay_generate_actions(
     MagpieCrossplayOracle *oracle, const MagpieCrossplayPosition *position,
     uint8_t allow_exchanges, MagpieCrossplayActionSet *out_actions,
     MagpieCrossplayError *error);
+
+MagpieCrossplayStatus magpie_crossplay_maximum_score(
+    MagpieCrossplayOracle *oracle, const MagpieCrossplayPosition *position,
+    MagpieCrossplayMaximumScore *out_score, MagpieCrossplayError *error);
 
 void magpie_crossplay_action_set_destroy(MagpieCrossplayActionSet *actions);
 

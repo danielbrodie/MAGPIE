@@ -599,6 +599,45 @@ void magpie_crossplay_action_set_destroy(MagpieCrossplayActionSet *actions) {
   }
 }
 
+MagpieCrossplayStatus magpie_crossplay_maximum_score(
+    MagpieCrossplayOracle *oracle, const MagpieCrossplayPosition *position,
+    MagpieCrossplayMaximumScore *out_score, MagpieCrossplayError *error) {
+  magpie_crossplay_error_reset(error);
+  if (oracle == NULL || position == NULL || out_score == NULL) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "oracle, position, and maximum-score output are required");
+  }
+  memset(out_score, 0, sizeof(*out_score));
+  crossplay_oracle_action_set_destroy(&oracle->generated_actions);
+  oracle->has_generated_actions = false;
+  if (!magpie_crossplay_load_position(oracle, position)) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_POSITION_INVALID, 0,
+        "position is malformed or violates exact tile conservation");
+  }
+  int maximum_score = 0;
+  const CrossplayOracleStatus internal_status =
+      crossplay_oracle_maximum_score(oracle->game, &maximum_score);
+  if (internal_status != CROSSPLAY_ORACLE_OK || maximum_score < 0) {
+    return magpie_crossplay_error_set(error,
+                                      MAGPIE_CROSSPLAY_STATUS_ENGINE_ERROR,
+                                      (uint32_t)internal_status,
+                                      crossplay_oracle_status_name(
+                                          internal_status));
+  }
+  oracle->generation++;
+  if (oracle->generation == 0) {
+    oracle->generation++;
+  }
+  magpie_crossplay_bind_action_basis(oracle, position);
+  oracle->has_generated_actions = true;
+  out_score->score = maximum_score;
+  out_score->complete = 1;
+  out_score->native_generation = oracle->generation;
+  return MAGPIE_CROSSPLAY_STATUS_OK;
+}
+
 MagpieCrossplayStatus magpie_crossplay_validate_action_space_position(
     MagpieCrossplayOracle *oracle, uint64_t native_generation,
     const MagpieCrossplayPosition *position, MagpieCrossplayError *error) {

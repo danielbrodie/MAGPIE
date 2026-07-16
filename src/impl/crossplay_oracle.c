@@ -520,6 +520,40 @@ void crossplay_oracle_transition_set_destroy(
   memset(result, 0, sizeof(*result));
 }
 
+CrossplayOracleStatus crossplay_oracle_maximum_score(const Game *game,
+                                                     int *maximum_score) {
+  if (game == NULL || maximum_score == NULL) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  Game *working_game = game_duplicate(game);
+  Board *board = game_get_board(working_game);
+  game_gen_all_cross_sets(working_game);
+  board_set_cross_sets_valid(board, true);
+  MoveList *moves = move_list_create(1);
+  const MoveGenArgs move_args = {
+      .game = working_game,
+      .move_list = moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&move_args);
+  *maximum_score = 0;
+  if (move_list_get_count(moves) > 0) {
+    const int placement_score =
+        equity_to_int(move_get_score(move_list_get_move(moves, 0)));
+    if (placement_score > *maximum_score) {
+      *maximum_score = placement_score;
+    }
+  }
+  move_list_destroy(moves);
+  game_destroy(working_game);
+  return CROSSPLAY_ORACLE_OK;
+}
+
 CrossplayOracleStatus crossplay_oracle_generate_actions(
     const Game *game, int bag_count, bool allow_exchanges,
     CrossplayOracleActionSet *result) {
