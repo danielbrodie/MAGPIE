@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define MAGPIE_CROSSPLAY_ABI_VERSION 1U
+#define MAGPIE_CROSSPLAY_ABI_VERSION 2U
 #define MAGPIE_CROSSPLAY_BOARD_CELLS 225U
 #define MAGPIE_CROSSPLAY_RACK_CAPACITY 7U
 #define MAGPIE_CROSSPLAY_WORD_CAPACITY 15U
@@ -172,6 +172,16 @@ void magpie_crossplay_action_set_destroy(MagpieCrossplayActionSet *actions);
 MagpieCrossplayStatus magpie_crossplay_apply_action(
     MagpieCrossplayOracle *oracle, uint64_t native_generation,
     uint64_t native_index, MagpieCrossplayTransitionSet *out_transitions,
+    MagpieCrossplayError *error);
+
+// Applies a retained action to another concrete position in the same
+// information set. The position may differ only in the hidden opponent rack
+// and bag composition; the oracle verifies the complete public/action-space
+// basis before applying the action.
+MagpieCrossplayStatus magpie_crossplay_apply_action_to_position(
+    MagpieCrossplayOracle *oracle, uint64_t native_generation,
+    uint64_t native_index, const MagpieCrossplayPosition *position,
+    MagpieCrossplayTransitionSet *out_transitions,
     MagpieCrossplayError *error);
 
 void magpie_crossplay_transition_set_destroy(
