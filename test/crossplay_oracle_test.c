@@ -220,6 +220,9 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
   const uint8_t saved_hidden_bag_tile = bag_tiles[bag_swap_idx];
   player1_rack[opponent_swap_idx] = saved_hidden_bag_tile;
   bag_tiles[bag_swap_idx] = saved_opponent_tile;
+  assert(magpie_crossplay_validate_action_space_position(
+             oracle, tosa_generation, &position, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_OK);
   assert(magpie_crossplay_apply_action_to_position(
              oracle, tosa_generation, tosa_index, &position, &transitions,
              &error) == MAGPIE_CROSSPLAY_STATUS_OK);
@@ -251,6 +254,9 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
   const uint8_t saved_other_tile = player1_rack[opponent_swap_idx];
   player0_rack[actor_swap_idx] = saved_other_tile;
   player1_rack[opponent_swap_idx] = saved_actor_tile;
+  assert(magpie_crossplay_validate_action_space_position(
+             oracle, tosa_generation, &position, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
   assert(magpie_crossplay_apply_action_to_position(
              oracle, tosa_generation, tosa_index, &position, &transitions,
              &error) == MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);

@@ -599,6 +599,34 @@ void magpie_crossplay_action_set_destroy(MagpieCrossplayActionSet *actions) {
   }
 }
 
+MagpieCrossplayStatus magpie_crossplay_validate_action_space_position(
+    MagpieCrossplayOracle *oracle, uint64_t native_generation,
+    const MagpieCrossplayPosition *position, MagpieCrossplayError *error) {
+  magpie_crossplay_error_reset(error);
+  if (oracle == NULL || position == NULL) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "oracle and position are required");
+  }
+  if (!oracle->has_generated_actions ||
+      native_generation != oracle->generation) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "action-space handle is stale or does not belong to this session");
+  }
+  if (!magpie_crossplay_action_basis_matches(oracle, position)) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "position does not match the retained action-space basis");
+  }
+  if (!magpie_crossplay_load_position(oracle, position)) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_POSITION_INVALID, 0,
+        "position is malformed or violates exact tile conservation");
+  }
+  return MAGPIE_CROSSPLAY_STATUS_OK;
+}
+
 static bool magpie_crossplay_export_owned_position(
     const Game *game, MagpieCrossplayOwnedPosition *position) {
   memset(position, 0, sizeof(*position));

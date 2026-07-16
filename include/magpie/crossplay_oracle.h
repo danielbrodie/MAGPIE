@@ -169,6 +169,13 @@ MagpieCrossplayStatus magpie_crossplay_generate_actions(
 
 void magpie_crossplay_action_set_destroy(MagpieCrossplayActionSet *actions);
 
+// Verifies that a concrete hidden world has the same complete action-space
+// basis as the retained generation. This performs no move generation and does
+// not invalidate retained action handles.
+MagpieCrossplayStatus magpie_crossplay_validate_action_space_position(
+    MagpieCrossplayOracle *oracle, uint64_t native_generation,
+    const MagpieCrossplayPosition *position, MagpieCrossplayError *error);
+
 MagpieCrossplayStatus magpie_crossplay_apply_action(
     MagpieCrossplayOracle *oracle, uint64_t native_generation,
     uint64_t native_index, MagpieCrossplayTransitionSet *out_transitions,
