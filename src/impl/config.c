@@ -4082,6 +4082,7 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
   }
   bool allow_exchanges = true;
   bool reuse_verified_assets = false;
+  bool compact_best = false;
   const char *apply_action_id = NULL;
   const int arg_count =
       config_get_parg_num_set_values(config, ARG_TOKEN_CROSSPLAY_ORACLE);
@@ -4092,6 +4093,8 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
       allow_exchanges = false;
     } else if (strings_equal(option, "trustedassets")) {
       reuse_verified_assets = true;
+    } else if (strings_equal(option, "best")) {
+      compact_best = true;
     } else if (strings_equal(option, "apply") && apply_action_id == NULL &&
                arg_idx + 1 < arg_count) {
       apply_action_id = config_get_parg_value(
@@ -4100,8 +4103,8 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
       error_stack_push(
           error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
           string_duplicate(
-              "crossplayoracle options are noexch, trustedassets, and apply "
-              "<action_id>"));
+              "crossplayoracle options are noexch, trustedassets, best, and "
+              "apply <action_id>"));
       return;
     }
   }
@@ -4125,6 +4128,14 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
   }
 
   if (apply_action_id != NULL) {
+    if (compact_best) {
+      crossplay_oracle_action_set_destroy(&actions);
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+          string_duplicate(
+              "crossplayoracle best and apply are mutually exclusive"));
+      return;
+    }
     const CrossplayOracleAction *selected = NULL;
     for (int action_idx = 0; action_idx < actions.count; action_idx++) {
       if (strings_equal(actions.actions[action_idx].id, apply_action_id)) {
@@ -4194,6 +4205,46 @@ void impl_crossplay_oracle(Config *config, ErrorStack *error_stack) {
     thread_control_print(config->thread_control, rendered);
     free(rendered);
     crossplay_oracle_transition_set_destroy(&transitions);
+    crossplay_oracle_action_set_destroy(&actions);
+    return;
+  }
+
+  if (compact_best) {
+    const CrossplayOracleAction *selected = &actions.actions[0];
+    for (int action_idx = 1; action_idx < actions.count; action_idx++) {
+      const CrossplayOracleAction *candidate = &actions.actions[action_idx];
+      if (candidate->score > selected->score) {
+        selected = candidate;
+      }
+    }
+    StringBuilder *output = string_builder_create();
+    string_builder_add_formatted_string(
+        output,
+        "crossplay-oracle-selected protocol=crossplay-oracle-selected-v1 "
+        "count=%d digest=%s placements=%d exchanges=%d pass=%d complete=1 "
+        "rules=%s rules_digest=%s lexicon=%s lexicon_digest=%s layout=%s "
+        "layout_digest=%s distribution=%s distribution_digest=%s "
+        "blocklist_digest=%s\n",
+        actions.count, actions.digest, actions.coverage.placements,
+        actions.coverage.exchanges, actions.coverage.passes, manifest.rules_id,
+        manifest.rules_digest, manifest.lexicon_id, manifest.lexicon_digest,
+        manifest.layout_id, manifest.layout_digest, manifest.distribution_id,
+        manifest.distribution_digest, manifest.blocklist_digest);
+    for (int action_idx = 0; action_idx < actions.count; action_idx++) {
+      const CrossplayOracleAction *action = &actions.actions[action_idx];
+      if (action == selected) {
+        string_builder_add_formatted_string(
+            output, "crossplay-oracle-selected-action %s score=%d %s\n",
+            action->id, action->score, action->canonical_json);
+      } else {
+        string_builder_add_formatted_string(
+            output, "crossplay-oracle-action-id %s\n", action->id);
+      }
+    }
+    char *rendered = string_builder_dump(output, NULL);
+    string_builder_destroy(output);
+    thread_control_print(config->thread_control, rendered);
+    free(rendered);
     crossplay_oracle_action_set_destroy(&actions);
     return;
   }
