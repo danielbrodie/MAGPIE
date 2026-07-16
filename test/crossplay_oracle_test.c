@@ -158,6 +158,8 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
       "f72a97fe20a27d5b498528f238f8a3bd9ea88106dab96a14984bc9f3657eaa34");
   bool found_tosa = false;
   bool found_pass = false;
+  uint64_t tosa_generation = 0;
+  uint64_t tosa_index = 0;
   const uint8_t tosa[] = {20, 15, 19, 1};
   for (uint64_t action_idx = 0; action_idx < actions.count; action_idx++) {
     const MagpieCrossplayAction *action = &actions.actions[action_idx];
@@ -168,13 +170,38 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
           "d04d289dc4be5bbe028e20372d31aefe6c3a5fa1361b778a99c522ec4b484e8e");
     }
     if (action->kind == MAGPIE_CROSSPLAY_ACTION_PLACEMENT &&
+        action->orientation == MAGPIE_CROSSPLAY_ORIENTATION_HORIZONTAL &&
+        action->start_row == 12 && action->start_col == 5 &&
+        action->score == 14 &&
         action->word_length == sizeof(tosa) &&
         memcmp(action->word, tosa, sizeof(tosa)) == 0) {
       found_tosa = true;
+      tosa_generation = action->native_generation;
+      tosa_index = action->native_index;
     }
   }
   assert(found_pass);
   assert(found_tosa);
+
+  MagpieCrossplayTransitionSet transitions;
+  assert(magpie_crossplay_apply_action(oracle, tosa_generation, tosa_index,
+                                        &transitions, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_OK);
+  assert(transitions.complete == 1);
+  assert(transitions.count == 1);
+  assert(transitions.weight_mass == 1);
+  assert(transitions.transitions[0].weight == 1);
+  assert(transitions.transitions[0].draw_count == 4);
+  assert(transitions.transitions[0].bag_emptied == 1);
+  assert(transitions.transitions[0].position.bag_length == 0);
+  assert(transitions.transitions[0].position.scores[0] == 343);
+  assert(transitions.transitions[0].position.scores[1] == 380);
+  assert(transitions.transitions[0].position.player_on_turn == 1);
+  magpie_crossplay_transition_set_destroy(&transitions);
+  assert(transitions.transitions == NULL);
+  assert(magpie_crossplay_apply_action(oracle, tosa_generation + 1,
+                                        tosa_index, &transitions, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
   magpie_crossplay_action_set_destroy(&actions);
   assert(actions.actions == NULL);
   assert(actions.count == 0);

@@ -12,6 +12,8 @@ extern "C" {
 #define MAGPIE_CROSSPLAY_RACK_CAPACITY 7U
 #define MAGPIE_CROSSPLAY_WORD_CAPACITY 15U
 #define MAGPIE_CROSSPLAY_ERROR_MESSAGE_CAPACITY 512U
+#define MAGPIE_CROSSPLAY_POSITION_TILE_CAPACITY 128U
+#define MAGPIE_CROSSPLAY_TRANSITION_CAPACITY 128U
 
 typedef uint32_t MagpieCrossplayStatus;
 
@@ -87,6 +89,9 @@ typedef struct MagpieCrossplayPlacementTile {
 
 // All action storage is owned by the returned action set. Unused fixed-width
 // fields are zeroed. Action IDs and set digests are raw SHA-256 bytes.
+// native_generation/native_index are opaque session-local handles. They remain
+// valid only until the next magpie_crossplay_generate_actions call on that
+// session and must not be persisted as part of an action's stable identity.
 typedef struct MagpieCrossplayAction {
   MagpieCrossplayActionKind kind;
   MagpieCrossplayOrientation orientation;
@@ -102,6 +107,8 @@ typedef struct MagpieCrossplayAction {
       new_tiles[MAGPIE_CROSSPLAY_RACK_CAPACITY];
   uint8_t exchange_tiles[MAGPIE_CROSSPLAY_RACK_CAPACITY];
   uint8_t id[32];
+  uint64_t native_generation;
+  uint64_t native_index;
 } MagpieCrossplayAction;
 
 typedef struct MagpieCrossplayActionSet {
@@ -114,6 +121,36 @@ typedef struct MagpieCrossplayActionSet {
   uint8_t complete;
   uint8_t reserved[7];
 } MagpieCrossplayActionSet;
+
+typedef struct MagpieCrossplayOwnedPosition {
+  MagpieCrossplayBoardCell board_cells[MAGPIE_CROSSPLAY_BOARD_CELLS];
+  uint8_t player_racks[2][MAGPIE_CROSSPLAY_RACK_CAPACITY];
+  uint8_t player_rack_lengths[2];
+  uint8_t bag[MAGPIE_CROSSPLAY_POSITION_TILE_CAPACITY];
+  uint64_t bag_length;
+  int32_t scores[2];
+  uint8_t player_on_turn;
+  uint8_t starting_player;
+  uint8_t consecutive_scoreless_turns;
+  uint8_t reserved[5];
+} MagpieCrossplayOwnedPosition;
+
+typedef struct MagpieCrossplayTransition {
+  MagpieCrossplayOwnedPosition position;
+  int64_t weight;
+  uint8_t draw[MAGPIE_CROSSPLAY_RACK_CAPACITY];
+  uint8_t draw_count;
+  uint8_t bag_emptied;
+  uint8_t reserved[6];
+} MagpieCrossplayTransition;
+
+typedef struct MagpieCrossplayTransitionSet {
+  MagpieCrossplayTransition *transitions;
+  uint64_t count;
+  int64_t weight_mass;
+  uint8_t complete;
+  uint8_t reserved[7];
+} MagpieCrossplayTransitionSet;
 
 typedef struct MagpieCrossplayOracle MagpieCrossplayOracle;
 
@@ -131,6 +168,14 @@ MagpieCrossplayStatus magpie_crossplay_generate_actions(
     MagpieCrossplayError *error);
 
 void magpie_crossplay_action_set_destroy(MagpieCrossplayActionSet *actions);
+
+MagpieCrossplayStatus magpie_crossplay_apply_action(
+    MagpieCrossplayOracle *oracle, uint64_t native_generation,
+    uint64_t native_index, MagpieCrossplayTransitionSet *out_transitions,
+    MagpieCrossplayError *error);
+
+void magpie_crossplay_transition_set_destroy(
+    MagpieCrossplayTransitionSet *transitions);
 
 #ifdef __cplusplus
 }

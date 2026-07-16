@@ -30,6 +30,9 @@ struct MagpieCrossplayOracle {
   Config *config;
   Game *game;
   CrossplayOracleAssetManifest manifest;
+  CrossplayOracleActionSet generated_actions;
+  uint64_t generation;
+  bool has_generated_actions;
 };
 
 static void magpie_crossplay_error_reset(MagpieCrossplayError *error) {
@@ -226,6 +229,7 @@ MagpieCrossplayStatus magpie_crossplay_oracle_create(
 
 void magpie_crossplay_oracle_destroy(MagpieCrossplayOracle *oracle) {
   if (oracle != NULL) {
+    crossplay_oracle_action_set_destroy(&oracle->generated_actions);
     game_destroy(oracle->game);
     config_destroy(oracle->config);
     free(oracle);
@@ -371,11 +375,15 @@ static bool magpie_crossplay_hex_digest(const char *hex, uint8_t digest[32]) {
 
 static bool magpie_crossplay_export_action(const Game *game,
                                            const CrossplayOracleAction *source,
+                                           uint64_t generation,
+                                           uint64_t native_index,
                                            MagpieCrossplayAction *dest) {
   memset(dest, 0, sizeof(*dest));
   dest->kind = (uint8_t)source->kind;
   dest->orientation = MAGPIE_CROSSPLAY_ORIENTATION_NONE;
   dest->score = source->score;
+  dest->native_generation = generation;
+  dest->native_index = native_index;
   if (!magpie_crossplay_hex_digest(source->id, dest->id)) {
     return false;
   }
@@ -450,18 +458,21 @@ MagpieCrossplayStatus magpie_crossplay_generate_actions(
         "oracle, position, output, and boolean exchange policy are required");
   }
   memset(out_actions, 0, sizeof(*out_actions));
+  crossplay_oracle_action_set_destroy(&oracle->generated_actions);
+  oracle->has_generated_actions = false;
   if (!magpie_crossplay_load_position(oracle, position)) {
     return magpie_crossplay_error_set(
         error, MAGPIE_CROSSPLAY_STATUS_POSITION_INVALID, 0,
         "position is malformed or violates exact tile conservation");
   }
 
-  CrossplayOracleActionSet internal = {0};
   const CrossplayOracleStatus internal_status =
       crossplay_oracle_generate_actions(oracle->game, (int)position->bag.length,
-                                        allow_exchanges != 0, &internal);
-  if (internal_status != CROSSPLAY_ORACLE_OK || !internal.coverage.complete) {
-    crossplay_oracle_action_set_destroy(&internal);
+                                        allow_exchanges != 0,
+                                        &oracle->generated_actions);
+  CrossplayOracleActionSet *internal = &oracle->generated_actions;
+  if (internal_status != CROSSPLAY_ORACLE_OK || !internal->coverage.complete) {
+    crossplay_oracle_action_set_destroy(internal);
     const MagpieCrossplayStatus status =
         internal_status == CROSSPLAY_ORACLE_CAPACITY_EXCEEDED
             ? MAGPIE_CROSSPLAY_STATUS_CAPACITY_EXCEEDED
@@ -472,34 +483,40 @@ MagpieCrossplayStatus magpie_crossplay_generate_actions(
   }
 
   MagpieCrossplayAction *actions =
-      calloc((size_t)internal.count, sizeof(*actions));
-  if (actions == NULL || !magpie_crossplay_hex_digest(internal.digest,
+      calloc((size_t)internal->count, sizeof(*actions));
+  if (actions == NULL || !magpie_crossplay_hex_digest(internal->digest,
                                                        out_actions->digest)) {
     free(actions);
-    crossplay_oracle_action_set_destroy(&internal);
+    crossplay_oracle_action_set_destroy(internal);
     return magpie_crossplay_error_set(
         error, MAGPIE_CROSSPLAY_STATUS_ENGINE_ERROR, 0,
         "could not allocate or decode the complete action set");
   }
-  for (int action_idx = 0; action_idx < internal.count; action_idx++) {
+  oracle->generation++;
+  if (oracle->generation == 0) {
+    oracle->generation++;
+  }
+  for (int action_idx = 0; action_idx < internal->count; action_idx++) {
     if (!magpie_crossplay_export_action(oracle->game,
-                                        &internal.actions[action_idx],
+                                        &internal->actions[action_idx],
+                                        oracle->generation,
+                                        (uint64_t)action_idx,
                                         &actions[action_idx])) {
       free(actions);
       memset(out_actions, 0, sizeof(*out_actions));
-      crossplay_oracle_action_set_destroy(&internal);
+      crossplay_oracle_action_set_destroy(internal);
       return magpie_crossplay_error_set(
           error, MAGPIE_CROSSPLAY_STATUS_ENGINE_ERROR, 0,
           "native action cannot be represented by ABI version 1");
     }
   }
   out_actions->actions = actions;
-  out_actions->count = (uint64_t)internal.count;
-  out_actions->placements = (uint64_t)internal.coverage.placements;
-  out_actions->exchanges = (uint64_t)internal.coverage.exchanges;
-  out_actions->passes = (uint64_t)internal.coverage.passes;
+  out_actions->count = (uint64_t)internal->count;
+  out_actions->placements = (uint64_t)internal->coverage.placements;
+  out_actions->exchanges = (uint64_t)internal->coverage.exchanges;
+  out_actions->passes = (uint64_t)internal->coverage.passes;
   out_actions->complete = 1;
-  crossplay_oracle_action_set_destroy(&internal);
+  oracle->has_generated_actions = true;
   return MAGPIE_CROSSPLAY_STATUS_OK;
 }
 
@@ -507,5 +524,131 @@ void magpie_crossplay_action_set_destroy(MagpieCrossplayActionSet *actions) {
   if (actions != NULL) {
     free(actions->actions);
     memset(actions, 0, sizeof(*actions));
+  }
+}
+
+static bool magpie_crossplay_export_owned_position(
+    const Game *game, MagpieCrossplayOwnedPosition *position) {
+  memset(position, 0, sizeof(*position));
+  const Board *board = game_get_board(game);
+  for (int row = 0; row < BOARD_DIM; row++) {
+    for (int col = 0; col < BOARD_DIM; col++) {
+      const MachineLetter letter = board_get_letter(board, row, col);
+      if (letter == ALPHABET_EMPTY_SQUARE_MARKER) {
+        continue;
+      }
+      MagpieCrossplayBoardCell *cell =
+          &position->board_cells[row * BOARD_DIM + col];
+      cell->letter = get_unblanked_machine_letter(letter);
+      cell->is_blank = get_is_blanked(letter) ? 1 : 0;
+    }
+  }
+  for (int player_idx = 0; player_idx < 2; player_idx++) {
+    const Rack *rack = player_get_rack(game_get_player(game, player_idx));
+    int count = 0;
+    for (int tile = 0; tile < 27; tile++) {
+      for (int copy = 0;
+           copy < rack_get_letter(rack, (MachineLetter)tile); copy++) {
+        if (count >= (int)MAGPIE_CROSSPLAY_RACK_CAPACITY) {
+          return false;
+        }
+        position->player_racks[player_idx][count++] = (uint8_t)tile;
+      }
+    }
+    position->player_rack_lengths[player_idx] = (uint8_t)count;
+  }
+  const int bag_count = bag_get_letters(game_get_bag(game));
+  if (bag_count < 0 ||
+      bag_count > (int)MAGPIE_CROSSPLAY_POSITION_TILE_CAPACITY) {
+    return false;
+  }
+  position->bag_length = (uint64_t)bag_count;
+  bag_peek_tiles(game_get_bag(game), position->bag);
+  position->scores[0] =
+      equity_to_int(player_get_score(game_get_player(game, 0)));
+  position->scores[1] =
+      equity_to_int(player_get_score(game_get_player(game, 1)));
+  position->player_on_turn = (uint8_t)game_get_player_on_turn_index(game);
+  position->starting_player = (uint8_t)game_get_starting_player_index(game);
+  position->consecutive_scoreless_turns =
+      (uint8_t)game_get_consecutive_scoreless_turns(game);
+  return true;
+}
+
+MagpieCrossplayStatus magpie_crossplay_apply_action(
+    MagpieCrossplayOracle *oracle, uint64_t native_generation,
+    uint64_t native_index, MagpieCrossplayTransitionSet *out_transitions,
+    MagpieCrossplayError *error) {
+  magpie_crossplay_error_reset(error);
+  if (oracle == NULL || out_transitions == NULL) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "oracle and transition output are required");
+  }
+  memset(out_transitions, 0, sizeof(*out_transitions));
+  if (!oracle->has_generated_actions ||
+      native_generation != oracle->generation ||
+      native_index >= (uint64_t)oracle->generated_actions.count) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "action handle is stale or does not belong to this session");
+  }
+  CrossplayOracleTransitionSet internal = {0};
+  const CrossplayOracleStatus internal_status = crossplay_oracle_apply_action(
+      oracle->game,
+      &oracle->generated_actions.actions[(size_t)native_index],
+      &internal);
+  if (internal_status != CROSSPLAY_ORACLE_OK || !internal.complete ||
+      internal.count <= 0 ||
+      internal.count > (int)MAGPIE_CROSSPLAY_TRANSITION_CAPACITY ||
+      internal.weight_mass <= 0) {
+    crossplay_oracle_transition_set_destroy(&internal);
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_ENGINE_ERROR,
+        (uint32_t)internal_status, crossplay_oracle_status_name(internal_status));
+  }
+  MagpieCrossplayTransition *transitions =
+      calloc((size_t)internal.count, sizeof(*transitions));
+  if (transitions == NULL) {
+    crossplay_oracle_transition_set_destroy(&internal);
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_ENGINE_ERROR, 0,
+        "could not allocate transition set");
+  }
+  for (int transition_idx = 0; transition_idx < internal.count;
+       transition_idx++) {
+    const CrossplayOracleTransition *source =
+        &internal.transitions[transition_idx];
+    MagpieCrossplayTransition *dest = &transitions[transition_idx];
+    if (source->game == NULL || source->draw.count < 0 ||
+        source->draw.count > (int)MAGPIE_CROSSPLAY_RACK_CAPACITY ||
+        source->draw.weight <= 0 ||
+        !magpie_crossplay_export_owned_position(source->game,
+                                                &dest->position)) {
+      free(transitions);
+      crossplay_oracle_transition_set_destroy(&internal);
+      return magpie_crossplay_error_set(
+          error, MAGPIE_CROSSPLAY_STATUS_CAPACITY_EXCEEDED, 0,
+          "transition position exceeds ABI capacity");
+    }
+    dest->weight = source->draw.weight;
+    dest->draw_count = (uint8_t)source->draw.count;
+    memcpy(dest->draw, source->draw.tiles,
+           (size_t)source->draw.count * sizeof(*dest->draw));
+    dest->bag_emptied = source->bag_emptied ? 1 : 0;
+  }
+  out_transitions->transitions = transitions;
+  out_transitions->count = (uint64_t)internal.count;
+  out_transitions->weight_mass = internal.weight_mass;
+  out_transitions->complete = 1;
+  crossplay_oracle_transition_set_destroy(&internal);
+  return MAGPIE_CROSSPLAY_STATUS_OK;
+}
+
+void magpie_crossplay_transition_set_destroy(
+    MagpieCrossplayTransitionSet *transitions) {
+  if (transitions != NULL) {
+    free(transitions->transitions);
+    memset(transitions, 0, sizeof(*transitions));
   }
 }
