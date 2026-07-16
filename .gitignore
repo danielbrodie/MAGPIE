@@ -8,6 +8,9 @@ covhtml
 *.info
 *.out
 magpie*
+!include/
+!include/magpie/
+!include/magpie/*.h
 dev/*.txt
 perf*
 .env

@@ -82,12 +82,17 @@ ifeq ($(OS),Windows_NT)
 LDLIBS += -lsystre -ltre
 endif
 
-.PHONY: all clean iwyu
+.PHONY: all clean crossplay_lib iwyu
 
 all: magpie magpie_test
 
 libmagpie_core.a: $(OBJ_SRC)
 	ar rcs $@ $^
+
+libmagpie_crossplay.a: $(OBJ_SRC)
+	ar rcs $@ $^
+
+crossplay_lib: libmagpie_crossplay.a
 
 magpie: $(OBJ_SRC) $(OBJ_CMD) | $(BIN_DIR)
 	$(CC) $(LDFLAGS) $(LFLAGS) $^ $(LDLIBS) -o $(BIN_DIR)/$@
@@ -109,7 +114,7 @@ $(BIN_DIR) $(OBJ_DIR) $(OBJ_DIR)/$(SRC_DIR) $(OBJ_DIR)/$(CMD_DIR) $(OBJ_DIR)/$(T
 	mkdir -p $@
 
 clean:
-	@$(RM) -rv $(BIN_DIR) $(OBJ_DIR) libmagpie_core.a
+	@$(RM) -rv $(BIN_DIR) $(OBJ_DIR) libmagpie_core.a libmagpie_crossplay.a
 
 -include $(OBJ_SRC:.o=.d)
 -include $(OBJ_CMD:.o=.d)

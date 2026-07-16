@@ -10,6 +10,7 @@
 #include "../src/impl/crossplay_oracle_assets.h"
 #include "../src/util/io_util.h"
 #include "../src/util/sha256.h"
+#include "../include/magpie/crossplay_oracle.h"
 #include "test_util.h"
 #include <assert.h>
 #include <stdlib.h>
@@ -34,6 +35,160 @@ static Config *crossplay_oracle_test_config(void) {
   return config_create_or_die(
       "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
       "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 1");
+}
+
+static uint8_t crossplay_oracle_test_hex_nibble(char value) {
+  if (value >= '0' && value <= '9') {
+    return (uint8_t)(value - '0');
+  }
+  assert(value >= 'a' && value <= 'f');
+  return (uint8_t)(value - 'a' + 10);
+}
+
+static void crossplay_oracle_test_assert_raw_digest(
+    const uint8_t actual[32], const char *expected) {
+  assert(strlen(expected) == 64);
+  for (int byte_idx = 0; byte_idx < 32; byte_idx++) {
+    const uint8_t high =
+        crossplay_oracle_test_hex_nibble(expected[byte_idx * 2]);
+    const uint8_t low =
+        crossplay_oracle_test_hex_nibble(expected[byte_idx * 2 + 1]);
+    assert(actual[byte_idx] == (uint8_t)((high << 4) | low));
+  }
+}
+
+static int crossplay_oracle_test_export_rack(const Rack *rack,
+                                             uint8_t tiles[RACK_SIZE]) {
+  int count = 0;
+  for (int tile = 0; tile < 27; tile++) {
+    for (int copy = 0; copy < rack_get_letter(rack, (MachineLetter)tile);
+         copy++) {
+      assert(count < RACK_SIZE);
+      tiles[count++] = (uint8_t)tile;
+    }
+  }
+  return count;
+}
+
+static MagpieCrossplayPosition crossplay_oracle_test_export_position(
+    const Game *game,
+    MagpieCrossplayBoardCell board_cells[MAGPIE_CROSSPLAY_BOARD_CELLS],
+    uint8_t player0_rack[RACK_SIZE], uint8_t player1_rack[RACK_SIZE],
+    uint8_t bag_tiles[MAX_BAG_SIZE]) {
+  memset(board_cells, 0,
+         sizeof(*board_cells) * MAGPIE_CROSSPLAY_BOARD_CELLS);
+  const Board *board = game_get_board(game);
+  for (int row = 0; row < BOARD_DIM; row++) {
+    for (int col = 0; col < BOARD_DIM; col++) {
+      const MachineLetter letter = board_get_letter(board, row, col);
+      if (letter == ALPHABET_EMPTY_SQUARE_MARKER) {
+        continue;
+      }
+      MagpieCrossplayBoardCell *cell =
+          &board_cells[row * BOARD_DIM + col];
+      cell->letter = get_unblanked_machine_letter(letter);
+      cell->is_blank = get_is_blanked(letter) ? 1 : 0;
+    }
+  }
+  const int player0_count = crossplay_oracle_test_export_rack(
+      player_get_rack(game_get_player(game, 0)), player0_rack);
+  const int player1_count = crossplay_oracle_test_export_rack(
+      player_get_rack(game_get_player(game, 1)), player1_rack);
+  const int bag_count = bag_peek_tiles(game_get_bag(game), bag_tiles);
+  MagpieCrossplayPosition position = {
+      .board_cells = board_cells,
+      .board_cell_count = MAGPIE_CROSSPLAY_BOARD_CELLS,
+      .player_racks =
+          {
+              {.data = player0_rack, .length = (uint64_t)player0_count},
+              {.data = player1_rack, .length = (uint64_t)player1_count},
+          },
+      .bag = {.data = bag_tiles, .length = (uint64_t)bag_count},
+      .scores =
+          {
+              equity_to_int(player_get_score(game_get_player(game, 0))),
+              equity_to_int(player_get_score(game_get_player(game, 1))),
+          },
+      .player_on_turn = (uint8_t)game_get_player_on_turn_index(game),
+      .starting_player = (uint8_t)game_get_starting_player_index(game),
+      .consecutive_scoreless_turns =
+          (uint8_t)game_get_consecutive_scoreless_turns(game),
+  };
+  return position;
+}
+
+static void crossplay_oracle_test_public_abi(const char *manifest_path) {
+  assert(magpie_crossplay_abi_version() == MAGPIE_CROSSPLAY_ABI_VERSION);
+  const char *data_paths = DEFAULT_TEST_DATA_PATH;
+  const MagpieCrossplayAssets assets = {
+      .data_paths =
+          {.data = (const uint8_t *)data_paths, .length = strlen(data_paths)},
+      .manifest_path =
+          {.data = (const uint8_t *)manifest_path,
+           .length = strlen(manifest_path)},
+  };
+  MagpieCrossplayOracle *oracle = NULL;
+  MagpieCrossplayError error;
+  assert(magpie_crossplay_oracle_create(&assets, &oracle, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_OK);
+  assert(oracle != NULL);
+  assert(error.status == MAGPIE_CROSSPLAY_STATUS_OK);
+
+  Config *config = crossplay_oracle_test_config();
+  load_and_exec_config_or_die(config, CONCRETE_SENATOR_CGP);
+  MagpieCrossplayBoardCell board_cells[MAGPIE_CROSSPLAY_BOARD_CELLS];
+  uint8_t player0_rack[RACK_SIZE];
+  uint8_t player1_rack[RACK_SIZE];
+  uint8_t bag_tiles[MAX_BAG_SIZE];
+  MagpieCrossplayPosition position = crossplay_oracle_test_export_position(
+      config_get_game(config), board_cells, player0_rack, player1_rack,
+      bag_tiles);
+
+  MagpieCrossplayActionSet actions;
+  assert(magpie_crossplay_generate_actions(oracle, &position, 1, &actions,
+                                            &error) ==
+         MAGPIE_CROSSPLAY_STATUS_OK);
+  assert(actions.complete == 1);
+  assert(actions.count == 1314);
+  assert(actions.placements == 1215);
+  assert(actions.exchanges == 98);
+  assert(actions.passes == 1);
+  crossplay_oracle_test_assert_raw_digest(
+      actions.digest,
+      "f72a97fe20a27d5b498528f238f8a3bd9ea88106dab96a14984bc9f3657eaa34");
+  bool found_tosa = false;
+  bool found_pass = false;
+  const uint8_t tosa[] = {20, 15, 19, 1};
+  for (uint64_t action_idx = 0; action_idx < actions.count; action_idx++) {
+    const MagpieCrossplayAction *action = &actions.actions[action_idx];
+    if (action->kind == MAGPIE_CROSSPLAY_ACTION_PASS) {
+      found_pass = true;
+      crossplay_oracle_test_assert_raw_digest(
+          action->id,
+          "d04d289dc4be5bbe028e20372d31aefe6c3a5fa1361b778a99c522ec4b484e8e");
+    }
+    if (action->kind == MAGPIE_CROSSPLAY_ACTION_PLACEMENT &&
+        action->word_length == sizeof(tosa) &&
+        memcmp(action->word, tosa, sizeof(tosa)) == 0) {
+      found_tosa = true;
+    }
+  }
+  assert(found_pass);
+  assert(found_tosa);
+  magpie_crossplay_action_set_destroy(&actions);
+  assert(actions.actions == NULL);
+  assert(actions.count == 0);
+
+  const uint8_t saved_bag_tile = bag_tiles[0];
+  bag_tiles[0] = bag_tiles[0] == 1 ? 2 : 1;
+  assert(magpie_crossplay_generate_actions(oracle, &position, 1, &actions,
+                                            &error) ==
+         MAGPIE_CROSSPLAY_STATUS_POSITION_INVALID);
+  assert(error.status == MAGPIE_CROSSPLAY_STATUS_POSITION_INVALID);
+  bag_tiles[0] = saved_bag_tile;
+
+  config_destroy(config);
+  magpie_crossplay_oracle_destroy(oracle);
 }
 
 static void test_sha256_known_vector(void) {
@@ -215,6 +370,8 @@ static void test_asset_manifest_verification(void) {
   assert(error_stack_is_empty(error_stack));
   free(six_arg_command);
   config_destroy(config);
+
+  crossplay_oracle_test_public_abi(manifest_path);
 
   manifest.lexicon_digest[0] = manifest.lexicon_digest[0] == '0' ? '1' : '0';
   assert(!crossplay_oracle_asset_manifest_verify(
