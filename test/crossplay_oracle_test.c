@@ -161,6 +161,7 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
   int maximum_action_score = 0;
   uint64_t tosa_generation = 0;
   uint64_t tosa_index = 0;
+  MagpieCrossplayAction detached_tosa = {0};
   const uint8_t tosa[] = {20, 15, 19, 1};
   for (uint64_t action_idx = 0; action_idx < actions.count; action_idx++) {
     const MagpieCrossplayAction *action = &actions.actions[action_idx];
@@ -182,6 +183,9 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
       found_tosa = true;
       tosa_generation = action->native_generation;
       tosa_index = action->native_index;
+      detached_tosa = *action;
+      detached_tosa.native_generation = 0;
+      detached_tosa.native_index = 0;
     }
   }
   assert(found_pass);
@@ -295,6 +299,32 @@ static void crossplay_oracle_test_public_abi(const char *manifest_path) {
 
   assert(magpie_crossplay_apply_action(oracle, tosa_generation + 1,
                                         tosa_index, &transitions, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
+  assert(magpie_crossplay_apply_detached_action_to_position(
+             oracle, &detached_tosa, &position, &transitions, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_OK);
+  assert(transitions.complete == 1);
+  assert(transitions.count == 1);
+  assert(transitions.transitions[0].position.scores[0] == 343);
+  magpie_crossplay_transition_set_destroy(&transitions);
+  detached_tosa.score++;
+  assert(magpie_crossplay_apply_detached_action_to_position(
+             oracle, &detached_tosa, &position, &transitions, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
+  detached_tosa.score--;
+  detached_tosa.id[0] ^= 1;
+  assert(magpie_crossplay_apply_detached_action_to_position(
+             oracle, &detached_tosa, &position, &transitions, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
+  detached_tosa.id[0] ^= 1;
+  detached_tosa.native_index = 1;
+  assert(magpie_crossplay_apply_detached_action_to_position(
+             oracle, &detached_tosa, &position, &transitions, &error) ==
+         MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
+  detached_tosa.native_index = 0;
+  detached_tosa.word[MAGPIE_CROSSPLAY_WORD_CAPACITY - 1] = 1;
+  assert(magpie_crossplay_apply_detached_action_to_position(
+             oracle, &detached_tosa, &position, &transitions, &error) ==
          MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT);
   magpie_crossplay_action_set_destroy(&actions);
   assert(actions.actions == NULL);

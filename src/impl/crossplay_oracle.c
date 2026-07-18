@@ -162,6 +162,23 @@ static void crossplay_oracle_action_id(CrossplayOracleAction *action) {
   sha256_final_hex(&sha, action->id);
 }
 
+CrossplayOracleStatus crossplay_oracle_prepare_action(
+    const Game *game, CrossplayOracleAction *action) {
+  if (game == NULL || action == NULL || action->canonical_json != NULL ||
+      (action->kind != CROSSPLAY_ORACLE_PLACEMENT &&
+       action->kind != CROSSPLAY_ORACLE_EXCHANGE &&
+       action->kind != CROSSPLAY_ORACLE_PASS)) {
+    return CROSSPLAY_ORACLE_INVALID_INPUT;
+  }
+  action->canonical_json = crossplay_oracle_action_json(
+      action, game_get_board(game), game_get_ld(game));
+  if (action->canonical_json == NULL) {
+    return CROSSPLAY_ORACLE_ENCODING_ERROR;
+  }
+  crossplay_oracle_action_id(action);
+  return CROSSPLAY_ORACLE_OK;
+}
+
 static void crossplay_oracle_exchange_rec(
     const int *counts, int ld_size, int start_ml, int tiles_left,
     MachineLetter *chosen, int chosen_count,
@@ -641,18 +658,17 @@ CrossplayOracleStatus crossplay_oracle_generate_actions(
   }
   result->actions[action_count++].kind = CROSSPLAY_ORACLE_PASS;
 
-  const LetterDistribution *ld = game_get_ld(working_game);
   for (int action_idx = 0; action_idx < action_count; action_idx++) {
     CrossplayOracleAction *action = &result->actions[action_idx];
-    action->canonical_json = crossplay_oracle_action_json(action, board, ld);
-    if (action->canonical_json == NULL) {
+    const CrossplayOracleStatus prepare_status =
+        crossplay_oracle_prepare_action(working_game, action);
+    if (prepare_status != CROSSPLAY_ORACLE_OK) {
       result->count = action_count;
       crossplay_oracle_action_set_destroy(result);
       move_list_destroy(moves);
       game_destroy(working_game);
-      return CROSSPLAY_ORACLE_ENCODING_ERROR;
+      return prepare_status;
     }
-    crossplay_oracle_action_id(action);
   }
   result->count = action_count;
   qsort(result->actions, (size_t)result->count, sizeof(*result->actions),

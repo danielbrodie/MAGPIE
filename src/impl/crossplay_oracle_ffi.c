@@ -13,6 +13,7 @@
 #include "../ent/player.h"
 #include "../ent/players_data.h"
 #include "../ent/rack.h"
+#include "../ent/static_eval.h"
 #include "../ent/thread_control.h"
 #include "../util/io_util.h"
 #include "crossplay_oracle.h"
@@ -714,15 +715,13 @@ static bool magpie_crossplay_export_owned_position(
   return true;
 }
 
-static MagpieCrossplayStatus magpie_crossplay_apply_retained_action(
-    MagpieCrossplayOracle *oracle, uint64_t native_index,
+static MagpieCrossplayStatus magpie_crossplay_apply_internal_action(
+    MagpieCrossplayOracle *oracle, const CrossplayOracleAction *action,
     MagpieCrossplayTransitionSet *out_transitions,
     MagpieCrossplayError *error) {
   CrossplayOracleTransitionSet internal = {0};
   const CrossplayOracleStatus internal_status = crossplay_oracle_apply_action(
-      oracle->game,
-      &oracle->generated_actions.actions[(size_t)native_index],
-      &internal);
+      oracle->game, action, &internal);
   if (internal_status != CROSSPLAY_ORACLE_OK || !internal.complete ||
       internal.count <= 0 ||
       internal.count > (int)MAGPIE_CROSSPLAY_TRANSITION_CAPACITY ||
@@ -770,6 +769,184 @@ static MagpieCrossplayStatus magpie_crossplay_apply_retained_action(
   return MAGPIE_CROSSPLAY_STATUS_OK;
 }
 
+static bool magpie_crossplay_import_detached_action(
+    const Game *game, const MagpieCrossplayAction *source,
+    CrossplayOracleAction *dest) {
+  memset(dest, 0, sizeof(*dest));
+  if (game == NULL || source == NULL || source->score < 0 ||
+      source->score > EQUITY_MAX_VALUE / EQUITY_RESOLUTION ||
+      source->reserved != 0 || source->native_generation != 0 ||
+      source->native_index != 0) {
+    return false;
+  }
+  if (source->kind == MAGPIE_CROSSPLAY_ACTION_PASS) {
+    if (source->score != 0 || source->word_length != 0 ||
+        source->new_tile_count != 0 || source->exchange_count != 0 ||
+        source->orientation != MAGPIE_CROSSPLAY_ORIENTATION_NONE ||
+        source->start_row != 0 || source->start_col != 0) {
+      return false;
+    }
+    for (int idx = 0; idx < MAGPIE_CROSSPLAY_WORD_CAPACITY; idx++) {
+      if (source->word[idx] != 0) {
+        return false;
+      }
+    }
+    for (int idx = 0; idx < MAGPIE_CROSSPLAY_RACK_CAPACITY; idx++) {
+      if (source->new_tiles[idx].row != 0 ||
+          source->new_tiles[idx].col != 0 ||
+          source->new_tiles[idx].letter != 0 ||
+          source->new_tiles[idx].is_blank != 0 ||
+          source->exchange_tiles[idx] != 0) {
+        return false;
+      }
+    }
+    dest->kind = CROSSPLAY_ORACLE_PASS;
+  } else if (source->kind == MAGPIE_CROSSPLAY_ACTION_EXCHANGE) {
+    if (source->score != 0 || source->word_length != 0 ||
+        source->new_tile_count != 0 || source->exchange_count < 1 ||
+        source->exchange_count > MAGPIE_CROSSPLAY_RACK_CAPACITY ||
+        source->orientation != MAGPIE_CROSSPLAY_ORIENTATION_NONE ||
+        source->start_row != 0 || source->start_col != 0) {
+      return false;
+    }
+    for (int idx = 0; idx < MAGPIE_CROSSPLAY_WORD_CAPACITY; idx++) {
+      if (source->word[idx] != 0) {
+        return false;
+      }
+    }
+    for (int idx = 0; idx < MAGPIE_CROSSPLAY_RACK_CAPACITY; idx++) {
+      if (source->new_tiles[idx].row != 0 ||
+          source->new_tiles[idx].col != 0 ||
+          source->new_tiles[idx].letter != 0 ||
+          source->new_tiles[idx].is_blank != 0 ||
+          (idx >= source->exchange_count && source->exchange_tiles[idx] != 0)) {
+        return false;
+      }
+    }
+    dest->kind = CROSSPLAY_ORACLE_EXCHANGE;
+    dest->exchange_count = source->exchange_count;
+    for (int tile_idx = 0; tile_idx < dest->exchange_count; tile_idx++) {
+      const uint8_t tile = source->exchange_tiles[tile_idx];
+      if (tile > 26 ||
+          (tile_idx > 0 && source->exchange_tiles[tile_idx - 1] > tile)) {
+        return false;
+      }
+      dest->exchange_tiles[tile_idx] = (MachineLetter)tile;
+    }
+  } else if (source->kind == MAGPIE_CROSSPLAY_ACTION_PLACEMENT) {
+    if ((source->orientation != MAGPIE_CROSSPLAY_ORIENTATION_HORIZONTAL &&
+         source->orientation != MAGPIE_CROSSPLAY_ORIENTATION_VERTICAL) ||
+        source->start_row >= BOARD_DIM || source->start_col >= BOARD_DIM ||
+        source->word_length < 1 || source->word_length > BOARD_DIM ||
+        source->new_tile_count < 1 ||
+        source->new_tile_count > MAGPIE_CROSSPLAY_RACK_CAPACITY ||
+        source->exchange_count != 0) {
+      return false;
+    }
+    for (int idx = source->word_length;
+         idx < MAGPIE_CROSSPLAY_WORD_CAPACITY; idx++) {
+      if (source->word[idx] != 0) {
+        return false;
+      }
+    }
+    for (int idx = 0; idx < MAGPIE_CROSSPLAY_RACK_CAPACITY; idx++) {
+      if (source->exchange_tiles[idx] != 0 ||
+          (idx >= source->new_tile_count &&
+           (source->new_tiles[idx].row != 0 ||
+            source->new_tiles[idx].col != 0 ||
+            source->new_tiles[idx].letter != 0 ||
+            source->new_tiles[idx].is_blank != 0))) {
+        return false;
+      }
+    }
+    const int direction =
+        source->orientation == MAGPIE_CROSSPLAY_ORIENTATION_HORIZONTAL
+            ? BOARD_HORIZONTAL_DIRECTION
+            : BOARD_VERTICAL_DIRECTION;
+    const int row_increment =
+        direction == BOARD_VERTICAL_DIRECTION ? 1 : 0;
+    const int col_increment =
+        direction == BOARD_HORIZONTAL_DIRECTION ? 1 : 0;
+    const Board *board = game_get_board(game);
+    MachineLetter strip[BOARD_DIM] = {0};
+    int needed[27] = {0};
+    int next_new_tile = 0;
+    for (int word_idx = 0; word_idx < source->word_length; word_idx++) {
+      const int row = source->start_row + row_increment * word_idx;
+      const int col = source->start_col + col_increment * word_idx;
+      const MachineLetter word_letter = source->word[word_idx];
+      if (row >= BOARD_DIM || col >= BOARD_DIM || word_letter < 1 ||
+          word_letter > 26) {
+        return false;
+      }
+      const bool is_new = next_new_tile < source->new_tile_count &&
+                          source->new_tiles[next_new_tile].row == row &&
+                          source->new_tiles[next_new_tile].col == col;
+      const MachineLetter board_letter = board_get_letter(board, row, col);
+      if (is_new) {
+        const MagpieCrossplayPlacementTile *tile =
+            &source->new_tiles[next_new_tile++];
+        if (board_letter != ALPHABET_EMPTY_SQUARE_MARKER ||
+            tile->letter != word_letter || tile->is_blank > 1) {
+          return false;
+        }
+        strip[word_idx] = tile->is_blank
+                              ? get_blanked_machine_letter(word_letter)
+                              : word_letter;
+        needed[tile->is_blank ? BLANK_MACHINE_LETTER : word_letter]++;
+      } else {
+        if (board_letter == ALPHABET_EMPTY_SQUARE_MARKER ||
+            get_unblanked_machine_letter(board_letter) != word_letter) {
+          return false;
+        }
+        strip[word_idx] = PLAYED_THROUGH_MARKER;
+      }
+    }
+    if (next_new_tile != source->new_tile_count) {
+      return false;
+    }
+    const int actor = game_get_player_on_turn_index(game);
+    const Rack *rack = player_get_rack(game_get_player(game, actor));
+    for (int ml = 0; ml < 27; ml++) {
+      if (needed[ml] > rack_get_letter(rack, (MachineLetter)ml)) {
+        return false;
+      }
+    }
+    dest->kind = CROSSPLAY_ORACLE_PLACEMENT;
+    dest->score = source->score;
+    move_set_all(&dest->move, strip, 0, source->word_length - 1,
+                 int_to_equity(source->score), source->start_row,
+                 source->start_col, source->new_tile_count, direction,
+                 GAME_EVENT_TILE_PLACEMENT_MOVE, 0);
+    const Equity verified_score = static_eval_get_move_score(
+        game_get_ld(game), &dest->move, game_get_board(game),
+        game_get_bingo_bonus(game),
+        board_get_cross_set_index(
+            game_get_data_is_shared(game, PLAYERS_DATA_TYPE_KWG), actor));
+    if (equity_to_int(verified_score) != source->score) {
+      return false;
+    }
+    move_set_score(&dest->move, verified_score);
+  } else {
+    return false;
+  }
+  const CrossplayOracleStatus prepare_status =
+      crossplay_oracle_prepare_action(game, dest);
+  if (prepare_status != CROSSPLAY_ORACLE_OK) {
+    free(dest->canonical_json);
+    memset(dest, 0, sizeof(*dest));
+    return false;
+  }
+  uint8_t expected_id[32];
+  if (!magpie_crossplay_hex_digest(dest->id, expected_id) ||
+      memcmp(expected_id, source->id, sizeof(expected_id)) != 0) {
+    free(dest->canonical_json);
+    memset(dest, 0, sizeof(*dest));
+    return false;
+  }
+  return true;
+}
+
 static MagpieCrossplayStatus magpie_crossplay_validate_action_handle(
     MagpieCrossplayOracle *oracle, uint64_t native_generation,
     uint64_t native_index, MagpieCrossplayTransitionSet *out_transitions,
@@ -801,8 +978,9 @@ MagpieCrossplayStatus magpie_crossplay_apply_action(
   if (validation != MAGPIE_CROSSPLAY_STATUS_OK) {
     return validation;
   }
-  return magpie_crossplay_apply_retained_action(
-      oracle, native_index, out_transitions, error);
+  return magpie_crossplay_apply_internal_action(
+      oracle, &oracle->generated_actions.actions[(size_t)native_index],
+      out_transitions, error);
 }
 
 MagpieCrossplayStatus magpie_crossplay_apply_action_to_position(
@@ -827,8 +1005,40 @@ MagpieCrossplayStatus magpie_crossplay_apply_action_to_position(
         error, MAGPIE_CROSSPLAY_STATUS_POSITION_INVALID, 0,
         "position is malformed or violates exact tile conservation");
   }
-  return magpie_crossplay_apply_retained_action(
-      oracle, native_index, out_transitions, error);
+  return magpie_crossplay_apply_internal_action(
+      oracle, &oracle->generated_actions.actions[(size_t)native_index],
+      out_transitions, error);
+}
+
+MagpieCrossplayStatus magpie_crossplay_apply_detached_action_to_position(
+    MagpieCrossplayOracle *oracle, const MagpieCrossplayAction *action,
+    const MagpieCrossplayPosition *position,
+    MagpieCrossplayTransitionSet *out_transitions,
+    MagpieCrossplayError *error) {
+  magpie_crossplay_error_reset(error);
+  if (oracle == NULL || action == NULL || position == NULL ||
+      out_transitions == NULL) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "oracle, action, position, and transition output are required");
+  }
+  memset(out_transitions, 0, sizeof(*out_transitions));
+  if (!magpie_crossplay_load_position(oracle, position)) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_POSITION_INVALID, 0,
+        "position is malformed or violates exact tile conservation");
+  }
+  CrossplayOracleAction imported = {0};
+  if (!magpie_crossplay_import_detached_action(oracle->game, action,
+                                               &imported)) {
+    return magpie_crossplay_error_set(
+        error, MAGPIE_CROSSPLAY_STATUS_INVALID_ARGUMENT, 0,
+        "detached action is malformed, unavailable, or has another identity");
+  }
+  const MagpieCrossplayStatus status = magpie_crossplay_apply_internal_action(
+      oracle, &imported, out_transitions, error);
+  free(imported.canonical_json);
+  return status;
 }
 
 void magpie_crossplay_transition_set_destroy(

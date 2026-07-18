@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define MAGPIE_CROSSPLAY_ABI_VERSION 3U
+#define MAGPIE_CROSSPLAY_ABI_VERSION 4U
 #define MAGPIE_CROSSPLAY_BOARD_CELLS 225U
 #define MAGPIE_CROSSPLAY_RACK_CAPACITY 7U
 #define MAGPIE_CROSSPLAY_WORD_CAPACITY 15U
@@ -203,6 +203,16 @@ MagpieCrossplayStatus magpie_crossplay_apply_action(
 MagpieCrossplayStatus magpie_crossplay_apply_action_to_position(
     MagpieCrossplayOracle *oracle, uint64_t native_generation,
     uint64_t native_index, const MagpieCrossplayPosition *position,
+    MagpieCrossplayTransitionSet *out_transitions,
+    MagpieCrossplayError *error);
+
+// Applies one stable structured action without relying on a session-local
+// generation handle. The action ID, structured board/rack applicability, and
+// exact score-bearing move representation are revalidated before expansion.
+// Complete legal-action coverage remains a separate generate-and-digest proof.
+MagpieCrossplayStatus magpie_crossplay_apply_detached_action_to_position(
+    MagpieCrossplayOracle *oracle, const MagpieCrossplayAction *action,
+    const MagpieCrossplayPosition *position,
     MagpieCrossplayTransitionSet *out_transitions,
     MagpieCrossplayError *error);
 

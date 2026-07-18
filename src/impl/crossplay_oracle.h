@@ -82,6 +82,8 @@ typedef struct CrossplayOracleTransitionSet {
 CrossplayOracleStatus crossplay_oracle_generate_actions(
     const Game *game, int bag_count, bool allow_exchanges,
     CrossplayOracleActionSet *result);
+CrossplayOracleStatus crossplay_oracle_prepare_action(
+    const Game *game, CrossplayOracleAction *action);
 CrossplayOracleStatus crossplay_oracle_maximum_score(const Game *game,
                                                      int *maximum_score);
 CrossplayOracleStatus crossplay_oracle_bounded_sequence_commitment(
