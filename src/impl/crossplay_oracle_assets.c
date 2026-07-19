@@ -86,6 +86,32 @@ static bool crossplay_oracle_asset_assign(CrossplayOracleAssetManifest *manifest
   return true;
 }
 
+static bool crossplay_oracle_asset_parse_line(char *line, char **key,
+                                              char **value) {
+  size_t length = strlen(line);
+  if (length == 0) {
+    return false;
+  }
+  if (line[length - 1] == '\n') {
+    line[--length] = '\0';
+    if (length > 0 && line[length - 1] == '\r') {
+      line[--length] = '\0';
+    }
+  }
+  char *const separator = strchr(line, ' ');
+  if (separator == NULL || separator == line || separator[1] == '\0') {
+    return false;
+  }
+  *separator = '\0';
+  *key = line;
+  *value = separator + 1;
+  // Every value except the filesystem path is a single canonical token. The
+  // path consumes the remainder of the line so ordinary absolute paths such
+  // as macOS's "Application Support" remain representable.
+  return strcmp(*key, "blocklist_path") == 0 ||
+         strpbrk(*value, " \t") == NULL;
+}
+
 bool crossplay_oracle_asset_manifest_load(
     const char *path, CrossplayOracleAssetManifest *manifest) {
   if (path == NULL || manifest == NULL) {
@@ -105,10 +131,9 @@ bool crossplay_oracle_asset_manifest_load(
   bool seen[CROSSPLAY_ORACLE_ASSET_FIELDS] = {false};
   bool valid = true;
   while (valid && fgets(line, sizeof(line), stream) != NULL) {
-    char key[64];
-    char value[CROSSPLAY_ORACLE_ASSET_PATH_SIZE];
-    char extra;
-    if (sscanf(line, "%63s %1023s %c", key, value, &extra) != 2 ||
+    char *key;
+    char *value;
+    if (!crossplay_oracle_asset_parse_line(line, &key, &value) ||
         !crossplay_oracle_asset_assign(manifest, seen, key, value)) {
       valid = false;
     }

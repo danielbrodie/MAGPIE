@@ -439,7 +439,7 @@ static void test_complete_canonical_action_set(void) {
 
 static void test_asset_manifest_verification(void) {
   const char *manifest_path = "crossplay_oracle_assets_test.txt";
-  const char *blocklist_path = "crossplay_oracle_blocklist_test.txt";
+  const char *blocklist_path = "crossplay oracle blocklist test.txt";
   ErrorStack *error_stack = error_stack_create();
   write_string_to_file(blocklist_path, "w", "NOTAWORD\n", error_stack);
   assert(error_stack_is_empty(error_stack));
