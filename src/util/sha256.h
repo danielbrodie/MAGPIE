@@ -4,6 +4,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#endif
 
 enum {
   SHA256_DIGEST_SIZE = 32,
@@ -11,10 +14,14 @@ enum {
 };
 
 typedef struct Sha256 {
+#ifdef __APPLE__
+  CC_SHA256_CTX context;
+#else
   uint8_t block[64];
   uint32_t state[8];
   uint64_t bit_count;
   size_t block_size;
+#endif
 } Sha256;
 
 void sha256_init(Sha256 *sha);

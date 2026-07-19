@@ -28,6 +28,27 @@ typedef struct CrossplayOracleExchangeCollector {
   bool overflow;
 } CrossplayOracleExchangeCollector;
 
+static bool crossplay_oracle_add_coordinate(StringBuilder *builder,
+                                            int coordinate) {
+  if (coordinate < 0 || coordinate >= BOARD_DIM) {
+    return false;
+  }
+  char digits[12];
+  int length = 0;
+  do {
+    digits[length++] = (char)('0' + coordinate % 10);
+    coordinate /= 10;
+  } while (coordinate > 0);
+  for (int left = 0, right = length - 1; left < right; left++, right--) {
+    const char saved = digits[left];
+    digits[left] = digits[right];
+    digits[right] = saved;
+  }
+  digits[length] = '\0';
+  string_builder_add_string(builder, digits);
+  return true;
+}
+
 static bool crossplay_oracle_add_human_letter(
     StringBuilder *builder, const LetterDistribution *ld, MachineLetter ml) {
   const MachineLetter unblanked = get_unblanked_machine_letter(ml);
@@ -85,13 +106,22 @@ static bool crossplay_oracle_add_new_tiles(
     first = false;
     const int row = move_get_row_start(move) + row_increment * tile_idx;
     const int col = move_get_col_start(move) + col_increment * tile_idx;
-    string_builder_add_formatted_string(
-        builder, "{\"blank\":%s,\"col\":%d,\"letter\":\"",
-        get_is_blanked(ml) ? "true" : "false", col);
+    string_builder_add_string(builder, "{\"blank\":");
+    string_builder_add_string(builder,
+                              get_is_blanked(ml) ? "true" : "false");
+    string_builder_add_string(builder, ",\"col\":");
+    if (!crossplay_oracle_add_coordinate(builder, col)) {
+      return false;
+    }
+    string_builder_add_string(builder, ",\"letter\":\"");
     if (!crossplay_oracle_add_human_letter(builder, ld, ml)) {
       return false;
     }
-    string_builder_add_formatted_string(builder, "\",\"row\":%d}", row);
+    string_builder_add_string(builder, "\",\"row\":");
+    if (!crossplay_oracle_add_coordinate(builder, row)) {
+      return false;
+    }
+    string_builder_add_string(builder, "}");
   }
   return !first;
 }
@@ -106,13 +136,24 @@ static char *crossplay_oracle_placement_json(
     string_builder_destroy(builder);
     return NULL;
   }
-  string_builder_add_formatted_string(
+  string_builder_add_string(builder, "],\"orientation\":\"");
+  string_builder_add_string(
       builder,
-      "],\"orientation\":\"%s\",\"start_col\":%d,\"start_row\":%d,"
-      "\"word\":\"",
       move_get_dir(&action->move) == BOARD_HORIZONTAL_DIRECTION ? "horizontal"
-                                                               : "vertical",
-      move_get_col_start(&action->move), move_get_row_start(&action->move));
+                                                               : "vertical");
+  string_builder_add_string(builder, "\",\"start_col\":");
+  if (!crossplay_oracle_add_coordinate(builder,
+                                       move_get_col_start(&action->move))) {
+    string_builder_destroy(builder);
+    return NULL;
+  }
+  string_builder_add_string(builder, ",\"start_row\":");
+  if (!crossplay_oracle_add_coordinate(builder,
+                                       move_get_row_start(&action->move))) {
+    string_builder_destroy(builder);
+    return NULL;
+  }
+  string_builder_add_string(builder, ",\"word\":\"");
   if (!crossplay_oracle_add_word(builder, action, board, ld)) {
     string_builder_destroy(builder);
     return NULL;

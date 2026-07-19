@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef __APPLE__
 static const uint32_t SHA256_K[64] = {
     UINT32_C(0x428a2f98), UINT32_C(0x71374491), UINT32_C(0xb5c0fbcf),
     UINT32_C(0xe9b5dba5), UINT32_C(0x3956c25b), UINT32_C(0x59f111f1),
@@ -92,8 +93,12 @@ static void sha256_transform(Sha256 *sha) {
   sha->state[6] += g;
   sha->state[7] += h;
 }
+#endif
 
 void sha256_init(Sha256 *sha) {
+#ifdef __APPLE__
+  CC_SHA256_Init(&sha->context);
+#else
   memset(sha, 0, sizeof(*sha));
   sha->state[0] = UINT32_C(0x6a09e667);
   sha->state[1] = UINT32_C(0xbb67ae85);
@@ -103,9 +108,19 @@ void sha256_init(Sha256 *sha) {
   sha->state[5] = UINT32_C(0x9b05688c);
   sha->state[6] = UINT32_C(0x1f83d9ab);
   sha->state[7] = UINT32_C(0x5be0cd19);
+#endif
 }
 
 void sha256_update(Sha256 *sha, const void *bytes, size_t length) {
+#ifdef __APPLE__
+  const uint8_t *input = (const uint8_t *)bytes;
+  while (length > 0) {
+    const size_t chunk = length > UINT32_MAX ? UINT32_MAX : length;
+    CC_SHA256_Update(&sha->context, input, (CC_LONG)chunk);
+    input += chunk;
+    length -= chunk;
+  }
+#else
   const uint8_t *input = (const uint8_t *)bytes;
   for (size_t byte_idx = 0; byte_idx < length; byte_idx++) {
     sha->block[sha->block_size++] = input[byte_idx];
@@ -115,9 +130,13 @@ void sha256_update(Sha256 *sha, const void *bytes, size_t length) {
       sha->block_size = 0;
     }
   }
+#endif
 }
 
 void sha256_final(Sha256 *sha, uint8_t digest[SHA256_DIGEST_SIZE]) {
+#ifdef __APPLE__
+  CC_SHA256_Final(digest, &sha->context);
+#else
   size_t block_idx = sha->block_size;
   sha->block[block_idx++] = UINT8_C(0x80);
   if (block_idx > 56) {
@@ -142,6 +161,7 @@ void sha256_final(Sha256 *sha, uint8_t digest[SHA256_DIGEST_SIZE]) {
           sha->state[word_idx] >> (unsigned int)(24 - byte_idx * 8));
     }
   }
+#endif
 }
 
 void sha256_final_hex(Sha256 *sha, char hex_digest[SHA256_HEX_SIZE]) {
