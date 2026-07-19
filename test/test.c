@@ -23,6 +23,7 @@
 #include "create_data_test.h"
 #include "cross_set_test.h"
 #include "crossplay_oracle_test.h"
+#include "data_filepaths_test.h"
 #include "dawg_packed_test.h"
 #include "endgame_test.h"
 #include "equity_adjustment_test.h"
@@ -121,6 +122,7 @@ static TestEntry test_table[] = {
     {"cgp", test_cgp},
     {"rl", test_rack_list},
     {"ch", test_checkpoint},
+    {"paths", test_data_filepaths},
     {"klv", test_klv},
     {"cv", test_convert},
     {"cd", test_create_data},

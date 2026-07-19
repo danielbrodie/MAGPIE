@@ -61,7 +61,9 @@ FILE *stream_from_filename(const char *filename, ErrorStack *error_stack) {
   log_debug("%s not found in cache (size %d), opening", filename,
             file_cache.num_items);
   FILE *stream;
-  stream = fopen_safe(filename, "r", error_stack);
+  // Binary mode keeps ftell() and fread() byte counts identical on Windows;
+  // text parsers still receive the original bytes and handle line endings.
+  stream = fopen_safe(filename, "rb", error_stack);
   return stream;
 }
 

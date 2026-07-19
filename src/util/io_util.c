@@ -524,7 +524,8 @@ char *get_string_from_file_handle(FILE *file_handle, const char *filename,
 }
 
 char *get_string_from_file(const char *filename, ErrorStack *error_stack) {
-  FILE *file_handle = fopen_safe(filename, "r", error_stack);
+  // Binary mode keeps ftell() and fread() byte counts identical on Windows.
+  FILE *file_handle = fopen_safe(filename, "rb", error_stack);
   if (!error_stack_is_empty(error_stack)) {
     return NULL;
   }

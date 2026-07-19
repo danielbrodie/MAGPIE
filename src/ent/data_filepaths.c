@@ -1,9 +1,9 @@
 #include "data_filepaths.h"
 
+#include "../compat/cglob.h"
 #include "../util/fileproxy.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
-#include "../compat/cglob.h"
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -18,6 +18,12 @@ static const char *const filepath_type_names[] = {"kwg",
                                                   "wordmap",
                                                   "rack info table",
                                                   "packed dawg"};
+
+#ifdef _WIN32
+enum { DATA_PATH_SEPARATOR = ';' };
+#else
+enum { DATA_PATH_SEPARATOR = ':' };
+#endif
 
 void string_builder_add_directory_for_data_type(StringBuilder *sb,
                                                 const char *data_path,
@@ -104,7 +110,8 @@ char *data_filepaths_get_first_valid_filename(const char *data_paths,
                              filepath_type_names[type]));
     return NULL;
   }
-  StringSplitter *split_data_paths = split_string(data_paths, ':', true);
+  StringSplitter *split_data_paths =
+      split_string(data_paths, DATA_PATH_SEPARATOR, true);
   int number_of_data_paths =
       string_splitter_get_number_of_items(split_data_paths);
   char *ret_val = NULL;
@@ -156,8 +163,8 @@ char *data_filepaths_get_readable_filename(const char *data_paths,
 // currently exist.
 // If data_name looks like a filepath, then data_name is just returned
 // as is.
-// If data paths has multiple paths delimited by ':', then the
-// first path is used.
+// If data paths has multiple paths delimited by the platform path-list
+// separator, then the first path is used.
 char *data_filepaths_get_writable_filename(const char *data_paths,
                                            const char *data_name,
                                            data_filepath_t type,
@@ -177,7 +184,8 @@ char *data_filepaths_get_writable_filename(const char *data_paths,
                              filepath_type_names[type]));
     return NULL;
   }
-  char *first_data_path = cut_off_after_first_char(data_paths, ':');
+  char *first_data_path =
+      cut_off_after_first_char(data_paths, DATA_PATH_SEPARATOR);
   char *writable_filepath = get_filepath(first_data_path, data_name, type);
   free(first_data_path);
   // File already exists and is not writable
@@ -213,7 +221,8 @@ StringList *data_filepaths_get_all_data_path_names(const char *data_paths,
     return NULL;
   }
   StringList *file_path_list = string_list_create();
-  StringSplitter *split_data_paths = split_string(data_paths, ':', true);
+  StringSplitter *split_data_paths =
+      split_string(data_paths, DATA_PATH_SEPARATOR, true);
   const int number_of_data_paths =
       string_splitter_get_number_of_items(split_data_paths);
   for (int path_idx = 0; path_idx < number_of_data_paths; path_idx++) {
