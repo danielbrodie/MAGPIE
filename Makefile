@@ -43,6 +43,11 @@ cflags.thread := -g -O0 -Wall -Wno-trigraphs -Wextra -Wshadow -Wstrict-prototype
 cflags.vlg := -g -O0 -Wall -Wno-trigraphs -Wextra
 cflags.cov := -g -O0 -Wall -Wno-trigraphs -Wextra --coverage
 cflags.release := -O3 -flto -march=native -DNDEBUG -Wall -Wno-trigraphs
+# Rust links this archive into a cdylib with its platform linker. GCC's LTO
+# archive members can remain unresolved when that final linker is not the same
+# GCC plugin driver, so the portable FFI archive deliberately uses ordinary
+# optimized ELF/Mach-O objects.
+cflags.rust_release := -O3 -march=native -DNDEBUG -Wall -Wno-trigraphs
 # Test-specific flags: like release but without DNDEBUG (asserts always enabled in tests)
 cflags.test_release := -O3 -flto -march=native -Wall -Wno-trigraphs
 cflags.profile := -O3 -g -march=native -DNDEBUG -Wall -Wno-trigraphs -fno-omit-frame-pointer -mllvm -inline-threshold=0
@@ -52,6 +57,7 @@ ldflags.dev := -pthread $(FSAN_ARG)
 ldflags.thread := -pthread -fsanitize=thread
 ldflags.vlg := -pthread
 ldflags.release := -pthread
+ldflags.rust_release := -pthread
 ldflags.profile := -pthread
 ldflags.cov := -pthread
 
