@@ -3172,9 +3172,9 @@ static void cpeg_wtl_trace_add_work(CpegWtlTrace *dest,
   dest->exact_endgame_work_ns += source->exact_endgame_work_ns;
 }
 
-static bool cpeg_generate_small_moves(Game *game, MoveList *moves,
-                                      move_record_t record_type,
-                                      CpegWtlTrace *trace) {
+static bool cpeg_generate_small_moves_at_least(
+    Game *game, MoveList *moves, move_record_t record_type,
+    int minimum_tiles_played, CpegWtlTrace *trace) {
   const MoveGenArgs args = {
       .game = game,
       .move_list = moves,
@@ -3184,6 +3184,7 @@ static bool cpeg_generate_small_moves(Game *game, MoveList *moves,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .minimum_tiles_played = minimum_tiles_played,
   };
   const int64_t start_ns = trace != NULL ? ctimer_monotonic_ns() : 0;
   generate_moves(&args);
@@ -3193,6 +3194,12 @@ static bool cpeg_generate_small_moves(Game *game, MoveList *moves,
     trace->opponent_movegen_work_ns += ctimer_monotonic_ns() - start_ns;
   }
   return moves->count <= CPEG_MOVE_LIST_CAP;
+}
+
+static bool cpeg_generate_small_moves(Game *game, MoveList *moves,
+                                      move_record_t record_type,
+                                      CpegWtlTrace *trace) {
+  return cpeg_generate_small_moves_at_least(game, moves, record_type, 0, trace);
 }
 
 static void cpeg_sort_small_moves(MoveList *moves, CpegWtlTrace *trace) {
@@ -4690,6 +4697,7 @@ typedef struct CpegWtlPlacementScreenJob {
   int bound_jobs;
   int batches_completed;
   bool collect_trace;
+  bool use_best_bag_emptying_screen;
   bool proof_valid;
   bool deadline_reached;
   CpegWtlTrace trace;
@@ -4706,12 +4714,15 @@ static bool cpeg_wtl_shallow_placement_world(CpegWtlPlacementScreenJob *job,
   const int tiles_played = move_get_tiles_played(&job->candidate->move);
   const int tiles_drawn = tiles_played < world->n ? tiles_played : world->n;
   const int remaining_bag = world->n - tiles_drawn;
-  const bool single_best_defense = remaining_bag <= 1;
+  const bool restricted_best_defense =
+      job->use_best_bag_emptying_screen && remaining_bag > 1;
+  const bool single_best_defense =
+      remaining_bag <= 1 || restricted_best_defense;
   CpegWtlTrace *trace = job->collect_trace ? &job->trace : NULL;
-  if (!cpeg_generate_small_moves(worker->opponent_game, worker->opponent_moves,
-                                 single_best_defense ? MOVE_RECORD_BEST_SMALL
-                                                     : MOVE_RECORD_ALL_SMALL,
-                                 trace)) {
+  if (!cpeg_generate_small_moves_at_least(
+          worker->opponent_game, worker->opponent_moves,
+          single_best_defense ? MOVE_RECORD_BEST_SMALL : MOVE_RECORD_ALL_SMALL,
+          restricted_best_defense ? remaining_bag : 0, trace)) {
     return false;
   }
   cpeg_sort_small_moves(worker->opponent_moves, trace);
@@ -4939,6 +4950,8 @@ static bool cpeg_wtl_screen_placements_parallel(
         .state = &states[candidate_idx],
         .world_evaluations = &evaluations[job_idx * world_count],
         .collect_trace = args->collect_trace,
+        .use_best_bag_emptying_screen =
+            args->use_best_bag_emptying_screen,
     };
     screen_job_ptrs[job_idx] = &screen_jobs[job_idx];
     job_idx++;

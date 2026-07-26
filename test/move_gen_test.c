@@ -731,6 +731,56 @@ void best_small_play_recorder_test(void) {
   assert(move_list_get_count(move_list) == 1);
   assert(small_move_get_score(move_list->small_moves[0]) == 1780);
 
+  // A restricted BEST_SMALL search must return exactly the first qualifying
+  // move from the exhaustive score/tiny-move ordering used by CPEG.
+  load_cgp_or_die(game, VS_JEREMY);
+  rack_set_to_string(ld, player_get_rack(player), "DDESW??");
+  draw_to_full_rack(game, 1);
+  MoveList *all_moves = move_list_create_small(100000);
+  const MoveGenArgs all_args = {
+      .game = game,
+      .move_list = all_moves,
+      .move_record_type = MOVE_RECORD_ALL_SMALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&all_args);
+  for (int minimum_tiles = 1; minimum_tiles <= RACK_SIZE; minimum_tiles++) {
+    const SmallMove *expected = NULL;
+    for (int move_idx = 0; move_idx < all_moves->count; move_idx++) {
+      const SmallMove *candidate = all_moves->small_moves[move_idx];
+      if (small_move_is_pass(candidate) ||
+          small_move_get_tiles_played(candidate) < minimum_tiles) {
+        continue;
+      }
+      if (expected == NULL ||
+          small_move_get_score(candidate) > small_move_get_score(expected) ||
+          (small_move_get_score(candidate) == small_move_get_score(expected) &&
+           candidate->tiny_move < expected->tiny_move)) {
+        expected = candidate;
+      }
+    }
+    const MoveGenArgs restricted_args = {
+        .game = game,
+        .move_list = move_list,
+        .move_record_type = MOVE_RECORD_BEST_SMALL,
+        .move_sort_type = MOVE_SORT_SCORE,
+        .eq_margin_movegen = 0,
+        .target_equity = EQUITY_MAX_VALUE,
+        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+        .minimum_tiles_played = minimum_tiles,
+    };
+    generate_moves(&restricted_args);
+    assert(move_list_get_count(move_list) == 1);
+    assert(expected != NULL);
+    assert(move_list->small_moves[0]->tiny_move == expected->tiny_move);
+    assert(small_move_get_score(move_list->small_moves[0]) ==
+           small_move_get_score(expected));
+  }
+  small_move_list_destroy(all_moves);
+
   small_move_list_destroy(move_list);
   game_destroy(game);
   config_destroy(config);

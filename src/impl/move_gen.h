@@ -126,6 +126,9 @@ typedef struct MoveGen {
   int target_leave_size;
   bool stop_on_threshold;
   bool threshold_exceeded;
+  // Minimum number of rack tiles a MOVE_RECORD_BEST_SMALL placement must use.
+  // Zero preserves the ordinary unrestricted best-score search.
+  int minimum_tiles_played;
 
   MachineLetter strip[(MOVE_MAX_TILES)];
   MachineLetter exchange_strip[(MOVE_MAX_TILES)];
@@ -263,6 +266,9 @@ typedef struct MoveGenArgs {
   // from move generation based on alternate exchange sizes. Value is
   // UNSET_LEAVE_SIZE for non-exchange scenarios.
   int target_leave_size_for_exchange_cutoff;
+  // Only used with MOVE_RECORD_BEST_SMALL. Restricts the retained placement
+  // to moves using at least this many rack tiles. Zero is unrestricted.
+  int minimum_tiles_played;
   MoveList *move_list;
   // Output: bitvector of machine letters that appear in any valid move.
   // Only used with MOVE_RECORD_TILES_PLAYED. Caller provides pointer; callee

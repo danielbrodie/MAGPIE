@@ -333,6 +333,10 @@ static inline void update_best_move_or_insert_into_movelist(
     MoveGen *gen, int leftstrip, int rightstrip, game_event_t move_type,
     Equity score, int start_row, int start_col, int tiles_played, int dir,
     MachineLetter strip[]) {
+  if (gen->move_record_type == MOVE_RECORD_BEST_SMALL &&
+      tiles_played < gen->minimum_tiles_played) {
+    return;
+  }
   bool need_to_update_best_move_equity_or_score = false;
   Equity move_equity_or_score = 0;
   switch (gen->move_record_type) {
@@ -391,7 +395,13 @@ static inline void update_best_move_or_insert_into_movelist(
     set_small_play_for_record(best_sm, move_type, leftstrip, rightstrip, score,
                               start_row, start_col, tiles_played, dir, strip);
     move_equity_or_score = score;
-    if (move_equity_or_score > gen->best_move_equity_or_score) {
+    const bool score_is_better =
+        move_equity_or_score > gen->best_move_equity_or_score;
+    const bool restricted_tie_is_better =
+        gen->minimum_tiles_played > 0 && gen->move_list->count > 0 &&
+        move_equity_or_score == gen->best_move_equity_or_score &&
+        best_sm->tiny_move < gen->move_list->small_moves[0]->tiny_move;
+    if (score_is_better || restricted_tie_is_better) {
       need_to_update_best_move_equity_or_score = true;
       gen->best_move_equity_or_score = move_equity_or_score;
       // Swap spare_small_move into small_moves[0].
@@ -2714,6 +2724,13 @@ void gen_load_position(MoveGen *gen, const MoveGenArgs *args) {
   gen->eq_margin_movegen = args->eq_margin_movegen;
   gen->target_equity_cutoff = args->target_equity;
   gen->target_leave_size = args->target_leave_size_for_exchange_cutoff;
+  gen->minimum_tiles_played = args->minimum_tiles_played;
+  if (gen->move_record_type == MOVE_RECORD_BEST_SMALL &&
+      (gen->minimum_tiles_played < 0 ||
+       gen->minimum_tiles_played > RACK_SIZE)) {
+    log_fatal("MOVE_RECORD_BEST_SMALL minimum tiles must be between 0 and %d",
+              RACK_SIZE);
+  }
 
   gen->board = game_get_board(game);
   gen->player_index = game_get_player_on_turn_index(game);

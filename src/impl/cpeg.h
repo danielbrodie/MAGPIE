@@ -397,6 +397,9 @@ typedef struct CpegWtlCertifiedArgs {
   // Experiment only: evaluate an exhaustive bag-emptying incumbent with one
   // exact two-ply solve per world instead of one exact reply per defense.
   bool use_exact_two_ply_incumbent;
+  // Experiment only: find the placement screen's highest-scoring bag-emptying
+  // defense directly instead of materializing and sorting every legal move.
+  bool use_best_bag_emptying_screen;
   // Collect the versioned producer trace. False preserves the normal hot path.
   bool collect_trace;
 } CpegWtlCertifiedArgs;
