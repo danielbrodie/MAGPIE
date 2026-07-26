@@ -83,10 +83,20 @@ static void cpeg_render_move(char *dest, size_t dest_size, const Board *board,
 // reply_moves, undo). Identical semantics to cpeg_solve_endgame; factored out
 // so the pre-endgame recursion can hit thousands of empty-bag leaves without a
 // per-leaf allocation. Fills *result and returns the swing (in points).
-static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
-                             MoveList *reply_moves, MoveUndo *undo,
-                             CpegResult *result, bool *capacity_exceeded) {
+static int cpeg_endgame_core_until(Game *game, MoveList *mover_moves,
+                                   MoveList *reply_moves, MoveUndo *undo,
+                                   CpegResult *result, bool *capacity_exceeded,
+                                   int64_t deadline_ns, bool *complete) {
   memset(result, 0, sizeof(*result));
+  if (complete != NULL) {
+    *complete = true;
+  }
+  if (deadline_ns != 0 && ctimer_monotonic_ns() >= deadline_ns) {
+    if (complete != NULL) {
+      *complete = false;
+    }
+    return 0;
+  }
 
   const LetterDistribution *ld = game_get_ld(game);
   Board *board = game_get_board(game);
@@ -123,6 +133,12 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
 
   const int mover_count = move_list_get_count(mover_moves);
   for (int mover_idx = 0; mover_idx < mover_count; mover_idx++) {
+    if (deadline_ns != 0 && ctimer_monotonic_ns() >= deadline_ns) {
+      if (complete != NULL) {
+        *complete = false;
+      }
+      break;
+    }
     const Move *mover_move = move_list_get_move(mover_moves, mover_idx);
     const int mover_score = equity_to_int(move_get_score(mover_move));
 
@@ -207,6 +223,14 @@ static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
   }
 
   return result->swing;
+}
+
+static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
+                             MoveList *reply_moves, MoveUndo *undo,
+                             CpegResult *result, bool *capacity_exceeded) {
+  return cpeg_endgame_core_until(game, mover_moves, reply_moves, undo, result,
+                                 capacity_exceeded, /*deadline_ns=*/0,
+                                 /*complete=*/NULL);
 }
 
 int cpeg_solve_endgame(Game *game, CpegResult *result) {
@@ -3078,6 +3102,7 @@ typedef struct CpegDefenseJob {
   int64_t deadline_ns;
   CpegInterval margin_prior;
   bool exhaustive_horizon;
+  bool use_exact_two_ply;
   int max_defenses;
   bool collect_trace;
   bool complete;
@@ -3464,14 +3489,77 @@ static void cpeg_defense_job_run(void *arg, int worker_idx) {
     trace->defense_world_jobs++;
   }
 
+  const bool horizon =
+      job->candidate->kind == 0 &&
+      move_get_tiles_played(&job->candidate->move) >= job->world->n;
+  if (horizon && job->exhaustive_horizon && job->use_exact_two_ply) {
+    if (cpeg_defense_deadline_reached(job->deadline_ns)) {
+      job->complete = false;
+      return;
+    }
+    if (!cpeg_apply_root_draw(job, worker, job->world) ||
+        bag_get_letters(game_get_bag(worker->draw_game)) != 0) {
+      job->capacity_exceeded = true;
+      return;
+    }
+    int64_t margin_after_root;
+    if (!cpeg_checked_margin_add(job->initial_lead, job->candidate->score,
+                                 &margin_after_root)) {
+      job->capacity_exceeded = true;
+      return;
+    }
+    CpegResult endgame_result;
+    bool endgame_capacity_exceeded = false;
+    bool endgame_complete = true;
+    const int64_t start_ns = trace != NULL ? ctimer_monotonic_ns() : 0;
+    const int opponent_swing = cpeg_endgame_core_until(
+        worker->draw_game, worker->endgame_mover, worker->endgame_reply,
+        worker->endgame_undo, &endgame_result, &endgame_capacity_exceeded,
+        job->deadline_ns, &endgame_complete);
+    if (trace != NULL) {
+      trace->compatible_draws_tested++;
+      trace->exact_endgame_queries++;
+      trace->exact_endgame_work_ns += ctimer_monotonic_ns() - start_ns;
+    }
+    if (endgame_capacity_exceeded) {
+      job->capacity_exceeded = true;
+      return;
+    }
+    if (!endgame_complete) {
+      job->complete = false;
+      return;
+    }
+    int64_t final_margin;
+    if (!cpeg_checked_margin_add(margin_after_root,
+                                 -(int64_t)opponent_swing, &final_margin)) {
+      job->capacity_exceeded = true;
+      return;
+    }
+    const CpegWtlEnvelope exact_envelope =
+        cpeg_wtl_exact_envelope(final_margin);
+    const int64_t exact_weight = 1;
+    job->result = (CpegWtlProofWorld){
+        // Preserve the existing one-draw outward-rounding boundary so the
+        // experiment is byte-for-byte identical, not merely rationally equal.
+        .envelope = cpeg_weighted_draw_envelope(
+            &exact_envelope, &exact_weight, /*count=*/1, /*weight_total=*/1),
+        .proof = CPEG_WTL_PROOF_EXACT,
+        .draw_mass = 1,
+        .win_lower_mass = final_margin > 0 ? 1 : 0,
+        .win_upper_mass = final_margin > 0 ? 1 : 0,
+        .tie_lower_mass = final_margin == 0 ? 1 : 0,
+        .tie_upper_mass = final_margin == 0 ? 1 : 0,
+        .loss_lower_mass = final_margin < 0 ? 1 : 0,
+        .loss_upper_mass = final_margin < 0 ? 1 : 0,
+    };
+    return;
+  }
+
   cpeg_set_world(worker->opponent_game, job->source_game, job->world,
                  job->unseen, job->ld_size, job->opponent_idx);
   if (job->candidate->kind != 0) {
     game_start_next_player_turn(worker->opponent_game);
   }
-  const bool horizon =
-      job->candidate->kind == 0 &&
-      move_get_tiles_played(&job->candidate->move) >= job->world->n;
   int remaining_after_root = job->world->n;
   if (job->candidate->kind == 0) {
     const int tiles_played = move_get_tiles_played(&job->candidate->move);
@@ -3851,9 +3939,9 @@ static bool cpeg_wtl_run_defense_batch(
     const Game *source_game, const CpegScheduledWorld *worlds,
     const int *unseen, int ld_size, int opponent_idx, int root_idx,
     const CpegRootCand *candidate, int64_t initial_lead, int64_t deadline_ns,
-    CpegInterval margin_prior, bool exhaustive_horizon, int max_defenses,
-    CpegWtlProofWorld *world_evaluations, int *exact_jobs, int *bound_jobs,
-    bool *batch_complete, CpegWtlTrace *trace,
+    CpegInterval margin_prior, bool exhaustive_horizon, bool use_exact_two_ply,
+    int max_defenses, CpegWtlProofWorld *world_evaluations, int *exact_jobs,
+    int *bound_jobs, bool *batch_complete, CpegWtlTrace *trace,
     CpegWtlTrace *candidate_trace) {
   *batch_complete = false;
   if (trace != NULL) {
@@ -3877,6 +3965,7 @@ static bool cpeg_wtl_run_defense_batch(
         .deadline_ns = deadline_ns,
         .margin_prior = margin_prior,
         .exhaustive_horizon = exhaustive_horizon,
+        .use_exact_two_ply = use_exact_two_ply,
         .max_defenses = max_defenses,
         .collect_trace = trace != NULL,
     };
@@ -5793,7 +5882,8 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
           pool, workers, helper_worker_idx, jobs, job_ptrs, first_world,
           batch_count, source_game, worlds, unseen, ld_size, opponent_idx,
           root_idx, candidate, args->initial_lead, deadline_ns, margin_prior,
-          bootstrap, bootstrap ? 0 : 1, world_evaluations, &out->exact_jobs,
+          bootstrap, bootstrap && args->use_exact_two_ply_incumbent,
+          bootstrap ? 0 : 1, world_evaluations, &out->exact_jobs,
           &out->bound_jobs, &batch_complete,
           collect_trace ? &out->trace : NULL,
           collect_trace ? &out->candidate_traces[candidate_idx] : NULL);
@@ -5855,8 +5945,10 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
             pool, workers, helper_worker_idx, jobs, job_ptrs, first_world,
             batch_count, source_game, worlds, unseen, ld_size, opponent_idx,
             root_idx, candidate, args->initial_lead, deadline_ns, margin_prior,
-            /*exhaustive_horizon=*/true, /*max_defenses=*/0, world_evaluations,
-            &out->exact_jobs, &out->bound_jobs, &batch_complete,
+            /*exhaustive_horizon=*/true,
+            /*use_exact_two_ply=*/args->use_exact_two_ply_incumbent,
+            /*max_defenses=*/0, world_evaluations, &out->exact_jobs,
+            &out->bound_jobs, &batch_complete,
             collect_trace ? &out->trace : NULL,
             collect_trace ? &out->candidate_traces[candidate_idx] : NULL);
         if (!proof_valid || !batch_complete) {
@@ -5974,8 +6066,8 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
           batch_count, template_game, worlds, unseen, ld_size, opponent_idx,
           root_idx, candidate, args->initial_lead, deadline_ns,
           unresolved_margin_prior, /*exhaustive_horizon=*/false,
-          /*max_defenses=*/0, world_evaluations, &out->exact_jobs,
-          &out->bound_jobs, &batch_complete,
+          /*use_exact_two_ply=*/false, /*max_defenses=*/0, world_evaluations,
+          &out->exact_jobs, &out->bound_jobs, &batch_complete,
           collect_trace ? &out->trace : NULL,
           collect_trace ? &out->candidate_traces[challenger_idx] : NULL);
       if (!proof_valid || !batch_complete) {

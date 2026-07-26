@@ -3514,6 +3514,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
                                     bool allow_exchanges, int64_t initial_lead,
                                     double budget_seconds,
                                     const char *belief_path,
+                                    bool use_exact_two_ply_incumbent,
                                     bool collect_trace,
                                     ErrorStack *error_stack) {
   CpegBeliefManifest belief = {0};
@@ -3537,6 +3538,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
       .weighted_world_count = belief_path != NULL ? belief.world_count : 0,
       .weighted_unseen_tiles = belief_path != NULL ? belief.unseen_mls : NULL,
       .weighted_unseen_count = belief_path != NULL ? belief.unseen_count : 0,
+      .use_exact_two_ply_incumbent = use_exact_two_ply_incumbent,
       .collect_trace = collect_trace,
   };
   if (cpeg_solve_pre_endgame_wtl_certified(config->game, &args, &result) < 1) {
@@ -3946,6 +3948,7 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
 //   cpeg <bag> lead <signed-int> budget <seconds> belief <path> -> the same
 //                           proof over an exact integer-weight posterior file.
 //   Add `trace` to a certified lead/budget command to emit producer cost data.
+//   Add `twoply` to opt into the exact two-ply incumbent experiment.
 void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (!config_has_game_data(config)) {
     error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
@@ -3963,6 +3966,7 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   double budget_seconds = 0.0;
   const char *belief_path = NULL;
   bool collect_trace = false;
+  bool use_exact_two_ply_incumbent = false;
   const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
   for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
     const char *value = config_get_parg_value(config, ARG_TOKEN_CPEG, arg_idx);
@@ -3971,6 +3975,14 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
     if (strings_equal(value, "noexch")) {
       allow_exchanges = false;
+    } else if (strings_equal(value, "twoply")) {
+      if (use_exact_two_ply_incumbent) {
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+            string_duplicate("cpeg twoply may be specified only once"));
+        return;
+      }
+      use_exact_two_ply_incumbent = true;
     } else if (strings_equal(value, "trace")) {
       if (collect_trace) {
         error_stack_push(
@@ -4054,6 +4066,13 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
         string_duplicate("cpeg trace requires the certified lead/budget solver"));
     return;
   }
+  if (use_exact_two_ply_incumbent && !(has_lead && use_certified)) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+        string_duplicate(
+            "cpeg twoply requires the certified lead/budget solver"));
+    return;
+  }
 
   if (bag <= 0) {
     if (has_lead) {
@@ -4080,7 +4099,8 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (use_certified) {
     if (has_lead) {
       impl_cpeg_wtl_certified(config, bag, allow_exchanges, initial_lead,
-                              budget_seconds, belief_path, collect_trace,
+                              budget_seconds, belief_path,
+                              use_exact_two_ply_incumbent, collect_trace,
                               error_stack);
       return;
     }
@@ -9378,7 +9398,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_INFER, "infer", 0, 5, infer, generic, false);
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
-  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 8, cpeg, generic, false);
+  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 9, cpeg, generic, false);
   cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 10,
       crossplay_oracle, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);

@@ -394,6 +394,9 @@ typedef struct CpegWtlCertifiedArgs {
   // a different Game whose visible inventory happens to admit those bags.
   const MachineLetter *weighted_unseen_tiles;
   int weighted_unseen_count;
+  // Experiment only: evaluate an exhaustive bag-emptying incumbent with one
+  // exact two-ply solve per world instead of one exact reply per defense.
+  bool use_exact_two_ply_incumbent;
   // Collect the versioned producer trace. False preserves the normal hot path.
   bool collect_trace;
 } CpegWtlCertifiedArgs;

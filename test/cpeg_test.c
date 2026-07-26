@@ -1486,6 +1486,12 @@ cpeg_assert_wtl_certified_results_equal(const CpegWtlCertifiedResult *lhs,
   assert(lhs->best_index == rhs->best_index);
   assert(lhs->worlds_distinct == rhs->worlds_distinct);
   assert(lhs->world_weight_mass == rhs->world_weight_mass);
+  assert(lhs->exact_jobs == rhs->exact_jobs);
+  assert(lhs->bound_jobs == rhs->bound_jobs);
+  assert(lhs->batches_completed == rhs->batches_completed);
+  assert(lhs->regret_num == rhs->regret_num);
+  assert(lhs->regret_den == rhs->regret_den);
+  assert(lhs->unique_best == rhs->unique_best);
   assert(lhs->coverage.total == rhs->coverage.total);
   for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
     const CpegWtlCertifiedCand *lhs_candidate = &lhs->cands[candidate_idx];
@@ -1502,6 +1508,24 @@ cpeg_assert_wtl_certified_results_equal(const CpegWtlCertifiedResult *lhs,
     assert(lhs_candidate->bounded_weight == rhs_candidate->bounded_weight);
     assert(lhs_candidate->unresolved_weight ==
            rhs_candidate->unresolved_weight);
+  }
+}
+
+static void cpeg_assert_wtl_certified_results_byte_equal(
+    const CpegWtlCertifiedResult *lhs,
+    const CpegWtlCertifiedResult *rhs) {
+  cpeg_assert_wtl_certified_results_equal(lhs, rhs);
+  for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
+    const CpegWtlCertifiedCand *lhs_candidate = &lhs->cands[candidate_idx];
+    const CpegWtlCertifiedCand *rhs_candidate = &rhs->cands[candidate_idx];
+    assert(lhs_candidate->score == rhs_candidate->score);
+    assert(memcmp(&lhs_candidate->outcome, &rhs_candidate->outcome,
+                  sizeof(lhs_candidate->outcome)) == 0);
+    assert(lhs_candidate->worlds_exact == rhs_candidate->worlds_exact);
+    assert(lhs_candidate->worlds_bounded == rhs_candidate->worlds_bounded);
+    assert(lhs_candidate->worlds_unresolved ==
+           rhs_candidate->worlds_unresolved);
+    assert(lhs_candidate->eliminated == rhs_candidate->eliminated);
   }
 }
 
@@ -1672,6 +1696,17 @@ void test_cpeg_wtl_certified_proof(void) {
                                               &four_threads) == 1314);
   cpeg_assert_wtl_certified_results_equal(&one_thread, &four_threads);
 
+  CpegWtlCertifiedArgs two_ply_args = one_thread_args;
+  two_ply_args.use_exact_two_ply_incumbent = true;
+  two_ply_args.collect_trace = true;
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  CpegWtlCertifiedResult two_ply = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &two_ply_args, &two_ply) == 1314);
+  cpeg_assert_wtl_certified_results_byte_equal(&one_thread, &two_ply);
+  assert(two_ply.trace.exact_endgame_queries == 1);
+  assert(two_ply.trace.final_reply_queries == 0);
+
   CpegWtlCertifiedArgs trace_args = one_thread_args;
   trace_args.collect_trace = true;
   load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
@@ -1708,6 +1743,7 @@ void test_cpeg_wtl_certified_proof(void) {
   assert(traced_candidates > 0);
   assert(candidate_reply_queries == traced.trace.final_reply_queries);
   cpeg_wtl_certified_result_destroy(&traced);
+  cpeg_wtl_certified_result_destroy(&two_ply);
   cpeg_wtl_certified_result_destroy(&four_threads);
   cpeg_wtl_certified_result_destroy(&one_thread);
 
@@ -1794,6 +1830,17 @@ void test_cpeg_wtl_certified_proof(void) {
   assert(compact.cands[compact.best_index].outcome_den == 8);
   assert(compact.regret_num == 0);
   assert(compact.regret_den == 1);
+  CpegWtlCertifiedArgs compact_two_ply_args = compact_args;
+  compact_two_ply_args.use_exact_two_ply_incumbent = true;
+  compact_two_ply_args.collect_trace = true;
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  CpegWtlCertifiedResult compact_two_ply = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &compact_two_ply_args,
+             &compact_two_ply) > 0);
+  cpeg_assert_wtl_certified_results_byte_equal(&compact, &compact_two_ply);
+  assert(compact_two_ply.trace.exact_endgame_queries > 0);
+  cpeg_wtl_certified_result_destroy(&compact_two_ply);
   cpeg_wtl_certified_result_destroy(&compact);
 
   // Exchange draws come from the pre-exchange bag: returned tiles are not
