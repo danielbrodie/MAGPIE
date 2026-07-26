@@ -195,6 +195,7 @@ static TestEntry on_demand_test_table[] = {
     {"cpegstat", test_cpeg_statistical_bag1},
     {"cpegwtl", test_cpeg_wtl_senator},
     {"cpegwtlproof", test_cpeg_wtl_certified_proof},
+    {"cpegreplybest", test_cpeg_replybest_screen},
     {"cpegwtlaccept", test_cpeg_wtl_certified_senator_acceptance},
     {"crossplayoracle", test_crossplay_oracle},
     {NULL, NULL} // Sentinel value to mark end of array

@@ -400,6 +400,9 @@ typedef struct CpegWtlCertifiedArgs {
   // Experiment only: find the placement screen's highest-scoring bag-emptying
   // defense directly instead of materializing and sorting every legal move.
   bool use_best_bag_emptying_screen;
+  // Experiment only: use the small reply generator for one-sided threshold
+  // queries and never consume a threshold witness as an exact score.
+  bool use_threshold_reply_screen;
   // Collect the versioned producer trace. False preserves the normal hot path.
   bool collect_trace;
 } CpegWtlCertifiedArgs;

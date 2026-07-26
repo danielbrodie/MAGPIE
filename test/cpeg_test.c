@@ -620,6 +620,8 @@ static void test_cpeg_wtl_command_parsing(void) {
                             ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
   cpeg_assert_command_error(config, error_stack, "cpeg 4 trace",
                             ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg 1 replybest",
+                            ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
   // A negative lead is consumed as the signed lead value, not mistaken for
   // the bag; the subsequent error is specifically the unsupported bag size.
   cpeg_assert_command_error(config, error_stack, "cpeg 5 lead -51",
@@ -632,6 +634,12 @@ static void test_cpeg_wtl_command_parsing(void) {
   load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
   config_load_command(config, "cpeg 1 noexch lead -51 budget 0.001",
                       error_stack);
+  assert(error_stack_is_empty(error_stack));
+  config_execute_command(config, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  config_load_command(
+      config, "cpeg 1 noexch lead -51 budget 0.001 replybest", error_stack);
   assert(error_stack_is_empty(error_stack));
   config_execute_command(config, error_stack);
   assert(error_stack_is_empty(error_stack));
@@ -1901,6 +1909,35 @@ void test_cpeg_wtl_certified_proof(void) {
   assert(saw_contracted_exchange);
   cpeg_wtl_certified_result_destroy(&exchange_bounds);
   cpeg_wtl_result_destroy(&exchange_oracle);
+  config_destroy(config);
+}
+
+void test_cpeg_replybest_screen(void) {
+  // A threshold witness proves only that the exact reply is above the
+  // threshold. This complete bag-one control pins the selected action and
+  // exact incumbent W/T/L mass while exercising the optimized cache path.
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 4");
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  const CpegWtlCertifiedArgs args = {
+      .bag = 1,
+      .allow_exchanges = true,
+      .num_threads = 4,
+      .initial_lead = 0,
+      .budget_seconds = 5.0,
+      .use_threshold_reply_screen = true,
+      .collect_trace = true,
+  };
+  CpegWtlCertifiedResult result = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config), &args,
+                                              &result) == 204);
+  assert_strings_equal(result.cands[result.best_index].label, "C4 EYAS");
+  assert(result.cands[result.best_index].win_lower_num == 6);
+  assert(result.cands[result.best_index].win_upper_num == 6);
+  assert(result.cands[result.best_index].outcome_den == 6);
+  assert(result.trace.threshold_short_circuits > 0);
+  cpeg_wtl_certified_result_destroy(&result);
   config_destroy(config);
 }
 
