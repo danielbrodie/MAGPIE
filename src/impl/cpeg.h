@@ -335,6 +335,24 @@ typedef enum CpegWtlProofKind {
   CPEG_WTL_PROOF_EXACT,
 } CpegWtlProofKind;
 
+typedef enum CpegWtlReplyPhase {
+  CPEG_WTL_REPLY_PHASE_INCUMBENT,
+  CPEG_WTL_REPLY_PHASE_PLACEMENT_SCREEN,
+  CPEG_WTL_REPLY_PHASE_HORIZON_REFINE,
+  CPEG_WTL_REPLY_PHASE_SCORELESS_SCREEN,
+  CPEG_WTL_REPLY_PHASE_SURVIVING_REFINE,
+  CPEG_WTL_REPLY_PHASE_FIXED_REFINE,
+  CPEG_WTL_REPLY_PHASE_COUNT,
+} CpegWtlReplyPhase;
+
+typedef struct CpegWtlReplyPhaseTrace {
+  int64_t queries;
+  int64_t replies_generated;
+  int64_t cache_hits;
+  int64_t movegen_work_ns;
+  int64_t threshold_short_circuits;
+} CpegWtlReplyPhaseTrace;
+
 // Default-off producer instrumentation. Timings ending in `_work_ns` are sums
 // across jobs and may exceed wall time when work runs in parallel.
 typedef struct CpegWtlTrace {
@@ -371,6 +389,7 @@ typedef struct CpegWtlTrace {
   int64_t final_reply_cache_hits;
   int64_t final_reply_movegen_work_ns;
   int64_t threshold_short_circuits;
+  CpegWtlReplyPhaseTrace reply_phases[CPEG_WTL_REPLY_PHASE_COUNT];
   int64_t exact_endgame_queries;
   int64_t exact_endgame_work_ns;
 } CpegWtlTrace;

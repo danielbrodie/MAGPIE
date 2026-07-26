@@ -3493,6 +3493,26 @@ static const char *cpeg_certified_status_name(CpegPreStatus status) {
   return "UNKNOWN";
 }
 
+static const char *cpeg_wtl_reply_phase_name(CpegWtlReplyPhase phase) {
+  switch (phase) {
+  case CPEG_WTL_REPLY_PHASE_INCUMBENT:
+    return "incumbent";
+  case CPEG_WTL_REPLY_PHASE_PLACEMENT_SCREEN:
+    return "placement_screen";
+  case CPEG_WTL_REPLY_PHASE_HORIZON_REFINE:
+    return "horizon_refine";
+  case CPEG_WTL_REPLY_PHASE_SCORELESS_SCREEN:
+    return "scoreless_screen";
+  case CPEG_WTL_REPLY_PHASE_SURVIVING_REFINE:
+    return "surviving_refine";
+  case CPEG_WTL_REPLY_PHASE_FIXED_REFINE:
+    return "fixed_refine";
+  case CPEG_WTL_REPLY_PHASE_COUNT:
+    break;
+  }
+  return "unknown";
+}
+
 static bool
 cpeg_wtl_proof_candidate_precedes(const CpegWtlCertifiedResult *result,
                                   int lhs_idx, int rhs_idx) {
@@ -3647,6 +3667,21 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
         (long long)trace->threshold_short_circuits,
         (long long)trace->exact_endgame_queries,
         (long long)trace->exact_endgame_work_ns);
+    for (int phase = 0; phase < CPEG_WTL_REPLY_PHASE_COUNT; phase++) {
+      const CpegWtlReplyPhaseTrace *phase_trace =
+          &trace->reply_phases[phase];
+      string_builder_add_formatted_string(
+          lines,
+          "cpeg-wtl-reply-phase schema=cpeg-wtl-reply-phase-v1 "
+          "phase=%s queries=%lld replies_generated=%lld cache_hits=%lld "
+          "movegen_work_ns=%lld threshold_short_circuits=%lld\n",
+          cpeg_wtl_reply_phase_name((CpegWtlReplyPhase)phase),
+          (long long)phase_trace->queries,
+          (long long)phase_trace->replies_generated,
+          (long long)phase_trace->cache_hits,
+          (long long)phase_trace->movegen_work_ns,
+          (long long)phase_trace->threshold_short_circuits);
+    }
   }
 
   int *order = malloc_or_die((size_t)result.count * sizeof(*order));

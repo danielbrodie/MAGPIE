@@ -1920,23 +1920,51 @@ void test_cpeg_replybest_screen(void) {
       "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
       "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 4");
   load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
-  const CpegWtlCertifiedArgs args = {
+  const CpegWtlCertifiedArgs baseline_args = {
       .bag = 1,
       .allow_exchanges = true,
       .num_threads = 4,
       .initial_lead = 0,
       .budget_seconds = 5.0,
-      .use_threshold_reply_screen = true,
       .collect_trace = true,
   };
+  CpegWtlCertifiedResult baseline = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &baseline_args, &baseline) == 204);
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  CpegWtlCertifiedArgs args = baseline_args;
+  args.use_threshold_reply_screen = true;
   CpegWtlCertifiedResult result = {0};
   assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config), &args,
                                               &result) == 204);
+  cpeg_assert_wtl_certified_results_byte_equal(&baseline, &result);
   assert_strings_equal(result.cands[result.best_index].label, "C4 EYAS");
   assert(result.cands[result.best_index].win_lower_num == 6);
   assert(result.cands[result.best_index].win_upper_num == 6);
   assert(result.cands[result.best_index].outcome_den == 6);
   assert(result.trace.threshold_short_circuits > 0);
+  int64_t phase_queries = 0;
+  int64_t phase_replies_generated = 0;
+  int64_t phase_cache_hits = 0;
+  int64_t phase_movegen_work_ns = 0;
+  int64_t phase_threshold_short_circuits = 0;
+  for (int phase = 0; phase < CPEG_WTL_REPLY_PHASE_COUNT; phase++) {
+    const CpegWtlReplyPhaseTrace *phase_trace =
+        &result.trace.reply_phases[phase];
+    phase_queries += phase_trace->queries;
+    phase_replies_generated += phase_trace->replies_generated;
+    phase_cache_hits += phase_trace->cache_hits;
+    phase_movegen_work_ns += phase_trace->movegen_work_ns;
+    phase_threshold_short_circuits +=
+        phase_trace->threshold_short_circuits;
+  }
+  assert(phase_queries == result.trace.final_reply_queries);
+  assert(phase_replies_generated == result.trace.final_replies_generated);
+  assert(phase_cache_hits == result.trace.final_reply_cache_hits);
+  assert(phase_movegen_work_ns == result.trace.final_reply_movegen_work_ns);
+  assert(phase_threshold_short_circuits ==
+         result.trace.threshold_short_circuits);
+  cpeg_wtl_certified_result_destroy(&baseline);
   cpeg_wtl_certified_result_destroy(&result);
   config_destroy(config);
 }
