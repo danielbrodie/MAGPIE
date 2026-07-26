@@ -3814,6 +3814,27 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
           (long long)trace->fixed_endgame_threshold_queries,
           (long long)trace->fixed_endgame_threshold_proofs,
           (long long)trace->fixed_endgame_threshold_work_ns);
+      for (int phase = 0; phase < CPEG_WTL_REPLY_PHASE_COUNT; phase++) {
+        const CpegWtlReplyPhaseTrace *phase_trace =
+            &trace->reply_phases[phase];
+        if (phase_trace->queries == 0) {
+          continue;
+        }
+        string_builder_add_formatted_string(
+            lines,
+            "cpeg-wtl-reply-phase-cand "
+            "schema=cpeg-wtl-reply-phase-cand-v1 "
+            "candidate_idx=%d rank=%d phase=%s queries=%lld "
+            "replies_generated=%lld cache_hits=%lld movegen_work_ns=%lld "
+            "threshold_short_circuits=%lld\n",
+            candidate_idx, rank_idx + 1,
+            cpeg_wtl_reply_phase_name((CpegWtlReplyPhase)phase),
+            (long long)phase_trace->queries,
+            (long long)phase_trace->replies_generated,
+            (long long)phase_trace->cache_hits,
+            (long long)phase_trace->movegen_work_ns,
+            (long long)phase_trace->threshold_short_circuits);
+      }
     }
   }
   char *output = string_builder_dump(lines, NULL);

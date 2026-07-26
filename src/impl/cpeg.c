@@ -5530,14 +5530,17 @@ static bool cpeg_wtl_refine_placement_world(CpegWtlPlacementRefineJob *job,
   if (overflow || draw_count < 1) {
     return false;
   }
+  // The fixed-win route sends only horizon placements through this oracle.
+  // Fail closed if a future scheduling change would reintroduce a hidden-draw
+  // branch here instead of using the one-defense fixed refinement.
+  if (job->use_fixed_win_threshold && draw_count != 1) {
+    return false;
+  }
   if (trace != NULL) {
     trace->compatible_draws_tested += draw_count;
   }
-  int64_t best_margin_upper[CPEG_ENUM_CAP];
-  bool have_bound[CPEG_ENUM_CAP] = {0};
-  for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
-    best_margin_upper[draw_idx] = INT64_MAX;
-  }
+  int64_t selected_margin_upper[CPEG_ENUM_CAP] = {0};
+  bool have_defense = false;
   int64_t margin_after_root;
   if (!cpeg_checked_margin_add(job->initial_lead, job->candidate->score,
                                &margin_after_root)) {
@@ -5571,10 +5574,8 @@ static bool cpeg_wtl_refine_placement_world(CpegWtlPlacementRefineJob *job,
     game_set_consecutive_scoreless_turns(worker->defense_game, 0);
     const int defense_score = small_move_get_score(defense);
     const int64_t threshold = (int64_t)defense_score - margin_after_root;
+    bool defense_covers_all_draws = true;
     for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
-      if (have_bound[draw_idx] && best_margin_upper[draw_idx] <= 0) {
-        continue;
-      }
       Rack branch_rack;
       rack_copy(&branch_rack, &leave);
       for (int tile_idx = 0; tile_idx < draws[draw_idx].n; tile_idx++) {
@@ -5593,26 +5594,26 @@ static bool cpeg_wtl_refine_placement_world(CpegWtlPlacementRefineJob *job,
         return false;
       }
       if (reply.kind == CPEG_ROOT_REPLY_ABOVE_THRESHOLD) {
-        continue;
+        defense_covers_all_draws = false;
+        if (trace != NULL) {
+          trace->defenses_refuted++;
+        }
+        break;
       }
-      int64_t margin_upper;
       if (!cpeg_checked_margin_add(margin_after_root, -(int64_t)defense_score,
-                                   &margin_upper) ||
-          !cpeg_checked_margin_add(margin_upper, reply.exact_score,
-                                   &margin_upper)) {
+                                   &selected_margin_upper[draw_idx]) ||
+          !cpeg_checked_margin_add(selected_margin_upper[draw_idx],
+                                   reply.exact_score,
+                                   &selected_margin_upper[draw_idx])) {
         return false;
       }
-      have_bound[draw_idx] = true;
-      if (margin_upper < best_margin_upper[draw_idx]) {
-        best_margin_upper[draw_idx] = margin_upper;
-      }
     }
-  }
-  if (trace != NULL) {
-    for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
-      if (have_bound[draw_idx]) {
+    if (defense_covers_all_draws) {
+      have_defense = true;
+      if (trace != NULL) {
         trace->defenses_accepted++;
       }
+      break;
     }
   }
 
@@ -5621,9 +5622,9 @@ static bool cpeg_wtl_refine_placement_world(CpegWtlPlacementRefineJob *job,
   int64_t draw_mass = 0;
   CpegWtlProofKind aggregate_proof = CPEG_WTL_PROOF_DEFENSE_BOUND;
   for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
-    if (have_bound[draw_idx]) {
+    if (have_defense) {
       draw_values[draw_idx] = cpeg_wtl_envelope_from_margin_upper(
-          best_margin_upper[draw_idx], job->margin_prior);
+          selected_margin_upper[draw_idx], job->margin_prior);
     } else {
       draw_values[draw_idx] = cpeg_wtl_unresolved_envelope(job->margin_prior);
       aggregate_proof = CPEG_WTL_PROOF_UNRESOLVED;
@@ -5631,13 +5632,13 @@ static bool cpeg_wtl_refine_placement_world(CpegWtlPlacementRefineJob *job,
     const int64_t draw_weight = draws[draw_idx].weight;
     draw_weights[draw_idx] = draw_weight;
     draw_mass += draw_weight;
-    if (!have_bound[draw_idx] || best_margin_upper[draw_idx] > 0) {
+    if (!have_defense || selected_margin_upper[draw_idx] > 0) {
       result->win_upper_mass += draw_weight;
     }
-    if (!have_bound[draw_idx] || best_margin_upper[draw_idx] >= 0) {
+    if (!have_defense || selected_margin_upper[draw_idx] >= 0) {
       result->tie_upper_mass += draw_weight;
     }
-    if (have_bound[draw_idx] && best_margin_upper[draw_idx] < 0) {
+    if (have_defense && selected_margin_upper[draw_idx] < 0) {
       result->loss_lower_mass += draw_weight;
     }
     result->loss_upper_mass += draw_weight;
@@ -5939,21 +5940,44 @@ static void cpeg_wtl_fixed_defense_job_run(void *arg, int worker_idx) {
       job->world_count, job->world_mass, draw_mass, job->margin_prior);
 }
 
+typedef enum {
+  CPEG_WTL_REFINE_ALL_PLACEMENTS,
+  CPEG_WTL_REFINE_HORIZON_PLACEMENTS,
+  CPEG_WTL_REFINE_BELOW_HORIZON_PLACEMENTS,
+} CpegWtlPlacementRefineScope;
+
+static bool cpeg_wtl_placement_matches_refine_scope(
+    const CpegRootCand *candidate, const CpegWtlCertifiedArgs *args,
+    CpegWtlPlacementRefineScope scope) {
+  if (candidate->kind != 0) {
+    return false;
+  }
+  const bool horizon = move_get_tiles_played(&candidate->move) >= args->bag;
+  if (scope == CPEG_WTL_REFINE_HORIZON_PLACEMENTS) {
+    return horizon;
+  }
+  if (scope == CPEG_WTL_REFINE_BELOW_HORIZON_PLACEMENTS) {
+    return !horizon;
+  }
+  return true;
+}
+
 static bool cpeg_wtl_refine_surviving_placements(
     PegPool *pool, CpegDefenseWorker *workers, int helper_worker_idx,
     Game *root_game, const CpegRootCand *candidates, int candidate_count,
     const CpegScheduledWorld *worlds, int world_count, int64_t world_mass,
     const int *unseen, int ld_size, int opponent_idx, int root_idx,
     int incumbent_idx, const CpegWtlCertifiedArgs *args, int64_t deadline_ns,
-    CpegInterval margin_prior, int max_defenses, bool fixed_endgame,
+    CpegInterval margin_prior, int max_defenses,
+    CpegWtlPlacementRefineScope scope,
     CpegWtlCertifiedResult *out, CpegWtlProofState *states, bool *stopped) {
+  const bool fixed_endgame =
+      scope == CPEG_WTL_REFINE_BELOW_HORIZON_PLACEMENTS;
   int job_count = 0;
   for (int candidate_idx = 0; candidate_idx < candidate_count;
        candidate_idx++) {
-    const bool eligible =
-        candidates[candidate_idx].kind == 0 &&
-        (!fixed_endgame ||
-         move_get_tiles_played(&candidates[candidate_idx].move) < args->bag);
+    const bool eligible = cpeg_wtl_placement_matches_refine_scope(
+        &candidates[candidate_idx], args, scope);
     if (candidate_idx != incumbent_idx && eligible &&
         !out->cands[candidate_idx].eliminated) {
       job_count++;
@@ -5972,10 +5996,8 @@ static bool cpeg_wtl_refine_surviving_placements(
   int job_idx = 0;
   for (int candidate_idx = 0; candidate_idx < candidate_count;
        candidate_idx++) {
-    const bool eligible =
-        candidates[candidate_idx].kind == 0 &&
-        (!fixed_endgame ||
-         move_get_tiles_played(&candidates[candidate_idx].move) < args->bag);
+    const bool eligible = cpeg_wtl_placement_matches_refine_scope(
+        &candidates[candidate_idx], args, scope);
     if (candidate_idx == incumbent_idx || !eligible ||
         out->cands[candidate_idx].eliminated) {
       continue;
@@ -6689,7 +6711,10 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
         candidate_count, worlds, world_count, world_mass, unseen, ld_size,
         opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
         unresolved_margin_prior, /*max_defenses=*/64,
-        /*fixed_endgame=*/false, out, states, &stopped);
+        args->use_fixed_win_threshold
+            ? CPEG_WTL_REFINE_HORIZON_PLACEMENTS
+            : CPEG_WTL_REFINE_ALL_PLACEMENTS,
+        out, states, &stopped);
   }
   if (collect_trace) {
     out->trace.surviving_refine_ns =
@@ -6716,7 +6741,7 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
           candidate_count, worlds, world_count, world_mass, unseen, ld_size,
           opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
           unresolved_margin_prior, /*max_defenses=*/1,
-          /*fixed_endgame=*/true, out, states, &stopped);
+          CPEG_WTL_REFINE_BELOW_HORIZON_PLACEMENTS, out, states, &stopped);
     } else {
       proof_valid = cpeg_wtl_refine_fixed_worlds_parallel(
           pool, workers, helper_worker_idx, root_game, candidates,
