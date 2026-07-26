@@ -3514,6 +3514,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
                                     bool allow_exchanges, int64_t initial_lead,
                                     double budget_seconds,
                                     const char *belief_path,
+                                    bool collect_trace,
                                     ErrorStack *error_stack) {
   CpegBeliefManifest belief = {0};
   if (belief_path != NULL &&
@@ -3536,6 +3537,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
       .weighted_world_count = belief_path != NULL ? belief.world_count : 0,
       .weighted_unseen_tiles = belief_path != NULL ? belief.unseen_mls : NULL,
       .weighted_unseen_count = belief_path != NULL ? belief.unseen_count : 0,
+      .collect_trace = collect_trace,
   };
   if (cpeg_solve_pre_endgame_wtl_certified(config->game, &args, &result) < 1) {
     cpeg_wtl_certified_result_destroy(&result);
@@ -3587,6 +3589,59 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
       result.coverage.placements, result.coverage.exchanges,
       result.coverage.passes, result.coverage.total,
       result.coverage.generation_complete ? 1 : 0);
+  if (collect_trace) {
+    const CpegWtlTrace *trace = &result.trace;
+    string_builder_add_formatted_string(
+        lines,
+        "cpeg-wtl-trace schema=cpeg-wtl-trace-v1 "
+        "wall_ns=%lld setup_ns=%lld incumbent_ns=%lld "
+        "placement_screen_ns=%lld horizon_refine_ns=%lld "
+        "scoreless_screen_ns=%lld surviving_refine_ns=%lld "
+        "fixed_refine_ns=%lld finalize_ns=%lld root_actions=%lld "
+        "challengers=%lld worlds=%lld information_states=%lld "
+        "participant_capacity=%lld public_state_batches=%lld "
+        "scheduler_batches=%lld defense_world_jobs=%lld "
+        "opponent_movegen_calls=%lld "
+        "opponent_moves_generated=%lld opponent_movegen_work_ns=%lld "
+        "opponent_sort_calls=%lld opponent_moves_sorted=%lld "
+        "opponent_sort_work_ns=%lld defenses_threshold_tested=%lld "
+        "defenses_accepted=%lld defenses_refuted=%lld "
+        "compatible_draws_tested=%lld final_reply_queries=%lld "
+        "final_replies_generated=%lld final_reply_cache_hits=%lld "
+        "final_reply_movegen_work_ns=%lld threshold_short_circuits=%lld "
+        "exact_endgame_queries=%lld exact_endgame_work_ns=%lld\n",
+        (long long)trace->wall_ns, (long long)trace->setup_ns,
+        (long long)trace->incumbent_ns,
+        (long long)trace->placement_screen_ns,
+        (long long)trace->horizon_refine_ns,
+        (long long)trace->scoreless_screen_ns,
+        (long long)trace->surviving_refine_ns,
+        (long long)trace->fixed_refine_ns, (long long)trace->finalize_ns,
+        (long long)trace->root_actions, (long long)trace->challengers,
+        (long long)trace->worlds,
+        (long long)trace->opponent_information_states,
+        (long long)trace->compute_participant_capacity,
+        (long long)trace->public_state_batches,
+        (long long)trace->scheduler_batches,
+        (long long)trace->defense_world_jobs,
+        (long long)trace->opponent_movegen_calls,
+        (long long)trace->opponent_moves_generated,
+        (long long)trace->opponent_movegen_work_ns,
+        (long long)trace->opponent_sort_calls,
+        (long long)trace->opponent_moves_sorted,
+        (long long)trace->opponent_sort_work_ns,
+        (long long)trace->defenses_threshold_tested,
+        (long long)trace->defenses_accepted,
+        (long long)trace->defenses_refuted,
+        (long long)trace->compatible_draws_tested,
+        (long long)trace->final_reply_queries,
+        (long long)trace->final_replies_generated,
+        (long long)trace->final_reply_cache_hits,
+        (long long)trace->final_reply_movegen_work_ns,
+        (long long)trace->threshold_short_circuits,
+        (long long)trace->exact_endgame_queries,
+        (long long)trace->exact_endgame_work_ns);
+  }
 
   int *order = malloc_or_die((size_t)result.count * sizeof(*order));
   for (int candidate_idx = 0; candidate_idx < result.count; candidate_idx++) {
@@ -3845,6 +3900,7 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
 //                           root coverage.
 //   cpeg <bag> lead <signed-int> budget <seconds> belief <path> -> the same
 //                           proof over an exact integer-weight posterior file.
+//   Add `trace` to a certified lead/budget command to emit producer cost data.
 void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (!config_has_game_data(config)) {
     error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
@@ -3861,6 +3917,7 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   int initial_lead = 0;
   double budget_seconds = 0.0;
   const char *belief_path = NULL;
+  bool collect_trace = false;
   const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
   for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
     const char *value = config_get_parg_value(config, ARG_TOKEN_CPEG, arg_idx);
@@ -3869,6 +3926,14 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
     }
     if (strings_equal(value, "noexch")) {
       allow_exchanges = false;
+    } else if (strings_equal(value, "trace")) {
+      if (collect_trace) {
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+            string_duplicate("cpeg trace may be specified only once"));
+        return;
+      }
+      collect_trace = true;
     } else if (strings_equal(value, "belief")) {
       if (belief_path != NULL || arg_idx + 1 >= n_args) {
         error_stack_push(
@@ -3938,6 +4003,12 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
             "cpeg belief requires the certified lead/budget solver"));
     return;
   }
+  if (collect_trace && !(has_lead && use_certified)) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+        string_duplicate("cpeg trace requires the certified lead/budget solver"));
+    return;
+  }
 
   if (bag <= 0) {
     if (has_lead) {
@@ -3964,7 +4035,8 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (use_certified) {
     if (has_lead) {
       impl_cpeg_wtl_certified(config, bag, allow_exchanges, initial_lead,
-                              budget_seconds, belief_path, error_stack);
+                              budget_seconds, belief_path, collect_trace,
+                              error_stack);
       return;
     }
     impl_cpeg_certified(config, bag, allow_exchanges, budget_seconds,

@@ -335,6 +335,46 @@ typedef enum CpegWtlProofKind {
   CPEG_WTL_PROOF_EXACT,
 } CpegWtlProofKind;
 
+// Default-off producer instrumentation. Timings ending in `_work_ns` are sums
+// across jobs and may exceed wall time when work runs in parallel.
+typedef struct CpegWtlTrace {
+  int64_t wall_ns;
+  int64_t setup_ns;
+  int64_t incumbent_ns;
+  int64_t placement_screen_ns;
+  int64_t horizon_refine_ns;
+  int64_t scoreless_screen_ns;
+  int64_t surviving_refine_ns;
+  int64_t fixed_refine_ns;
+  int64_t finalize_ns;
+  int64_t root_actions;
+  int64_t challengers;
+  int64_t worlds;
+  int64_t opponent_information_states;
+  int64_t compute_participant_capacity;
+  // Zero until move-generation traversal is shared across public-state groups.
+  int64_t public_state_batches;
+  int64_t scheduler_batches;
+  int64_t defense_world_jobs;
+  int64_t opponent_movegen_calls;
+  int64_t opponent_moves_generated;
+  int64_t opponent_movegen_work_ns;
+  int64_t opponent_sort_calls;
+  int64_t opponent_moves_sorted;
+  int64_t opponent_sort_work_ns;
+  int64_t defenses_threshold_tested;
+  int64_t defenses_accepted;
+  int64_t defenses_refuted;
+  int64_t compatible_draws_tested;
+  int64_t final_reply_queries;
+  int64_t final_replies_generated;
+  int64_t final_reply_cache_hits;
+  int64_t final_reply_movegen_work_ns;
+  int64_t threshold_short_circuits;
+  int64_t exact_endgame_queries;
+  int64_t exact_endgame_work_ns;
+} CpegWtlTrace;
+
 typedef struct CpegWtlCertifiedArgs {
   int bag;
   bool allow_exchanges;
@@ -354,6 +394,8 @@ typedef struct CpegWtlCertifiedArgs {
   // a different Game whose visible inventory happens to admit those bags.
   const MachineLetter *weighted_unseen_tiles;
   int weighted_unseen_count;
+  // Collect the versioned producer trace. False preserves the normal hot path.
+  bool collect_trace;
 } CpegWtlCertifiedArgs;
 
 typedef struct CpegWtlCertifiedCand {
@@ -389,6 +431,7 @@ typedef struct CpegWtlCertifiedResult {
   int64_t regret_den;
   bool unique_best;
   CpegRootCoverage coverage;
+  CpegWtlTrace trace;
 } CpegWtlCertifiedResult;
 
 // Construct the sound outcome enclosure implied by a concrete opponent

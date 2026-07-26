@@ -618,6 +618,8 @@ static void test_cpeg_wtl_command_parsing(void) {
                             ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
   cpeg_assert_command_error(config, error_stack, "cpeg 4 lead nope",
                             ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg 4 trace",
+                            ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
   // A negative lead is consumed as the signed lead value, not mistaken for
   // the bag; the subsequent error is specifically the unsupported bag size.
   cpeg_assert_command_error(config, error_stack, "cpeg 5 lead -51",
@@ -629,6 +631,13 @@ static void test_cpeg_wtl_command_parsing(void) {
   // used to make this otherwise-valid uniform command fail tuple validation.
   load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
   config_load_command(config, "cpeg 1 noexch lead -51 budget 0.001",
+                      error_stack);
+  assert(error_stack_is_empty(error_stack));
+  config_execute_command(config, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  config_load_command(config,
+                      "cpeg 1 noexch lead -51 budget 0.001 trace",
                       error_stack);
   assert(error_stack_is_empty(error_stack));
   config_execute_command(config, error_stack);
@@ -1638,6 +1647,8 @@ void test_cpeg_wtl_certified_proof(void) {
   assert(one_thread.coverage.generation_complete);
   assert(one_thread.worlds_distinct == 246);
   assert(one_thread.world_weight_mass == 330);
+  const CpegWtlTrace empty_trace = {0};
+  assert(memcmp(&one_thread.trace, &empty_trace, sizeof(empty_trace)) == 0);
   for (int candidate_idx = 0; candidate_idx < one_thread.count;
        candidate_idx++) {
     cpeg_assert_wtl_certified_candidate_valid(&one_thread.cands[candidate_idx]);
@@ -1651,6 +1662,29 @@ void test_cpeg_wtl_certified_proof(void) {
                                               &four_thread_args,
                                               &four_threads) == 1314);
   cpeg_assert_wtl_certified_results_equal(&one_thread, &four_threads);
+
+  CpegWtlCertifiedArgs trace_args = one_thread_args;
+  trace_args.collect_trace = true;
+  load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
+  CpegWtlCertifiedResult traced = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &trace_args, &traced) == 1314);
+  cpeg_assert_wtl_certified_results_equal(&one_thread, &traced);
+  assert(traced.trace.wall_ns > 0);
+  assert(traced.trace.setup_ns > 0);
+  assert(traced.trace.root_actions == 1314);
+  assert(traced.trace.challengers == 1313);
+  assert(traced.trace.worlds == 246);
+  assert(traced.trace.opponent_information_states == 246);
+  assert(traced.trace.compute_participant_capacity == 1);
+  assert(traced.trace.public_state_batches == 0);
+  assert(traced.trace.scheduler_batches > 0);
+  assert(traced.trace.defense_world_jobs > 0);
+  assert(traced.trace.opponent_movegen_calls > 0);
+  assert(traced.trace.opponent_moves_generated > 0);
+  assert(traced.trace.opponent_sort_calls > 0);
+  assert(traced.trace.final_reply_queries > 0);
+  cpeg_wtl_certified_result_destroy(&traced);
   cpeg_wtl_certified_result_destroy(&four_threads);
   cpeg_wtl_certified_result_destroy(&one_thread);
 
