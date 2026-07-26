@@ -44,6 +44,13 @@ typedef struct CpegResult {
 // Fills *result and returns the swing (in points).
 int cpeg_solve_endgame(Game *game, CpegResult *result);
 
+// One-sided form of the same exact two-ply model. Sets *above_threshold to
+// whether the exact swing is strictly greater than threshold without
+// necessarily computing the swing itself. Returns 0 on success and -1 on an
+// invalid or capacity-exceeded position.
+int cpeg_solve_endgame_swing_above(Game *game, int64_t threshold,
+                                   bool *above_threshold);
+
 // Maximum absolute raw point value of any tile in the distribution.
 int cpeg_max_future_tile_score(const LetterDistribution *ld);
 
@@ -396,6 +403,14 @@ typedef struct CpegWtlTrace {
   int64_t fixed_endgame_queries;
   int64_t fixed_endgame_cache_hits;
   int64_t fixed_endgame_work_ns;
+  int64_t fixed_endgame_threshold_queries;
+  int64_t fixed_endgame_threshold_proofs;
+  int64_t fixed_endgame_threshold_work_ns;
+  // Fixed-refinement work grouped by the opponent's empty-bag rack size.
+  // These arrays are populated only when tracing is enabled.
+  int64_t fixed_endgame_queries_by_opponent_rack[RACK_SIZE + 1];
+  int64_t fixed_endgame_cache_hits_by_opponent_rack[RACK_SIZE + 1];
+  int64_t fixed_endgame_work_ns_by_opponent_rack[RACK_SIZE + 1];
 } CpegWtlTrace;
 
 typedef struct CpegWtlCertifiedArgs {
@@ -429,6 +444,9 @@ typedef struct CpegWtlCertifiedArgs {
   // Experiment only: reuse exact empty-bag swings by a collision-safe key over
   // the complete board, both racks, and the player on turn.
   bool use_exact_endgame_cache;
+  // Experiment only: in fixed refinement, answer only whether the root can
+  // still win each empty-bag state and stop each challenger once dominated.
+  bool use_fixed_win_threshold;
   // Collect the versioned producer trace. False preserves the normal hot path.
   bool collect_trace;
 } CpegWtlCertifiedArgs;

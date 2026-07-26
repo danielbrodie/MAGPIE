@@ -349,6 +349,23 @@ static void test_cpeg_endgame(void) {
   assert_strings_equal(result.mover_str, "C4 EYAS");
   assert_strings_equal(result.reply_str, "K4 (B)hUT");
 
+  Game *before = game_duplicate(game);
+  bool above_threshold = false;
+  assert(cpeg_solve_endgame_swing_above(game, 4, &above_threshold) == 0);
+  assert(above_threshold);
+  assert(cpeg_solve_endgame_swing_above(game, 5, &above_threshold) == 0);
+  assert(!above_threshold);
+  assert(cpeg_solve_endgame_swing_above(game, 6, &above_threshold) == 0);
+  assert(!above_threshold);
+  assert(cpeg_solve_endgame_swing_above(
+             game, INT64_MIN, &above_threshold) == 0);
+  assert(above_threshold);
+  assert(cpeg_solve_endgame_swing_above(
+             game, INT64_MAX, &above_threshold) == 0);
+  assert(!above_threshold);
+  cpeg_test_assert_state_equal(before, game);
+  game_destroy(before);
+
   config_destroy(config);
 }
 
@@ -624,6 +641,8 @@ static void test_cpeg_wtl_command_parsing(void) {
                             ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
   cpeg_assert_command_error(config, error_stack, "cpeg 1 endcache",
                             ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg 1 fixedwin",
+                            ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
   // A negative lead is consumed as the signed lead value, not mistaken for
   // the bag; the subsequent error is specifically the unsupported bag size.
   cpeg_assert_command_error(config, error_stack, "cpeg 5 lead -51",
@@ -636,6 +655,12 @@ static void test_cpeg_wtl_command_parsing(void) {
   load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
   config_load_command(config, "cpeg 1 noexch lead -51 budget 0.001",
                       error_stack);
+  assert(error_stack_is_empty(error_stack));
+  config_execute_command(config, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  config_load_command(
+      config, "cpeg 1 noexch lead -51 budget 0.001 fixedwin", error_stack);
   assert(error_stack_is_empty(error_stack));
   config_execute_command(config, error_stack);
   assert(error_stack_is_empty(error_stack));
@@ -1751,6 +1776,9 @@ void test_cpeg_wtl_certified_proof(void) {
   int64_t candidate_exact_endgame_cache_hits = 0;
   int64_t candidate_fixed_endgame_queries = 0;
   int64_t candidate_fixed_endgame_cache_hits = 0;
+  int64_t shaped_fixed_endgame_queries = 0;
+  int64_t shaped_fixed_endgame_cache_hits = 0;
+  int64_t shaped_fixed_endgame_work_ns = 0;
   for (int candidate_idx = 0; candidate_idx < traced.count;
        candidate_idx++) {
     const CpegWtlTrace *candidate_trace =
@@ -1776,6 +1804,20 @@ void test_cpeg_wtl_certified_proof(void) {
          traced.trace.fixed_endgame_queries);
   assert(candidate_fixed_endgame_cache_hits ==
          traced.trace.fixed_endgame_cache_hits);
+  for (int rack_tiles = 0; rack_tiles <= RACK_SIZE; rack_tiles++) {
+    shaped_fixed_endgame_queries +=
+        traced.trace.fixed_endgame_queries_by_opponent_rack[rack_tiles];
+    shaped_fixed_endgame_cache_hits +=
+        traced.trace.fixed_endgame_cache_hits_by_opponent_rack[rack_tiles];
+    shaped_fixed_endgame_work_ns +=
+        traced.trace.fixed_endgame_work_ns_by_opponent_rack[rack_tiles];
+  }
+  assert(shaped_fixed_endgame_queries ==
+         traced.trace.fixed_endgame_queries);
+  assert(shaped_fixed_endgame_cache_hits ==
+         traced.trace.fixed_endgame_cache_hits);
+  assert(shaped_fixed_endgame_work_ns ==
+         traced.trace.fixed_endgame_work_ns);
   cpeg_wtl_certified_result_destroy(&traced);
   cpeg_wtl_certified_result_destroy(&two_ply);
   cpeg_wtl_certified_result_destroy(&four_threads);

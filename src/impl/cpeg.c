@@ -226,6 +226,85 @@ static int cpeg_endgame_core_until(Game *game, MoveList *mover_moves,
   return result->swing;
 }
 
+// Decide only whether the empty-bag two-ply swing is strictly above threshold.
+// Reply scores are non-negative, so once the score-sorted mover list reaches a
+// move at or below threshold, no remaining move can cross it.
+static bool cpeg_endgame_swing_above(
+    Game *game, MoveList *mover_moves, MoveList *reply_moves, MoveUndo *undo,
+    int64_t threshold, bool *above_threshold, bool *capacity_exceeded,
+    int64_t deadline_ns, bool *complete) {
+  *above_threshold = false;
+  if (complete != NULL) {
+    *complete = true;
+  }
+  if (deadline_ns != 0 && ctimer_monotonic_ns() >= deadline_ns) {
+    if (complete != NULL) {
+      *complete = false;
+    }
+    return true;
+  }
+
+  Board *board = game_get_board(game);
+  if (!board_get_cross_sets_valid(board)) {
+    game_gen_all_cross_sets(game);
+    board_set_cross_sets_valid(board, true);
+  }
+  const MoveGenArgs mover_args = {
+      .game = game,
+      .move_list = mover_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves(&mover_args);
+  move_list_sort_moves(mover_moves);
+  if (move_list_get_count(mover_moves) > CPEG_MOVE_LIST_CAP) {
+    if (capacity_exceeded != NULL) {
+      *capacity_exceeded = true;
+    }
+    return true;
+  }
+
+  const int mover_count = move_list_get_count(mover_moves);
+  for (int mover_idx = 0; mover_idx < mover_count; mover_idx++) {
+    if (deadline_ns != 0 && ctimer_monotonic_ns() >= deadline_ns) {
+      if (complete != NULL) {
+        *complete = false;
+      }
+      break;
+    }
+    const Move *mover_move = move_list_get_move(mover_moves, mover_idx);
+    const int mover_score = equity_to_int(move_get_score(mover_move));
+    if ((int64_t)mover_score <= threshold) {
+      break;
+    }
+    play_move_incremental(mover_move, game, undo);
+    const MoveGenArgs reply_args = {
+        .game = game,
+        .move_list = reply_moves,
+        .move_record_type = MOVE_RECORD_BEST,
+        .move_sort_type = MOVE_SORT_SCORE,
+        .override_kwg = NULL,
+        .eq_margin_movegen = 0,
+        .target_equity = EQUITY_MAX_VALUE,
+        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+    };
+    generate_moves(&reply_args);
+    const Move *reply_move = move_list_get_move(reply_moves, 0);
+    const int reply_score = equity_to_int(move_get_score(reply_move));
+    const int swing = mover_score - reply_score;
+    unplay_move_incremental(game, undo);
+    if ((int64_t)swing > threshold) {
+      *above_threshold = true;
+      break;
+    }
+  }
+  return true;
+}
+
 static int cpeg_endgame_core(Game *game, MoveList *mover_moves,
                              MoveList *reply_moves, MoveUndo *undo,
                              CpegResult *result, bool *capacity_exceeded) {
@@ -244,6 +323,26 @@ int cpeg_solve_endgame(Game *game, CpegResult *result) {
   move_list_destroy(reply_moves);
   move_list_destroy(mover_moves);
   return swing;
+}
+
+int cpeg_solve_endgame_swing_above(Game *game, int64_t threshold,
+                                   bool *above_threshold) {
+  if (game == NULL || above_threshold == NULL ||
+      !bag_is_empty(game_get_bag(game))) {
+    return -1;
+  }
+  MoveList *mover_moves = move_list_create(CPEG_MOVE_LIST_CAP + 1);
+  MoveList *reply_moves = move_list_create(CPEG_MOVE_LIST_CAP);
+  MoveUndo *undo = malloc_or_die(sizeof(MoveUndo));
+  bool capacity_exceeded = false;
+  bool complete = true;
+  const bool valid = cpeg_endgame_swing_above(
+      game, mover_moves, reply_moves, undo, threshold, above_threshold,
+      &capacity_exceeded, /*deadline_ns=*/0, &complete);
+  free(undo);
+  move_list_destroy(reply_moves);
+  move_list_destroy(mover_moves);
+  return valid && !capacity_exceeded && complete ? 0 : -1;
 }
 
 CpegWtlValue cpeg_wtl_classify_margin(int64_t final_margin) {
@@ -3234,6 +3333,20 @@ static void cpeg_wtl_trace_add_work(CpegWtlTrace *dest,
   dest->fixed_endgame_queries += source->fixed_endgame_queries;
   dest->fixed_endgame_cache_hits += source->fixed_endgame_cache_hits;
   dest->fixed_endgame_work_ns += source->fixed_endgame_work_ns;
+  dest->fixed_endgame_threshold_queries +=
+      source->fixed_endgame_threshold_queries;
+  dest->fixed_endgame_threshold_proofs +=
+      source->fixed_endgame_threshold_proofs;
+  dest->fixed_endgame_threshold_work_ns +=
+      source->fixed_endgame_threshold_work_ns;
+  for (int rack_tiles = 0; rack_tiles <= RACK_SIZE; rack_tiles++) {
+    dest->fixed_endgame_queries_by_opponent_rack[rack_tiles] +=
+        source->fixed_endgame_queries_by_opponent_rack[rack_tiles];
+    dest->fixed_endgame_cache_hits_by_opponent_rack[rack_tiles] +=
+        source->fixed_endgame_cache_hits_by_opponent_rack[rack_tiles];
+    dest->fixed_endgame_work_ns_by_opponent_rack[rack_tiles] +=
+        source->fixed_endgame_work_ns_by_opponent_rack[rack_tiles];
+  }
 }
 
 static bool cpeg_generate_small_moves_at_least(
@@ -5380,6 +5493,7 @@ typedef struct CpegWtlPlacementRefineJob {
   int batches_completed;
   bool collect_trace;
   bool use_threshold_reply_screen;
+  bool use_fixed_win_threshold;
   bool proof_valid;
   bool deadline_reached;
   CpegWtlTrace trace;
@@ -5645,29 +5759,69 @@ static bool cpeg_wtl_fixed_defense_world(CpegWtlPlacementRefineJob *job,
     bool capacity_exceeded = false;
     bool endgame_complete = true;
     bool endgame_cache_hit = false;
+    const int opponent_rack_tiles = rack_get_total_letters(opponent_rack);
+    if (opponent_rack_tiles < 0 || opponent_rack_tiles > RACK_SIZE) {
+      return false;
+    }
     const int64_t start_ns = trace != NULL ? ctimer_monotonic_ns() : 0;
-    const int root_swing = cpeg_exact_endgame_swing(
-        worker->defense_game, worker->endgame_mover, worker->endgame_reply,
-        worker->endgame_undo, worker->exact_endgame_cache, &capacity_exceeded,
-        /*deadline_ns=*/0, &endgame_complete, &endgame_cache_hit);
+    int root_swing = 0;
+    bool above_win_threshold = false;
+    if (job->use_fixed_win_threshold) {
+      if (!cpeg_endgame_swing_above(
+              worker->defense_game, worker->endgame_mover,
+              worker->endgame_reply, worker->endgame_undo,
+              -margin_after_defense, &above_win_threshold,
+              &capacity_exceeded, /*deadline_ns=*/0, &endgame_complete)) {
+        return false;
+      }
+    } else {
+      root_swing = cpeg_exact_endgame_swing(
+          worker->defense_game, worker->endgame_mover, worker->endgame_reply,
+          worker->endgame_undo, worker->exact_endgame_cache,
+          &capacity_exceeded, /*deadline_ns=*/0, &endgame_complete,
+          &endgame_cache_hit);
+    }
     if (trace != NULL) {
       const int64_t work_ns = ctimer_monotonic_ns() - start_ns;
-      trace->exact_endgame_queries++;
       trace->fixed_endgame_queries++;
-      if (endgame_cache_hit) {
-        trace->exact_endgame_cache_hits++;
-        trace->fixed_endgame_cache_hits++;
+      if (job->use_fixed_win_threshold) {
+        trace->fixed_endgame_threshold_queries++;
+        if (!capacity_exceeded && endgame_complete &&
+            !above_win_threshold) {
+          trace->fixed_endgame_threshold_proofs++;
+        }
+        trace->fixed_endgame_threshold_work_ns += work_ns;
+      } else {
+        trace->exact_endgame_queries++;
+        if (endgame_cache_hit) {
+          trace->exact_endgame_cache_hits++;
+          trace->fixed_endgame_cache_hits++;
+        }
+        trace->exact_endgame_work_ns += work_ns;
       }
-      trace->exact_endgame_work_ns += work_ns;
       trace->fixed_endgame_work_ns += work_ns;
+      trace->fixed_endgame_queries_by_opponent_rack[opponent_rack_tiles]++;
+      if (endgame_cache_hit) {
+        trace
+            ->fixed_endgame_cache_hits_by_opponent_rack[opponent_rack_tiles]++;
+      }
+      trace->fixed_endgame_work_ns_by_opponent_rack[opponent_rack_tiles] +=
+          work_ns;
     }
     if (capacity_exceeded) {
       draw_values[draw_idx] = cpeg_wtl_unresolved_envelope(job->margin_prior);
       result->win_upper_mass += draws[draw_idx].weight;
       result->tie_upper_mass += draws[draw_idx].weight;
+    } else if (job->use_fixed_win_threshold && above_win_threshold) {
+      draw_values[draw_idx] =
+          cpeg_wtl_unresolved_envelope(job->margin_prior);
+      result->win_upper_mass += draws[draw_idx].weight;
+      result->tie_upper_mass += draws[draw_idx].weight;
     } else {
       int64_t margin_upper;
-      if (!cpeg_checked_margin_add(margin_after_defense, root_swing,
+      const int64_t swing_upper =
+          job->use_fixed_win_threshold ? -margin_after_defense : root_swing;
+      if (!cpeg_checked_margin_add(margin_after_defense, swing_upper,
                                    &margin_upper)) {
         return false;
       }
@@ -5851,6 +6005,7 @@ static bool cpeg_wtl_refine_surviving_placements(
         .world_evaluations = &evaluations[job_idx * world_count],
         .collect_trace = args->collect_trace,
         .use_threshold_reply_screen = args->use_threshold_reply_screen,
+        .use_fixed_win_threshold = args->use_fixed_win_threshold,
     };
     refine_job_ptrs[job_idx] = &refine_jobs[job_idx];
     job_idx++;
@@ -5964,9 +6119,11 @@ static bool cpeg_wtl_refine_fixed_worlds_parallel(
                   .deadline_ns = deadline_ns,
                   .margin_prior = margin_prior,
                    .world_mass = world_mass,
-                   .collect_trace = args->collect_trace,
-                   .use_threshold_reply_screen =
-                       args->use_threshold_reply_screen,
+                  .collect_trace = args->collect_trace,
+                  .use_threshold_reply_screen =
+                      args->use_threshold_reply_screen,
+                  .use_fixed_win_threshold =
+                      args->use_fixed_win_threshold,
                },
           .world_idx = world_idx,
       };
@@ -6553,11 +6710,20 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
     }
   }
   if (proof_valid && !stopped && args->max_batches == 0 && incumbent_idx >= 0) {
-    proof_valid = cpeg_wtl_refine_fixed_worlds_parallel(
-        pool, workers, helper_worker_idx, root_game, candidates,
-        candidate_count, worlds, world_count, world_mass, unseen, ld_size,
-        opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
-        unresolved_margin_prior, out, states, &stopped);
+    if (args->use_fixed_win_threshold) {
+      proof_valid = cpeg_wtl_refine_surviving_placements(
+          pool, workers, helper_worker_idx, root_game, candidates,
+          candidate_count, worlds, world_count, world_mass, unseen, ld_size,
+          opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
+          unresolved_margin_prior, /*max_defenses=*/1,
+          /*fixed_endgame=*/true, out, states, &stopped);
+    } else {
+      proof_valid = cpeg_wtl_refine_fixed_worlds_parallel(
+          pool, workers, helper_worker_idx, root_game, candidates,
+          candidate_count, worlds, world_count, world_mass, unseen, ld_size,
+          opponent_idx, root_idx, incumbent_idx, args, deadline_ns,
+          unresolved_margin_prior, out, states, &stopped);
+    }
   }
   if (collect_trace) {
     out->trace.fixed_refine_ns =
