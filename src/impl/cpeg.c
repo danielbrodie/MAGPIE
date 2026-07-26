@@ -30,6 +30,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -2440,6 +2441,7 @@ void cpeg_wtl_certified_result_destroy(CpegWtlCertifiedResult *result) {
   if (result == NULL) {
     return;
   }
+  free(result->candidate_traces);
   free(result->cands);
   memset(result, 0, sizeof(*result));
   result->best_index = -1;
@@ -3734,6 +3736,8 @@ static void cpeg_wtl_recompute_candidate(
   candidate->worlds_bounded = 0;
   candidate->worlds_unresolved = 0;
   candidate->exact_weight = 0;
+  candidate->bounded_weight = 0;
+  candidate->unresolved_weight = 0;
   for (int world_idx = 0; world_idx < world_count; world_idx++) {
     const CpegWtlProofWorld *evaluation = &world_evaluations[world_idx];
     const int64_t world_weight = worlds[world_idx].multiset.weight;
@@ -3744,6 +3748,7 @@ static void cpeg_wtl_recompute_candidate(
       state->tie_upper_mass += world_weight * draw_mass;
       state->loss_upper_mass += world_weight * draw_mass;
       candidate->worlds_unresolved++;
+      candidate->unresolved_weight += world_weight;
       continue;
     }
     values[world_idx] = evaluation->envelope;
@@ -3758,6 +3763,7 @@ static void cpeg_wtl_recompute_candidate(
       candidate->exact_weight += world_weight;
     } else {
       candidate->worlds_bounded++;
+      candidate->bounded_weight += world_weight;
     }
   }
   state->outcome_mass = world_mass * draw_mass;
@@ -3847,10 +3853,14 @@ static bool cpeg_wtl_run_defense_batch(
     const CpegRootCand *candidate, int64_t initial_lead, int64_t deadline_ns,
     CpegInterval margin_prior, bool exhaustive_horizon, int max_defenses,
     CpegWtlProofWorld *world_evaluations, int *exact_jobs, int *bound_jobs,
-    bool *batch_complete, CpegWtlTrace *trace) {
+    bool *batch_complete, CpegWtlTrace *trace,
+    CpegWtlTrace *candidate_trace) {
   *batch_complete = false;
   if (trace != NULL) {
     trace->scheduler_batches++;
+  }
+  if (candidate_trace != NULL) {
+    candidate_trace->scheduler_batches++;
   }
   for (int job_idx = 0; job_idx < world_count; job_idx++) {
     const int world_idx = first_world + job_idx;
@@ -3876,6 +3886,7 @@ static bool cpeg_wtl_run_defense_batch(
                            helper_worker_idx);
   for (int job_idx = 0; job_idx < world_count; job_idx++) {
     cpeg_wtl_trace_add_work(trace, &jobs[job_idx].trace);
+    cpeg_wtl_trace_add_work(candidate_trace, &jobs[job_idx].trace);
     if (jobs[job_idx].capacity_exceeded) {
       return false;
     }
@@ -3900,6 +3911,83 @@ typedef struct CpegWtlReplyCacheEntry {
   uint64_t rack_key;
   int score;
 } CpegWtlReplyCacheEntry;
+
+typedef struct CpegWtlAtomicCandidateTrace {
+  atomic_int_fast64_t defense_world_jobs;
+  atomic_int_fast64_t defenses_threshold_tested;
+  atomic_int_fast64_t defenses_accepted;
+  atomic_int_fast64_t compatible_draws_tested;
+  atomic_int_fast64_t final_reply_queries;
+  atomic_int_fast64_t final_replies_generated;
+  atomic_int_fast64_t final_reply_cache_hits;
+  atomic_int_fast64_t final_reply_movegen_work_ns;
+} CpegWtlAtomicCandidateTrace;
+
+static void
+cpeg_wtl_atomic_candidate_trace_init(CpegWtlAtomicCandidateTrace *trace) {
+  atomic_init(&trace->defense_world_jobs, 0);
+  atomic_init(&trace->defenses_threshold_tested, 0);
+  atomic_init(&trace->defenses_accepted, 0);
+  atomic_init(&trace->compatible_draws_tested, 0);
+  atomic_init(&trace->final_reply_queries, 0);
+  atomic_init(&trace->final_replies_generated, 0);
+  atomic_init(&trace->final_reply_cache_hits, 0);
+  atomic_init(&trace->final_reply_movegen_work_ns, 0);
+}
+
+static void cpeg_wtl_atomic_candidate_trace_add(
+    CpegWtlAtomicCandidateTrace *dest, const CpegWtlTrace *source) {
+  if (dest == NULL || source == NULL) {
+    return;
+  }
+  atomic_fetch_add_explicit(&dest->defense_world_jobs,
+                            source->defense_world_jobs,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&dest->defenses_threshold_tested,
+                            source->defenses_threshold_tested,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&dest->defenses_accepted,
+                            source->defenses_accepted,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&dest->compatible_draws_tested,
+                            source->compatible_draws_tested,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&dest->final_reply_queries,
+                            source->final_reply_queries,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&dest->final_replies_generated,
+                            source->final_replies_generated,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&dest->final_reply_cache_hits,
+                            source->final_reply_cache_hits,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&dest->final_reply_movegen_work_ns,
+                            source->final_reply_movegen_work_ns,
+                            memory_order_relaxed);
+}
+
+static void cpeg_wtl_atomic_candidate_trace_load(
+    CpegWtlTrace *dest, const CpegWtlAtomicCandidateTrace *source) {
+  if (dest == NULL || source == NULL) {
+    return;
+  }
+  dest->defense_world_jobs +=
+      atomic_load_explicit(&source->defense_world_jobs, memory_order_relaxed);
+  dest->defenses_threshold_tested += atomic_load_explicit(
+      &source->defenses_threshold_tested, memory_order_relaxed);
+  dest->defenses_accepted +=
+      atomic_load_explicit(&source->defenses_accepted, memory_order_relaxed);
+  dest->compatible_draws_tested += atomic_load_explicit(
+      &source->compatible_draws_tested, memory_order_relaxed);
+  dest->final_reply_queries +=
+      atomic_load_explicit(&source->final_reply_queries, memory_order_relaxed);
+  dest->final_replies_generated += atomic_load_explicit(
+      &source->final_replies_generated, memory_order_relaxed);
+  dest->final_reply_cache_hits += atomic_load_explicit(
+      &source->final_reply_cache_hits, memory_order_relaxed);
+  dest->final_reply_movegen_work_ns += atomic_load_explicit(
+      &source->final_reply_movegen_work_ns, memory_order_relaxed);
+}
 
 static uint64_t cpeg_wtl_rack_key(const Rack *rack, int ld_size) {
   uint64_t key = 1;
@@ -4071,6 +4159,12 @@ static bool cpeg_wtl_screen_scoreless_candidates(
       }
       if (trace != NULL) {
         trace->compatible_draws_tested += draw_count;
+        CpegWtlTrace *candidate_trace =
+            &out->candidate_traces[candidate_idx];
+        candidate_trace->defense_world_jobs++;
+        candidate_trace->defenses_threshold_tested++;
+        candidate_trace->defenses_accepted++;
+        candidate_trace->compatible_draws_tested += draw_count;
       }
       int64_t candidate_win_upper = 0;
       int64_t candidate_tie_upper = 0;
@@ -4089,9 +4183,14 @@ static bool cpeg_wtl_screen_scoreless_candidates(
         }
         rack_copy(player_get_rack(game_get_player(world_game, root_idx)),
                   &branch_rack);
-        const int root_score =
-            cpeg_wtl_cached_root_score(world_game, root_moves, ld_size, cache,
-                                       REPLY_CACHE_CAPACITY, threshold, trace);
+        CpegWtlTrace reply_trace = {0};
+        const int root_score = cpeg_wtl_cached_root_score(
+            world_game, root_moves, ld_size, cache, REPLY_CACHE_CAPACITY,
+            threshold, trace != NULL ? &reply_trace : NULL);
+        cpeg_wtl_trace_add_work(trace, &reply_trace);
+        cpeg_wtl_trace_add_work(
+            trace != NULL ? &out->candidate_traces[candidate_idx] : NULL,
+            &reply_trace);
         const int64_t margin_upper =
             args->initial_lead - (int64_t)defense_score + root_score;
         if (margin_upper > 0) {
@@ -4139,6 +4238,8 @@ static bool cpeg_wtl_screen_scoreless_candidates(
     result_candidate->worlds_bounded = worlds_bounded;
     result_candidate->worlds_unresolved = world_count - worlds_bounded;
     result_candidate->exact_weight = 0;
+    result_candidate->bounded_weight = bounded_world_mass;
+    result_candidate->unresolved_weight = world_mass - bounded_world_mass;
     result_candidate->outcome = (CpegWtlEnvelope){
         .estimate =
             {
@@ -4201,6 +4302,7 @@ typedef struct CpegWtlScorelessWorldJob {
   int64_t *win_upper;
   int64_t *tie_upper;
   int64_t *loss_lower;
+  CpegWtlAtomicCandidateTrace *candidate_traces;
   bool collect_trace;
   bool bounded;
   bool complete;
@@ -4285,6 +4387,16 @@ static void cpeg_wtl_scoreless_world_job_run(void *arg, int worker_idx) {
       draws[0].weight = 1;
     }
     if (trace != NULL) {
+      const CpegWtlTrace candidate_context = {
+          .defense_world_jobs = 1,
+          .defenses_threshold_tested = 1,
+          .defenses_accepted = 1,
+          .compatible_draws_tested = draw_count,
+      };
+      cpeg_wtl_atomic_candidate_trace_add(
+          &job->candidate_traces[candidate_idx], &candidate_context);
+    }
+    if (trace != NULL) {
       trace->compatible_draws_tested += draw_count;
     }
     for (int draw_idx = 0; draw_idx < draw_count; draw_idx++) {
@@ -4302,9 +4414,15 @@ static void cpeg_wtl_scoreless_world_job_run(void *arg, int worker_idx) {
       rack_copy(
           player_get_rack(game_get_player(worker->defense_game, job->root_idx)),
           &branch_rack);
+      CpegWtlTrace reply_trace = {0};
       const int root_score = cpeg_wtl_cached_root_score(
           worker->defense_game, worker->root_best, job->ld_size, cache,
-          REPLY_CACHE_CAPACITY, threshold, trace);
+          REPLY_CACHE_CAPACITY, threshold,
+          trace != NULL ? &reply_trace : NULL);
+      cpeg_wtl_trace_add_work(trace, &reply_trace);
+      cpeg_wtl_atomic_candidate_trace_add(
+          trace != NULL ? &job->candidate_traces[candidate_idx] : NULL,
+          &reply_trace);
       if (root_score == INT_MAX) {
         job->proof_valid = false;
         return;
@@ -4346,6 +4464,16 @@ static bool cpeg_wtl_screen_scoreless_candidates_parallel(
       (size_t)world_count * (size_t)candidate_count, sizeof(*tie_upper));
   int64_t *loss_lower = calloc_or_die(
       (size_t)world_count * (size_t)candidate_count, sizeof(*loss_lower));
+  CpegWtlAtomicCandidateTrace *candidate_traces = NULL;
+  if (args->collect_trace) {
+    candidate_traces =
+        malloc_or_die((size_t)candidate_count * sizeof(*candidate_traces));
+    for (int candidate_idx = 0; candidate_idx < candidate_count;
+         candidate_idx++) {
+      cpeg_wtl_atomic_candidate_trace_init(
+          &candidate_traces[candidate_idx]);
+    }
+  }
   for (int world_idx = 0; world_idx < world_count; world_idx++) {
     jobs[world_idx] = (CpegWtlScorelessWorldJob){
         .workers = workers,
@@ -4363,6 +4491,7 @@ static bool cpeg_wtl_screen_scoreless_candidates_parallel(
         .win_upper = &win_upper[world_idx * candidate_count],
         .tie_upper = &tie_upper[world_idx * candidate_count],
         .loss_lower = &loss_lower[world_idx * candidate_count],
+        .candidate_traces = candidate_traces,
         .collect_trace = args->collect_trace,
     };
     job_ptrs[world_idx] = &jobs[world_idx];
@@ -4390,6 +4519,9 @@ static bool cpeg_wtl_screen_scoreless_candidates_parallel(
   }
   for (int candidate_idx = 0; candidate_idx < candidate_count;
        candidate_idx++) {
+    cpeg_wtl_atomic_candidate_trace_load(
+        args->collect_trace ? &out->candidate_traces[candidate_idx] : NULL,
+        candidate_traces != NULL ? &candidate_traces[candidate_idx] : NULL);
     const CpegRootCand *candidate = &candidates[candidate_idx];
     if (candidate->kind == 0) {
       continue;
@@ -4422,6 +4554,8 @@ static bool cpeg_wtl_screen_scoreless_candidates_parallel(
     result_candidate->worlds_bounded = worlds_bounded;
     result_candidate->worlds_unresolved = world_count - worlds_bounded;
     result_candidate->exact_weight = 0;
+    result_candidate->bounded_weight = bounded_world_mass;
+    result_candidate->unresolved_weight = world_mass - bounded_world_mass;
     result_candidate->outcome = cpeg_wtl_unresolved_envelope(margin_prior);
     cpeg_wtl_set_rational_outcome(result_candidate);
     states[candidate_idx] = (CpegWtlProofState){
@@ -4437,6 +4571,7 @@ static bool cpeg_wtl_screen_scoreless_candidates_parallel(
   free(loss_lower);
   free(tie_upper);
   free(win_upper);
+  free(candidate_traces);
   free(job_ptrs);
   free(jobs);
   return proof_valid;
@@ -4451,6 +4586,7 @@ typedef struct CpegWtlPlacementScreenJob {
   int ld_size;
   int opponent_idx;
   int root_idx;
+  int candidate_idx;
   const CpegRootCand *candidate;
   int64_t initial_lead;
   int64_t deadline_ns;
@@ -4702,6 +4838,7 @@ static bool cpeg_wtl_screen_placements_parallel(
         .ld_size = ld_size,
         .opponent_idx = opponent_idx,
         .root_idx = root_idx,
+        .candidate_idx = candidate_idx,
         .candidate = &candidates[candidate_idx],
         .initial_lead = args->initial_lead,
         .deadline_ns = deadline_ns,
@@ -4725,6 +4862,10 @@ static bool cpeg_wtl_screen_placements_parallel(
     const CpegWtlPlacementScreenJob *job = &screen_jobs[screen_idx];
     cpeg_wtl_trace_add_work(args->collect_trace ? &out->trace : NULL,
                             &job->trace);
+    cpeg_wtl_trace_add_work(
+        args->collect_trace ? &out->candidate_traces[job->candidate_idx]
+                            : NULL,
+        &job->trace);
     out->exact_jobs += job->exact_jobs;
     out->bound_jobs += job->bound_jobs;
     out->batches_completed += job->batches_completed;
@@ -4752,6 +4893,7 @@ typedef struct CpegWtlPlacementRefineJob {
   int ld_size;
   int opponent_idx;
   int root_idx;
+  int candidate_idx;
   const CpegRootCand *candidate;
   int64_t initial_lead;
   int64_t deadline_ns;
@@ -5231,6 +5373,7 @@ static bool cpeg_wtl_refine_surviving_placements(
         .ld_size = ld_size,
         .opponent_idx = opponent_idx,
         .root_idx = root_idx,
+        .candidate_idx = candidate_idx,
         .candidate = &candidates[candidate_idx],
         .initial_lead = args->initial_lead,
         .deadline_ns = deadline_ns,
@@ -5257,6 +5400,10 @@ static bool cpeg_wtl_refine_surviving_placements(
     const CpegWtlPlacementRefineJob *job = &refine_jobs[refine_idx];
     cpeg_wtl_trace_add_work(args->collect_trace ? &out->trace : NULL,
                             &job->trace);
+    cpeg_wtl_trace_add_work(
+        args->collect_trace ? &out->candidate_traces[job->candidate_idx]
+                            : NULL,
+        &job->trace);
     out->exact_jobs += job->exact_jobs;
     out->bound_jobs += job->bound_jobs;
     out->batches_completed += job->batches_completed;
@@ -5346,6 +5493,7 @@ static bool cpeg_wtl_refine_fixed_worlds_parallel(
                   .ld_size = ld_size,
                   .opponent_idx = opponent_idx,
                   .root_idx = root_idx,
+                  .candidate_idx = candidate_idx,
                   .candidate = &candidates[candidate_idx],
                   .initial_lead = args->initial_lead,
                   .deadline_ns = deadline_ns,
@@ -5366,6 +5514,11 @@ static bool cpeg_wtl_refine_fixed_worlds_parallel(
   for (int job_idx = 0; job_idx < job_count; job_idx++) {
     cpeg_wtl_trace_add_work(args->collect_trace ? &out->trace : NULL,
                             &jobs[job_idx].context.trace);
+    cpeg_wtl_trace_add_work(
+        args->collect_trace
+            ? &out->candidate_traces[jobs[job_idx].context.candidate_idx]
+            : NULL,
+        &jobs[job_idx].context.trace);
     if (!jobs[job_idx].proof_valid) {
       proof_valid = false;
     }
@@ -5487,6 +5640,11 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
   }
   out->coverage = root_collection.coverage;
   out->cands = calloc_or_die((size_t)candidate_count, sizeof(*out->cands));
+  if (collect_trace) {
+    out->candidate_traces =
+        calloc_or_die((size_t)candidate_count,
+                      sizeof(*out->candidate_traces));
+  }
   states = calloc_or_die((size_t)candidate_count, sizeof(*states));
   candidate_order =
       malloc_or_die((size_t)candidate_count * sizeof(*candidate_order));
@@ -5552,6 +5710,7 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
     result_candidate->tie_upper_num = outcome_mass;
     result_candidate->loss_upper_num = outcome_mass;
     result_candidate->worlds_unresolved = world_count;
+    result_candidate->unresolved_weight = world_mass;
   }
 
   const int thread_count = args->num_threads < 1 ? 1 : args->num_threads;
@@ -5636,7 +5795,8 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
           root_idx, candidate, args->initial_lead, deadline_ns, margin_prior,
           bootstrap, bootstrap ? 0 : 1, world_evaluations, &out->exact_jobs,
           &out->bound_jobs, &batch_complete,
-          collect_trace ? &out->trace : NULL);
+          collect_trace ? &out->trace : NULL,
+          collect_trace ? &out->candidate_traces[candidate_idx] : NULL);
       if (!proof_valid || !batch_complete) {
         stopped = true;
         break;
@@ -5697,7 +5857,8 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
             root_idx, candidate, args->initial_lead, deadline_ns, margin_prior,
             /*exhaustive_horizon=*/true, /*max_defenses=*/0, world_evaluations,
             &out->exact_jobs, &out->bound_jobs, &batch_complete,
-            collect_trace ? &out->trace : NULL);
+            collect_trace ? &out->trace : NULL,
+            collect_trace ? &out->candidate_traces[candidate_idx] : NULL);
         if (!proof_valid || !batch_complete) {
           stopped = true;
           break;
@@ -5815,7 +5976,8 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
           unresolved_margin_prior, /*exhaustive_horizon=*/false,
           /*max_defenses=*/0, world_evaluations, &out->exact_jobs,
           &out->bound_jobs, &batch_complete,
-          collect_trace ? &out->trace : NULL);
+          collect_trace ? &out->trace : NULL,
+          collect_trace ? &out->candidate_traces[challenger_idx] : NULL);
       if (!proof_valid || !batch_complete) {
         stopped = true;
         break;

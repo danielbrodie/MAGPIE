@@ -413,6 +413,8 @@ typedef struct CpegWtlCertifiedCand {
   int worlds_bounded;
   int worlds_unresolved;
   int64_t exact_weight;
+  int64_t bounded_weight;
+  int64_t unresolved_weight;
   bool eliminated;
 } CpegWtlCertifiedCand;
 
@@ -432,6 +434,8 @@ typedef struct CpegWtlCertifiedResult {
   bool unique_best;
   CpegRootCoverage coverage;
   CpegWtlTrace trace;
+  // Parallel to `cands`; allocated only when collect_trace is true.
+  CpegWtlTrace *candidate_traces;
 } CpegWtlCertifiedResult;
 
 // Construct the sound outcome enclosure implied by a concrete opponent

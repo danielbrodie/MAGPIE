@@ -1498,6 +1498,10 @@ cpeg_assert_wtl_certified_results_equal(const CpegWtlCertifiedResult *lhs,
     assert(lhs_candidate->tie_upper_num == rhs_candidate->tie_upper_num);
     assert(lhs_candidate->loss_lower_num == rhs_candidate->loss_lower_num);
     assert(lhs_candidate->loss_upper_num == rhs_candidate->loss_upper_num);
+    assert(lhs_candidate->exact_weight == rhs_candidate->exact_weight);
+    assert(lhs_candidate->bounded_weight == rhs_candidate->bounded_weight);
+    assert(lhs_candidate->unresolved_weight ==
+           rhs_candidate->unresolved_weight);
   }
 }
 
@@ -1647,11 +1651,16 @@ void test_cpeg_wtl_certified_proof(void) {
   assert(one_thread.coverage.generation_complete);
   assert(one_thread.worlds_distinct == 246);
   assert(one_thread.world_weight_mass == 330);
+  assert(one_thread.candidate_traces == NULL);
   const CpegWtlTrace empty_trace = {0};
   assert(memcmp(&one_thread.trace, &empty_trace, sizeof(empty_trace)) == 0);
   for (int candidate_idx = 0; candidate_idx < one_thread.count;
        candidate_idx++) {
     cpeg_assert_wtl_certified_candidate_valid(&one_thread.cands[candidate_idx]);
+    const CpegWtlCertifiedCand *candidate = &one_thread.cands[candidate_idx];
+    assert(candidate->exact_weight + candidate->bounded_weight +
+               candidate->unresolved_weight ==
+           one_thread.world_weight_mass);
   }
 
   CpegWtlCertifiedArgs four_thread_args = one_thread_args;
@@ -1684,6 +1693,20 @@ void test_cpeg_wtl_certified_proof(void) {
   assert(traced.trace.opponent_moves_generated > 0);
   assert(traced.trace.opponent_sort_calls > 0);
   assert(traced.trace.final_reply_queries > 0);
+  assert(traced.candidate_traces != NULL);
+  int traced_candidates = 0;
+  int64_t candidate_reply_queries = 0;
+  for (int candidate_idx = 0; candidate_idx < traced.count;
+       candidate_idx++) {
+    const CpegWtlTrace *candidate_trace =
+        &traced.candidate_traces[candidate_idx];
+    if (candidate_trace->defense_world_jobs > 0) {
+      traced_candidates++;
+    }
+    candidate_reply_queries += candidate_trace->final_reply_queries;
+  }
+  assert(traced_candidates > 0);
+  assert(candidate_reply_queries == traced.trace.final_reply_queries);
   cpeg_wtl_certified_result_destroy(&traced);
   cpeg_wtl_certified_result_destroy(&four_threads);
   cpeg_wtl_certified_result_destroy(&one_thread);

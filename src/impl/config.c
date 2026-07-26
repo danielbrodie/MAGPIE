@@ -3657,7 +3657,8 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
     }
   }
   for (int rank_idx = 0; rank_idx < result.count; rank_idx++) {
-    const CpegWtlCertifiedCand *candidate = &result.cands[order[rank_idx]];
+    const int candidate_idx = order[rank_idx];
+    const CpegWtlCertifiedCand *candidate = &result.cands[candidate_idx];
     string_builder_add_formatted_string(
         lines,
         "cpeg-wtl-proof-cand %d %s %d "
@@ -3685,6 +3686,50 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
         candidate->outcome.expected_final_margin.hi, candidate->worlds_exact,
         candidate->worlds_bounded, candidate->worlds_unresolved,
         (long long)candidate->exact_weight, candidate->eliminated ? 1 : 0);
+    if (collect_trace) {
+      const CpegWtlTrace *trace = &result.candidate_traces[candidate_idx];
+      string_builder_add_formatted_string(
+          lines,
+          "cpeg-wtl-trace-cand schema=cpeg-wtl-trace-cand-v1 "
+          "candidate_idx=%d rank=%d action=%s score=%d "
+          "exact_weight=%lld bounded_weight=%lld unresolved_weight=%lld "
+          "closed_weight=%lld remaining_weight=%lld "
+          "scheduler_batches=%lld defense_world_jobs=%lld "
+          "opponent_movegen_calls=%lld opponent_moves_generated=%lld "
+          "opponent_movegen_work_ns=%lld opponent_sort_calls=%lld "
+          "opponent_moves_sorted=%lld opponent_sort_work_ns=%lld "
+          "defenses_threshold_tested=%lld defenses_accepted=%lld "
+          "defenses_refuted=%lld compatible_draws_tested=%lld "
+          "final_reply_queries=%lld final_replies_generated=%lld "
+          "final_reply_cache_hits=%lld final_reply_movegen_work_ns=%lld "
+          "threshold_short_circuits=%lld exact_endgame_queries=%lld "
+          "exact_endgame_work_ns=%lld\n",
+          candidate_idx, rank_idx + 1, candidate->label, candidate->score,
+          (long long)candidate->exact_weight,
+          (long long)candidate->bounded_weight,
+          (long long)candidate->unresolved_weight,
+          (long long)(candidate->exact_weight + candidate->bounded_weight),
+          (long long)candidate->unresolved_weight,
+          (long long)trace->scheduler_batches,
+          (long long)trace->defense_world_jobs,
+          (long long)trace->opponent_movegen_calls,
+          (long long)trace->opponent_moves_generated,
+          (long long)trace->opponent_movegen_work_ns,
+          (long long)trace->opponent_sort_calls,
+          (long long)trace->opponent_moves_sorted,
+          (long long)trace->opponent_sort_work_ns,
+          (long long)trace->defenses_threshold_tested,
+          (long long)trace->defenses_accepted,
+          (long long)trace->defenses_refuted,
+          (long long)trace->compatible_draws_tested,
+          (long long)trace->final_reply_queries,
+          (long long)trace->final_replies_generated,
+          (long long)trace->final_reply_cache_hits,
+          (long long)trace->final_reply_movegen_work_ns,
+          (long long)trace->threshold_short_circuits,
+          (long long)trace->exact_endgame_queries,
+          (long long)trace->exact_endgame_work_ns);
+    }
   }
   char *output = string_builder_dump(lines, NULL);
   string_builder_destroy(lines);
