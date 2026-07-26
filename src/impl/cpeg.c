@@ -3078,7 +3078,10 @@ typedef struct CpegWtlProofState {
   CpegWtlEnvelope outcome;
 } CpegWtlProofState;
 
-enum { CPEG_ROOT_REPLY_CACHE_CAPACITY = 4096 };
+enum {
+  CPEG_ROOT_REPLY_CACHE_CAPACITY = 4096,
+  CPEG_EXACT_ENDGAME_CACHE_CAPACITY = 32768,
+};
 
 typedef struct CpegRootReplyCacheEntry {
   uint64_t hash;
@@ -3095,6 +3098,28 @@ typedef struct CpegRootReplyCacheKey {
   const Board *board;
 } CpegRootReplyCacheKey;
 
+typedef struct CpegExactEndgameCacheEntry {
+  uint64_t hash;
+  int swing;
+  uint16_t rack_dist_size;
+  uint8_t player_on_turn;
+  MachineLetter board_letters[BOARD_DIM * BOARD_DIM];
+  uint8_t rack_counts[2][MAX_ALPHABET_SIZE];
+} CpegExactEndgameCacheEntry;
+
+typedef struct CpegExactEndgameCacheKey {
+  uint64_t hash;
+  uint16_t rack_dist_size;
+  uint8_t player_on_turn;
+  uint8_t rack_counts[2][MAX_ALPHABET_SIZE];
+  const Board *board;
+} CpegExactEndgameCacheKey;
+
+typedef struct CpegExactEndgameCache {
+  atomic_flag lock;
+  CpegExactEndgameCacheEntry entries[CPEG_EXACT_ENDGAME_CACHE_CAPACITY];
+} CpegExactEndgameCache;
+
 typedef struct CpegDefenseWorker {
   Game *opponent_game;
   Game *draw_game;
@@ -3103,6 +3128,7 @@ typedef struct CpegDefenseWorker {
   MoveList *root_best;
   MoveList *root_best_small;
   CpegRootReplyCacheEntry *root_reply_cache;
+  CpegExactEndgameCache *exact_endgame_cache;
   MoveUndo *defense_undo;
   MoveList *endgame_mover;
   MoveList *endgame_reply;
@@ -3203,7 +3229,11 @@ static void cpeg_wtl_trace_add_work(CpegWtlTrace *dest,
         source->reply_phases[phase].threshold_short_circuits;
   }
   dest->exact_endgame_queries += source->exact_endgame_queries;
+  dest->exact_endgame_cache_hits += source->exact_endgame_cache_hits;
   dest->exact_endgame_work_ns += source->exact_endgame_work_ns;
+  dest->fixed_endgame_queries += source->fixed_endgame_queries;
+  dest->fixed_endgame_cache_hits += source->fixed_endgame_cache_hits;
+  dest->fixed_endgame_work_ns += source->fixed_endgame_work_ns;
 }
 
 static bool cpeg_generate_small_moves_at_least(
@@ -3338,6 +3368,154 @@ static void cpeg_root_reply_cache_insert(
     }
     slot = (slot + 1) % CPEG_ROOT_REPLY_CACHE_CAPACITY;
   }
+}
+
+static void
+cpeg_exact_endgame_cache_key(const Game *game,
+                             CpegExactEndgameCacheKey *key) {
+  uint64_t hash = FNV_64_OFFSET_BASIS;
+  key->board = game_get_board(game);
+  key->player_on_turn = (uint8_t)game_get_player_on_turn_index(game);
+  hash = fnv64a_step(hash, key->player_on_turn);
+  const Rack *first_rack = player_get_rack(game_get_player(game, 0));
+  key->rack_dist_size = rack_get_dist_size(first_rack);
+  hash = fnv64a_step(hash, key->rack_dist_size);
+  memset(key->rack_counts, 0, sizeof(key->rack_counts));
+  for (int player_idx = 0; player_idx < 2; player_idx++) {
+    const Rack *rack = player_get_rack(game_get_player(game, player_idx));
+    for (uint16_t ml = 0; ml < key->rack_dist_size; ml++) {
+      key->rack_counts[player_idx][ml] =
+          (uint8_t)rack_get_letter(rack, (MachineLetter)ml);
+      hash = fnv64a_step(hash, key->rack_counts[player_idx][ml]);
+    }
+  }
+  for (int row = 0; row < BOARD_DIM; row++) {
+    for (int col = 0; col < BOARD_DIM; col++) {
+      hash = fnv64a_step(hash, board_get_letter(key->board, row, col));
+    }
+  }
+  key->hash = hash == 0 ? 1 : hash;
+}
+
+static bool cpeg_exact_endgame_cache_entry_matches(
+    const CpegExactEndgameCacheEntry *entry,
+    const CpegExactEndgameCacheKey *key) {
+  if (entry->hash != key->hash ||
+      entry->rack_dist_size != key->rack_dist_size ||
+      entry->player_on_turn != key->player_on_turn ||
+      memcmp(entry->rack_counts, key->rack_counts,
+             sizeof(entry->rack_counts)) != 0) {
+    return false;
+  }
+  int square_idx = 0;
+  for (int row = 0; row < BOARD_DIM; row++) {
+    for (int col = 0; col < BOARD_DIM; col++) {
+      if (entry->board_letters[square_idx++] !=
+          board_get_letter(key->board, row, col)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static void cpeg_exact_endgame_cache_lock(CpegExactEndgameCache *cache) {
+  while (atomic_flag_test_and_set_explicit(&cache->lock,
+                                            memory_order_acquire)) {
+  }
+}
+
+static void cpeg_exact_endgame_cache_unlock(CpegExactEndgameCache *cache) {
+  atomic_flag_clear_explicit(&cache->lock, memory_order_release);
+}
+
+static bool cpeg_exact_endgame_cache_lookup(
+    CpegExactEndgameCache *cache, const CpegExactEndgameCacheKey *key,
+    int *swing) {
+  bool found = false;
+  cpeg_exact_endgame_cache_lock(cache);
+  int slot = (int)(key->hash % CPEG_EXACT_ENDGAME_CACHE_CAPACITY);
+  for (int probe = 0; probe < CPEG_EXACT_ENDGAME_CACHE_CAPACITY; probe++) {
+    const CpegExactEndgameCacheEntry *entry = &cache->entries[slot];
+    if (entry->hash == 0) {
+      break;
+    }
+    if (cpeg_exact_endgame_cache_entry_matches(entry, key)) {
+      *swing = entry->swing;
+      found = true;
+      break;
+    }
+    slot = (slot + 1) % CPEG_EXACT_ENDGAME_CACHE_CAPACITY;
+  }
+  cpeg_exact_endgame_cache_unlock(cache);
+  return found;
+}
+
+static void cpeg_exact_endgame_cache_insert(
+    CpegExactEndgameCache *cache, const CpegExactEndgameCacheKey *key,
+    int swing) {
+  cpeg_exact_endgame_cache_lock(cache);
+  int slot = (int)(key->hash % CPEG_EXACT_ENDGAME_CACHE_CAPACITY);
+  for (int probe = 0; probe < CPEG_EXACT_ENDGAME_CACHE_CAPACITY; probe++) {
+    CpegExactEndgameCacheEntry *entry = &cache->entries[slot];
+    if (entry->hash == 0 ||
+        cpeg_exact_endgame_cache_entry_matches(entry, key)) {
+      *entry = (CpegExactEndgameCacheEntry){
+          .hash = key->hash,
+          .swing = swing,
+          .rack_dist_size = key->rack_dist_size,
+          .player_on_turn = key->player_on_turn,
+      };
+      int square_idx = 0;
+      for (int row = 0; row < BOARD_DIM; row++) {
+        for (int col = 0; col < BOARD_DIM; col++) {
+          entry->board_letters[square_idx++] =
+              board_get_letter(key->board, row, col);
+        }
+      }
+      memcpy(entry->rack_counts, key->rack_counts,
+             sizeof(entry->rack_counts));
+      break;
+    }
+    slot = (slot + 1) % CPEG_EXACT_ENDGAME_CACHE_CAPACITY;
+  }
+  cpeg_exact_endgame_cache_unlock(cache);
+}
+
+static int cpeg_exact_endgame_swing(
+    Game *game, MoveList *mover_moves, MoveList *reply_moves, MoveUndo *undo,
+    CpegExactEndgameCache *cache, bool *capacity_exceeded,
+    int64_t deadline_ns, bool *complete, bool *cache_hit) {
+  *cache_hit = false;
+  if (cache != NULL) {
+    CpegExactEndgameCacheKey key = {0};
+    cpeg_exact_endgame_cache_key(game, &key);
+    int cached_swing = 0;
+    if (cpeg_exact_endgame_cache_lookup(cache, &key, &cached_swing)) {
+      *cache_hit = true;
+      if (capacity_exceeded != NULL) {
+        *capacity_exceeded = false;
+      }
+      if (complete != NULL) {
+        *complete = true;
+      }
+      return cached_swing;
+    }
+    CpegResult result;
+    const int swing = cpeg_endgame_core_until(
+        game, mover_moves, reply_moves, undo, &result, capacity_exceeded,
+        deadline_ns, complete);
+    const bool solved =
+        (capacity_exceeded == NULL || !*capacity_exceeded) &&
+        (complete == NULL || *complete);
+    if (solved) {
+      cpeg_exact_endgame_cache_insert(cache, &key, swing);
+    }
+    return swing;
+  }
+  CpegResult result;
+  return cpeg_endgame_core_until(game, mover_moves, reply_moves, undo, &result,
+                                 capacity_exceeded, deadline_ns, complete);
 }
 
 static void cpeg_root_reply_trace_query(CpegWtlTrace *trace,
@@ -3737,17 +3915,21 @@ static void cpeg_defense_job_run(void *arg, int worker_idx) {
       job->capacity_exceeded = true;
       return;
     }
-    CpegResult endgame_result;
     bool endgame_capacity_exceeded = false;
     bool endgame_complete = true;
+    bool endgame_cache_hit = false;
     const int64_t start_ns = trace != NULL ? ctimer_monotonic_ns() : 0;
-    const int opponent_swing = cpeg_endgame_core_until(
+    const int opponent_swing = cpeg_exact_endgame_swing(
         worker->draw_game, worker->endgame_mover, worker->endgame_reply,
-        worker->endgame_undo, &endgame_result, &endgame_capacity_exceeded,
-        job->deadline_ns, &endgame_complete);
+        worker->endgame_undo, worker->exact_endgame_cache,
+        &endgame_capacity_exceeded, job->deadline_ns, &endgame_complete,
+        &endgame_cache_hit);
     if (trace != NULL) {
       trace->compatible_draws_tested++;
       trace->exact_endgame_queries++;
+      if (endgame_cache_hit) {
+        trace->exact_endgame_cache_hits++;
+      }
       trace->exact_endgame_work_ns += ctimer_monotonic_ns() - start_ns;
     }
     if (endgame_capacity_exceeded) {
@@ -5460,15 +5642,24 @@ static bool cpeg_wtl_fixed_defense_world(CpegWtlPlacementRefineJob *job,
     bag_set_to_tiles(game_get_bag(worker->defense_game), NULL, 0);
     game_set_game_end_reason(worker->defense_game, GAME_END_REASON_NONE);
     game_set_consecutive_scoreless_turns(worker->defense_game, 0);
-    CpegResult endgame_result;
     bool capacity_exceeded = false;
+    bool endgame_complete = true;
+    bool endgame_cache_hit = false;
     const int64_t start_ns = trace != NULL ? ctimer_monotonic_ns() : 0;
-    const int root_swing = cpeg_endgame_core(
+    const int root_swing = cpeg_exact_endgame_swing(
         worker->defense_game, worker->endgame_mover, worker->endgame_reply,
-        worker->endgame_undo, &endgame_result, &capacity_exceeded);
+        worker->endgame_undo, worker->exact_endgame_cache, &capacity_exceeded,
+        /*deadline_ns=*/0, &endgame_complete, &endgame_cache_hit);
     if (trace != NULL) {
+      const int64_t work_ns = ctimer_monotonic_ns() - start_ns;
       trace->exact_endgame_queries++;
-      trace->exact_endgame_work_ns += ctimer_monotonic_ns() - start_ns;
+      trace->fixed_endgame_queries++;
+      if (endgame_cache_hit) {
+        trace->exact_endgame_cache_hits++;
+        trace->fixed_endgame_cache_hits++;
+      }
+      trace->exact_endgame_work_ns += work_ns;
+      trace->fixed_endgame_work_ns += work_ns;
     }
     if (capacity_exceeded) {
       draw_values[draw_idx] = cpeg_wtl_unresolved_envelope(job->margin_prior);
@@ -5896,6 +6087,7 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
   CpegRootCollection root_collection = {0};
   CpegScheduledWorld *worlds = NULL;
   CpegDefenseWorker *workers = NULL;
+  CpegExactEndgameCache *exact_endgame_cache = NULL;
   PegPool *pool = NULL;
   CpegDefenseJob *jobs = NULL;
   void **job_ptrs = NULL;
@@ -6001,6 +6193,10 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
   }
   scratch_count = pool != NULL ? thread_count + 1 : 1;
   workers = calloc_or_die((size_t)scratch_count, sizeof(*workers));
+  if (args->use_exact_endgame_cache) {
+    exact_endgame_cache = calloc_or_die(1, sizeof(*exact_endgame_cache));
+    atomic_flag_clear(&exact_endgame_cache->lock);
+  }
   for (int worker_idx = 0; worker_idx < scratch_count; worker_idx++) {
     workers[worker_idx].opponent_game = game_duplicate(root_game);
     workers[worker_idx].draw_game = game_duplicate(root_game);
@@ -6008,6 +6204,7 @@ int cpeg_solve_pre_endgame_wtl_certified(const Game *game,
     workers[worker_idx].opponent_moves =
         move_list_create_small(CPEG_MOVE_LIST_CAP + 1);
     workers[worker_idx].root_best = move_list_create(1);
+    workers[worker_idx].exact_endgame_cache = exact_endgame_cache;
     if (args->use_threshold_reply_screen) {
       workers[worker_idx].root_best_small = move_list_create_small(1);
       workers[worker_idx].root_reply_cache =
@@ -6470,6 +6667,7 @@ cleanup:
     }
   }
   free(workers);
+  free(exact_endgame_cache);
   free(worlds);
   cpeg_root_collection_destroy(&root_collection);
   game_destroy(root_game);

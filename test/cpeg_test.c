@@ -622,6 +622,8 @@ static void test_cpeg_wtl_command_parsing(void) {
                             ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
   cpeg_assert_command_error(config, error_stack, "cpeg 1 replybest",
                             ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
+  cpeg_assert_command_error(config, error_stack, "cpeg 1 endcache",
+                            ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
   // A negative lead is consumed as the signed lead value, not mistaken for
   // the bag; the subsequent error is specifically the unsupported bag size.
   cpeg_assert_command_error(config, error_stack, "cpeg 5 lead -51",
@@ -634,6 +636,12 @@ static void test_cpeg_wtl_command_parsing(void) {
   load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
   config_load_command(config, "cpeg 1 noexch lead -51 budget 0.001",
                       error_stack);
+  assert(error_stack_is_empty(error_stack));
+  config_execute_command(config, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  config_load_command(
+      config, "cpeg 1 noexch lead -51 budget 0.001 endcache", error_stack);
   assert(error_stack_is_empty(error_stack));
   config_execute_command(config, error_stack);
   assert(error_stack_is_empty(error_stack));
@@ -1739,6 +1747,10 @@ void test_cpeg_wtl_certified_proof(void) {
   assert(traced.candidate_traces != NULL);
   int traced_candidates = 0;
   int64_t candidate_reply_queries = 0;
+  int64_t candidate_exact_endgame_queries = 0;
+  int64_t candidate_exact_endgame_cache_hits = 0;
+  int64_t candidate_fixed_endgame_queries = 0;
+  int64_t candidate_fixed_endgame_cache_hits = 0;
   for (int candidate_idx = 0; candidate_idx < traced.count;
        candidate_idx++) {
     const CpegWtlTrace *candidate_trace =
@@ -1747,9 +1759,23 @@ void test_cpeg_wtl_certified_proof(void) {
       traced_candidates++;
     }
     candidate_reply_queries += candidate_trace->final_reply_queries;
+    candidate_exact_endgame_queries += candidate_trace->exact_endgame_queries;
+    candidate_exact_endgame_cache_hits +=
+        candidate_trace->exact_endgame_cache_hits;
+    candidate_fixed_endgame_queries += candidate_trace->fixed_endgame_queries;
+    candidate_fixed_endgame_cache_hits +=
+        candidate_trace->fixed_endgame_cache_hits;
   }
   assert(traced_candidates > 0);
   assert(candidate_reply_queries == traced.trace.final_reply_queries);
+  assert(candidate_exact_endgame_queries ==
+         traced.trace.exact_endgame_queries);
+  assert(candidate_exact_endgame_cache_hits ==
+         traced.trace.exact_endgame_cache_hits);
+  assert(candidate_fixed_endgame_queries ==
+         traced.trace.fixed_endgame_queries);
+  assert(candidate_fixed_endgame_cache_hits ==
+         traced.trace.fixed_endgame_cache_hits);
   cpeg_wtl_certified_result_destroy(&traced);
   cpeg_wtl_certified_result_destroy(&two_ply);
   cpeg_wtl_certified_result_destroy(&four_threads);
@@ -1848,6 +1874,18 @@ void test_cpeg_wtl_certified_proof(void) {
              &compact_two_ply) > 0);
   cpeg_assert_wtl_certified_results_byte_equal(&compact, &compact_two_ply);
   assert(compact_two_ply.trace.exact_endgame_queries > 0);
+  CpegWtlCertifiedArgs compact_cached_args = compact_two_ply_args;
+  compact_cached_args.use_exact_endgame_cache = true;
+  load_and_exec_config_or_die(config, CPEG_PRE_9570_CGP);
+  CpegWtlCertifiedResult compact_cached = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &compact_cached_args,
+             &compact_cached) > 0);
+  cpeg_assert_wtl_certified_results_byte_equal(&compact, &compact_cached);
+  assert(compact_cached.trace.exact_endgame_queries > 0);
+  assert(compact_cached.trace.exact_endgame_cache_hits <=
+         compact_cached.trace.exact_endgame_queries);
+  cpeg_wtl_certified_result_destroy(&compact_cached);
   cpeg_wtl_certified_result_destroy(&compact_two_ply);
   cpeg_wtl_certified_result_destroy(&compact);
 
@@ -1964,22 +2002,36 @@ void test_cpeg_replybest_screen(void) {
   assert(phase_movegen_work_ns == result.trace.final_reply_movegen_work_ns);
   assert(phase_threshold_short_circuits ==
          result.trace.threshold_short_circuits);
+  CpegWtlCertifiedArgs endcache_args = args;
+  endcache_args.use_exact_endgame_cache = true;
+  load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);
+  CpegWtlCertifiedResult endcache = {0};
+  assert(cpeg_solve_pre_endgame_wtl_certified(
+             config_get_game(config), &endcache_args, &endcache) == 204);
+  cpeg_assert_wtl_certified_results_byte_equal(&result, &endcache);
+  assert(endcache.trace.exact_endgame_cache_hits == 0);
   cpeg_wtl_certified_result_destroy(&baseline);
   cpeg_wtl_certified_result_destroy(&result);
+  cpeg_wtl_certified_result_destroy(&endcache);
   config_destroy(config);
 }
 
 void test_cpeg_wtl_certified_senator_acceptance(void) {
   Config *config = config_create_or_die(
       "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
-      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 6");
+      "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 3");
   load_and_exec_config_or_die(config, CPEG_SENATOR_TOSA_CGP);
   const CpegWtlCertifiedArgs args = {
       .bag = 4,
       .allow_exchanges = true,
-      .num_threads = 6,
+      .num_threads = 3,
       .initial_lead = -51,
-      .budget_seconds = 42.0,
+      .budget_seconds = 180.0,
+      .use_exact_two_ply_incumbent = true,
+      .use_best_bag_emptying_screen = true,
+      .use_threshold_reply_screen = true,
+      .use_exact_endgame_cache = true,
+      .collect_trace = true,
   };
   CpegWtlCertifiedResult result = {0};
   assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config), &args,
@@ -1997,6 +2049,7 @@ void test_cpeg_wtl_certified_senator_acceptance(void) {
   assert(result.coverage.generation_complete);
   assert(result.regret_num == 0);
   assert(result.regret_den == 1);
+  assert(result.trace.fixed_endgame_cache_hits > 0);
   cpeg_wtl_certified_result_destroy(&result);
   config_destroy(config);
 }

@@ -3537,6 +3537,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
                                     bool use_exact_two_ply_incumbent,
                                     bool use_best_bag_emptying_screen,
                                     bool use_threshold_reply_screen,
+                                    bool use_exact_endgame_cache,
                                     bool collect_trace,
                                     ErrorStack *error_stack) {
   CpegBeliefManifest belief = {0};
@@ -3563,6 +3564,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
       .use_exact_two_ply_incumbent = use_exact_two_ply_incumbent,
       .use_best_bag_emptying_screen = use_best_bag_emptying_screen,
       .use_threshold_reply_screen = use_threshold_reply_screen,
+      .use_exact_endgame_cache = use_exact_endgame_cache,
       .collect_trace = collect_trace,
   };
   if (cpeg_solve_pre_endgame_wtl_certified(config->game, &args, &result) < 1) {
@@ -3635,7 +3637,9 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
         "compatible_draws_tested=%lld final_reply_queries=%lld "
         "final_replies_generated=%lld final_reply_cache_hits=%lld "
         "final_reply_movegen_work_ns=%lld threshold_short_circuits=%lld "
-        "exact_endgame_queries=%lld exact_endgame_work_ns=%lld\n",
+        "exact_endgame_queries=%lld exact_endgame_cache_hits=%lld "
+        "exact_endgame_work_ns=%lld fixed_endgame_queries=%lld "
+        "fixed_endgame_cache_hits=%lld fixed_endgame_work_ns=%lld\n",
         (long long)trace->wall_ns, (long long)trace->setup_ns,
         (long long)trace->incumbent_ns,
         (long long)trace->placement_screen_ns,
@@ -3666,7 +3670,11 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
         (long long)trace->final_reply_movegen_work_ns,
         (long long)trace->threshold_short_circuits,
         (long long)trace->exact_endgame_queries,
-        (long long)trace->exact_endgame_work_ns);
+        (long long)trace->exact_endgame_cache_hits,
+        (long long)trace->exact_endgame_work_ns,
+        (long long)trace->fixed_endgame_queries,
+        (long long)trace->fixed_endgame_cache_hits,
+        (long long)trace->fixed_endgame_work_ns);
     for (int phase = 0; phase < CPEG_WTL_REPLY_PHASE_COUNT; phase++) {
       const CpegWtlReplyPhaseTrace *phase_trace =
           &trace->reply_phases[phase];
@@ -3744,7 +3752,9 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
           "final_reply_queries=%lld final_replies_generated=%lld "
           "final_reply_cache_hits=%lld final_reply_movegen_work_ns=%lld "
           "threshold_short_circuits=%lld exact_endgame_queries=%lld "
-          "exact_endgame_work_ns=%lld\n",
+          "exact_endgame_cache_hits=%lld exact_endgame_work_ns=%lld "
+          "fixed_endgame_queries=%lld fixed_endgame_cache_hits=%lld "
+          "fixed_endgame_work_ns=%lld\n",
           candidate_idx, rank_idx + 1, candidate->label, candidate->score,
           (long long)candidate->exact_weight,
           (long long)candidate->bounded_weight,
@@ -3769,7 +3779,11 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
           (long long)trace->final_reply_movegen_work_ns,
           (long long)trace->threshold_short_circuits,
           (long long)trace->exact_endgame_queries,
-          (long long)trace->exact_endgame_work_ns);
+          (long long)trace->exact_endgame_cache_hits,
+          (long long)trace->exact_endgame_work_ns,
+          (long long)trace->fixed_endgame_queries,
+          (long long)trace->fixed_endgame_cache_hits,
+          (long long)trace->fixed_endgame_work_ns);
     }
   }
   char *output = string_builder_dump(lines, NULL);
@@ -3990,6 +4004,7 @@ static void impl_cpeg_statistical(Config *config, int bag, bool allow_exchanges,
 //   Add `twoply` to opt into the exact two-ply incumbent experiment.
 //   Add `screenbest` to directly find the best bag-emptying screen defense.
 //   Add `replybest` to use a one-sided small-move final-reply query.
+//   Add `endcache` to reuse exact empty-bag states by their complete key.
 void impl_cpeg(Config *config, ErrorStack *error_stack) {
   if (!config_has_game_data(config)) {
     error_stack_push(error_stack, ERROR_STATUS_CONFIG_LOAD_GAME_DATA_MISSING,
@@ -4010,6 +4025,7 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
   bool use_exact_two_ply_incumbent = false;
   bool use_best_bag_emptying_screen = false;
   bool use_threshold_reply_screen = false;
+  bool use_exact_endgame_cache = false;
   const int n_args = config_get_parg_num_set_values(config, ARG_TOKEN_CPEG);
   for (int arg_idx = 0; arg_idx < n_args; arg_idx++) {
     const char *value = config_get_parg_value(config, ARG_TOKEN_CPEG, arg_idx);
@@ -4042,6 +4058,14 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
         return;
       }
       use_threshold_reply_screen = true;
+    } else if (strings_equal(value, "endcache")) {
+      if (use_exact_endgame_cache) {
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+            string_duplicate("cpeg endcache may be specified only once"));
+        return;
+      }
+      use_exact_endgame_cache = true;
     } else if (strings_equal(value, "trace")) {
       if (collect_trace) {
         error_stack_push(
@@ -4146,6 +4170,13 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
             "cpeg replybest requires the certified lead/budget solver"));
     return;
   }
+  if (use_exact_endgame_cache && !(has_lead && use_certified)) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONFIG_LOAD_MISSING_ARG,
+        string_duplicate(
+            "cpeg endcache requires the certified lead/budget solver"));
+    return;
+  }
 
   if (bag <= 0) {
     if (has_lead) {
@@ -4175,7 +4206,8 @@ void impl_cpeg(Config *config, ErrorStack *error_stack) {
                               budget_seconds, belief_path,
                               use_exact_two_ply_incumbent,
                               use_best_bag_emptying_screen,
-                              use_threshold_reply_screen, collect_trace,
+                              use_threshold_reply_screen,
+                              use_exact_endgame_cache, collect_trace,
                               error_stack);
       return;
     }
@@ -9473,7 +9505,7 @@ Config *config_create(const ConfigArgs *config_args, ErrorStack *error_stack) {
   cmd(ARG_TOKEN_INFER, "infer", 0, 5, infer, generic, false);
   cmd(ARG_TOKEN_ENDGAME, "endgame", 0, 0, endgame, endgame, false);
   cmd(ARG_TOKEN_PEG, "peg", 0, 0, peg, peg, false);
-  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 11, cpeg, generic, false);
+  cmd(ARG_TOKEN_CPEG, "cpeg", 0, 12, cpeg, generic, false);
   cmd(ARG_TOKEN_CROSSPLAY_ORACLE, "crossplayoracle", 2, 10,
       crossplay_oracle, generic, false);
   cmd(ARG_TOKEN_AUTOPLAY, "autoplay", 2, 2, autoplay, autoplay, false);

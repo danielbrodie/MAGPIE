@@ -391,7 +391,11 @@ typedef struct CpegWtlTrace {
   int64_t threshold_short_circuits;
   CpegWtlReplyPhaseTrace reply_phases[CPEG_WTL_REPLY_PHASE_COUNT];
   int64_t exact_endgame_queries;
+  int64_t exact_endgame_cache_hits;
   int64_t exact_endgame_work_ns;
+  int64_t fixed_endgame_queries;
+  int64_t fixed_endgame_cache_hits;
+  int64_t fixed_endgame_work_ns;
 } CpegWtlTrace;
 
 typedef struct CpegWtlCertifiedArgs {
@@ -422,6 +426,9 @@ typedef struct CpegWtlCertifiedArgs {
   // Experiment only: use the small reply generator for one-sided threshold
   // queries and never consume a threshold witness as an exact score.
   bool use_threshold_reply_screen;
+  // Experiment only: reuse exact empty-bag swings by a collision-safe key over
+  // the complete board, both racks, and the player on turn.
+  bool use_exact_endgame_cache;
   // Collect the versioned producer trace. False preserves the normal hot path.
   bool collect_trace;
 } CpegWtlCertifiedArgs;
