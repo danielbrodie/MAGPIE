@@ -73,6 +73,17 @@ typedef struct UnrestrictedMultiplier {
   uint8_t column;
 } UnrestrictedMultiplier;
 
+// Optional per-call instrumentation for the BEST_SMALL threshold path.
+// `gaddag_arcs` counts arc records examined, including separator lookups.
+// The pointer is NULL on the ordinary hot path.
+typedef struct MoveGenTrace {
+  int64_t shadow_work_ns;
+  int64_t recursive_work_ns;
+  int64_t gaddag_arcs;
+  int64_t anchors_prepared;
+  int64_t anchors_surviving_threshold;
+} MoveGenTrace;
+
 typedef struct MoveGen {
   // Owned by this MoveGen struct
   int current_row_index;
@@ -126,6 +137,8 @@ typedef struct MoveGen {
   int target_leave_size;
   bool stop_on_threshold;
   bool threshold_exceeded;
+  bool prove_threshold_only;
+  MoveGenTrace *trace;
   // Minimum number of rack tiles a MOVE_RECORD_BEST_SMALL placement must use.
   // Zero preserves the ordinary unrestricted best-score search.
   int minimum_tiles_played;
@@ -269,6 +282,9 @@ typedef struct MoveGenArgs {
   // Only used with MOVE_RECORD_BEST_SMALL. Restricts the retained placement
   // to moves using at least this many rack tiles. Zero is unrestricted.
   int minimum_tiles_played;
+  // Only used with thresholded MOVE_RECORD_BEST_SMALL. Prove that no score is
+  // strictly above target_equity without recovering the exact losing score.
+  bool prove_threshold_only;
   MoveList *move_list;
   // Output: bitvector of machine letters that appear in any valid move.
   // Only used with MOVE_RECORD_TILES_PLAYED. Caller provides pointer; callee
@@ -277,6 +293,8 @@ typedef struct MoveGenArgs {
   // Input: initial set of known-playable tiles for MOVE_RECORD_TILES_PLAYED.
   // Movegen ORs further discoveries in. Default 0 (no known tiles).
   uint64_t initial_tiles_bv;
+  // Optional output. The caller owns and zero-initializes this trace.
+  MoveGenTrace *trace;
 } MoveGenArgs;
 
 void gen_destroy_cache(void);

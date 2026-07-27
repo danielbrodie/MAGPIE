@@ -3315,6 +3315,13 @@ static void cpeg_wtl_trace_add_work(CpegWtlTrace *dest,
   dest->final_reply_movegen_work_ns +=
       source->final_reply_movegen_work_ns;
   dest->threshold_short_circuits += source->threshold_short_circuits;
+  dest->threshold_negative_proofs += source->threshold_negative_proofs;
+  dest->reply_shadow_work_ns += source->reply_shadow_work_ns;
+  dest->reply_recursive_work_ns += source->reply_recursive_work_ns;
+  dest->reply_gaddag_arcs += source->reply_gaddag_arcs;
+  dest->reply_anchors_prepared += source->reply_anchors_prepared;
+  dest->reply_anchors_surviving_threshold +=
+      source->reply_anchors_surviving_threshold;
   for (int phase = 0; phase < CPEG_WTL_REPLY_PHASE_COUNT; phase++) {
     dest->reply_phases[phase].queries +=
         source->reply_phases[phase].queries;
@@ -3326,6 +3333,18 @@ static void cpeg_wtl_trace_add_work(CpegWtlTrace *dest,
         source->reply_phases[phase].movegen_work_ns;
     dest->reply_phases[phase].threshold_short_circuits +=
         source->reply_phases[phase].threshold_short_circuits;
+    dest->reply_phases[phase].threshold_negative_proofs +=
+        source->reply_phases[phase].threshold_negative_proofs;
+    dest->reply_phases[phase].shadow_work_ns +=
+        source->reply_phases[phase].shadow_work_ns;
+    dest->reply_phases[phase].recursive_work_ns +=
+        source->reply_phases[phase].recursive_work_ns;
+    dest->reply_phases[phase].gaddag_arcs +=
+        source->reply_phases[phase].gaddag_arcs;
+    dest->reply_phases[phase].anchors_prepared +=
+        source->reply_phases[phase].anchors_prepared;
+    dest->reply_phases[phase].anchors_surviving_threshold +=
+        source->reply_phases[phase].anchors_surviving_threshold;
   }
   dest->exact_endgame_queries += source->exact_endgame_queries;
   dest->exact_endgame_cache_hits += source->exact_endgame_cache_hits;
@@ -3393,6 +3412,7 @@ static void cpeg_sort_small_moves(MoveList *moves, CpegWtlTrace *trace) {
 typedef enum CpegRootReplyResultKind {
   CPEG_ROOT_REPLY_EXACT,
   CPEG_ROOT_REPLY_ABOVE_THRESHOLD,
+  CPEG_ROOT_REPLY_NOT_ABOVE_THRESHOLD,
 } CpegRootReplyResultKind;
 
 typedef struct CpegRootReplyResult {
@@ -3635,7 +3655,8 @@ static void cpeg_root_reply_trace_query(CpegWtlTrace *trace,
                                         CpegWtlReplyPhase phase,
                                         int replies_generated,
                                         int64_t movegen_work_ns,
-                                        bool cache_hit) {
+                                        bool cache_hit,
+                                        const MoveGenTrace *movegen_trace) {
   if (trace == NULL) {
     return;
   }
@@ -3646,6 +3667,20 @@ static void cpeg_root_reply_trace_query(CpegWtlTrace *trace,
   phase_trace->queries++;
   phase_trace->replies_generated += replies_generated;
   phase_trace->movegen_work_ns += movegen_work_ns;
+  if (movegen_trace != NULL) {
+    trace->reply_shadow_work_ns += movegen_trace->shadow_work_ns;
+    trace->reply_recursive_work_ns += movegen_trace->recursive_work_ns;
+    trace->reply_gaddag_arcs += movegen_trace->gaddag_arcs;
+    trace->reply_anchors_prepared += movegen_trace->anchors_prepared;
+    trace->reply_anchors_surviving_threshold +=
+        movegen_trace->anchors_surviving_threshold;
+    phase_trace->shadow_work_ns += movegen_trace->shadow_work_ns;
+    phase_trace->recursive_work_ns += movegen_trace->recursive_work_ns;
+    phase_trace->gaddag_arcs += movegen_trace->gaddag_arcs;
+    phase_trace->anchors_prepared += movegen_trace->anchors_prepared;
+    phase_trace->anchors_surviving_threshold +=
+        movegen_trace->anchors_surviving_threshold;
+  }
   if (cache_hit) {
     trace->final_reply_cache_hits++;
     phase_trace->cache_hits++;
@@ -3657,6 +3692,14 @@ static void cpeg_root_reply_trace_threshold_short_circuit(
   if (trace != NULL) {
     trace->threshold_short_circuits++;
     trace->reply_phases[phase].threshold_short_circuits++;
+  }
+}
+
+static void cpeg_root_reply_trace_threshold_negative_proof(
+    CpegWtlTrace *trace, CpegWtlReplyPhase phase) {
+  if (trace != NULL) {
+    trace->threshold_negative_proofs++;
+    trace->reply_phases[phase].threshold_negative_proofs++;
   }
 }
 
@@ -3689,7 +3732,7 @@ static bool cpeg_root_reply(
     cache_entry = cpeg_root_reply_cache_lookup(cache, &key);
   }
   if (cache_entry != NULL) {
-    cpeg_root_reply_trace_query(trace, phase, 0, 0, true);
+    cpeg_root_reply_trace_query(trace, phase, 0, 0, true, NULL);
     if (!require_exact_score && cache_entry->exact_score > threshold) {
       *result = (CpegRootReplyResult){
           .kind = CPEG_ROOT_REPLY_ABOVE_THRESHOLD,
@@ -3703,6 +3746,23 @@ static bool cpeg_root_reply(
     }
     return true;
   }
+  if (!require_exact_score && threshold < 0) {
+    cpeg_root_reply_trace_query(trace, phase, 0, 0, false, NULL);
+    *result = (CpegRootReplyResult){
+        .kind = CPEG_ROOT_REPLY_ABOVE_THRESHOLD,
+    };
+    cpeg_root_reply_trace_threshold_short_circuit(trace, phase);
+    return true;
+  }
+  if (!require_exact_score &&
+      threshold >= (int64_t)EQUITY_MAX_DOUBLE) {
+    cpeg_root_reply_trace_query(trace, phase, 0, 0, false, NULL);
+    *result = (CpegRootReplyResult){
+        .kind = CPEG_ROOT_REPLY_NOT_ABOVE_THRESHOLD,
+    };
+    cpeg_root_reply_trace_threshold_negative_proof(trace, phase);
+    return true;
+  }
   Equity target = EQUITY_MAX_VALUE;
   if (!require_exact_score && threshold >= (int64_t)EQUITY_MIN_DOUBLE &&
       threshold <= (int64_t)EQUITY_MAX_DOUBLE) {
@@ -3713,6 +3773,11 @@ static bool cpeg_root_reply(
   if (selected_moves == NULL) {
     return false;
   }
+  const bool prove_threshold_only =
+      use_small_reply && !require_exact_score &&
+      (phase == CPEG_WTL_REPLY_PHASE_PLACEMENT_SCREEN ||
+       phase == CPEG_WTL_REPLY_PHASE_SURVIVING_REFINE);
+  MoveGenTrace movegen_trace = {0};
   const MoveGenArgs root_args = {
       .game = defended_game,
       .move_list = selected_moves,
@@ -3723,13 +3788,16 @@ static bool cpeg_root_reply(
       .eq_margin_movegen = 0,
       .target_equity = target,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .prove_threshold_only = prove_threshold_only,
+      .trace = trace != NULL && use_small_reply ? &movegen_trace : NULL,
   };
   const int64_t start_ns = trace != NULL ? ctimer_monotonic_ns() : 0;
   generate_moves(&root_args);
   const int64_t movegen_work_ns =
       trace != NULL ? ctimer_monotonic_ns() - start_ns : 0;
   const int reply_count = move_list_get_count(selected_moves);
-  cpeg_root_reply_trace_query(trace, phase, reply_count, movegen_work_ns, false);
+  cpeg_root_reply_trace_query(trace, phase, reply_count, movegen_work_ns, false,
+                              use_small_reply ? &movegen_trace : NULL);
   if (reply_count < 1) {
     return false;
   }
@@ -3742,6 +3810,13 @@ static bool cpeg_root_reply(
         .kind = CPEG_ROOT_REPLY_ABOVE_THRESHOLD,
     };
     cpeg_root_reply_trace_threshold_short_circuit(trace, phase);
+    return true;
+  }
+  if (prove_threshold_only) {
+    *result = (CpegRootReplyResult){
+        .kind = CPEG_ROOT_REPLY_NOT_ABOVE_THRESHOLD,
+    };
+    cpeg_root_reply_trace_threshold_negative_proof(trace, phase);
     return true;
   }
   *result = (CpegRootReplyResult){
@@ -3875,12 +3950,17 @@ cpeg_defense_for_draw(CpegDefenseJob *job, CpegDefenseWorker *worker,
       trace->defenses_accepted++;
     }
     int64_t margin_upper;
-    if (!cpeg_checked_margin_add(margin_after_root,
-                                 -(int64_t)small_move_get_score(defense),
-                                 &margin_upper) ||
-        !cpeg_checked_margin_add(margin_upper, reply.exact_score,
-                                 &margin_upper)) {
-      return false;
+    if (reply.kind == CPEG_ROOT_REPLY_NOT_ABOVE_THRESHOLD) {
+      margin_upper = 0;
+    } else {
+      if (reply.kind != CPEG_ROOT_REPLY_EXACT ||
+          !cpeg_checked_margin_add(
+              margin_after_root, -(int64_t)small_move_get_score(defense),
+              &margin_upper) ||
+          !cpeg_checked_margin_add(margin_upper, reply.exact_score,
+                                   &margin_upper)) {
+        return false;
+      }
     }
     have_bound = true;
     if (margin_upper < best_margin_upper) {
@@ -5300,11 +5380,16 @@ static bool cpeg_wtl_shallow_placement_world(CpegWtlPlacementScreenJob *job,
       continue;
     }
     int64_t margin_upper;
-    if (!cpeg_checked_margin_add(margin_after_root, -(int64_t)defense_score,
-                                 &margin_upper) ||
-        !cpeg_checked_margin_add(margin_upper, reply.exact_score,
-                                 &margin_upper)) {
-      return false;
+    if (reply.kind == CPEG_ROOT_REPLY_NOT_ABOVE_THRESHOLD) {
+      margin_upper = 0;
+    } else {
+      if (reply.kind != CPEG_ROOT_REPLY_EXACT ||
+          !cpeg_checked_margin_add(margin_after_root,
+                                   -(int64_t)defense_score, &margin_upper) ||
+          !cpeg_checked_margin_add(margin_upper, reply.exact_score,
+                                   &margin_upper)) {
+        return false;
+      }
     }
     draw_values[draw_idx] =
         cpeg_wtl_envelope_from_margin_upper(margin_upper, job->margin_prior);
@@ -5600,12 +5685,18 @@ static bool cpeg_wtl_refine_placement_world(CpegWtlPlacementRefineJob *job,
         }
         break;
       }
-      if (!cpeg_checked_margin_add(margin_after_root, -(int64_t)defense_score,
-                                   &selected_margin_upper[draw_idx]) ||
-          !cpeg_checked_margin_add(selected_margin_upper[draw_idx],
-                                   reply.exact_score,
-                                   &selected_margin_upper[draw_idx])) {
-        return false;
+      if (reply.kind == CPEG_ROOT_REPLY_NOT_ABOVE_THRESHOLD) {
+        selected_margin_upper[draw_idx] = 0;
+      } else {
+        if (reply.kind != CPEG_ROOT_REPLY_EXACT ||
+            !cpeg_checked_margin_add(
+                margin_after_root, -(int64_t)defense_score,
+                &selected_margin_upper[draw_idx]) ||
+            !cpeg_checked_margin_add(selected_margin_upper[draw_idx],
+                                     reply.exact_score,
+                                     &selected_margin_upper[draw_idx])) {
+          return false;
+        }
       }
     }
     if (defense_covers_all_draws) {

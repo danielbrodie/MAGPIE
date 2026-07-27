@@ -1570,6 +1570,23 @@ static void cpeg_assert_wtl_certified_results_byte_equal(
   }
 }
 
+static void cpeg_assert_wtl_certified_win_bounds_equal(
+    const CpegWtlCertifiedResult *lhs,
+    const CpegWtlCertifiedResult *rhs) {
+  assert(lhs->count == rhs->count);
+  assert(lhs->best_index == rhs->best_index);
+  assert(lhs->regret_num == rhs->regret_num);
+  assert(lhs->regret_den == rhs->regret_den);
+  for (int candidate_idx = 0; candidate_idx < lhs->count; candidate_idx++) {
+    const CpegWtlCertifiedCand *lhs_candidate = &lhs->cands[candidate_idx];
+    const CpegWtlCertifiedCand *rhs_candidate = &rhs->cands[candidate_idx];
+    assert_strings_equal(lhs_candidate->label, rhs_candidate->label);
+    assert(lhs_candidate->outcome_den == rhs_candidate->outcome_den);
+    assert(lhs_candidate->win_lower_num == rhs_candidate->win_lower_num);
+    assert(lhs_candidate->win_upper_num == rhs_candidate->win_upper_num);
+  }
+}
+
 static void test_cpeg_belief_manifest_parser(const LetterDistribution *ld) {
   char *path = string_duplicate("cpeg_belief_manifest_test.txt");
   FILE *stream = fopen(path, "w");
@@ -1994,8 +2011,9 @@ void test_cpeg_wtl_certified_proof(void) {
 
 void test_cpeg_replybest_screen(void) {
   // A threshold witness proves only that the exact reply is above the
-  // threshold. This complete bag-one control pins the selected action and
-  // exact incumbent W/T/L mass while exercising the optimized cache path.
+  // threshold, while a completed negative traversal proves only a non-win.
+  // This complete bag-one control pins the selected action, exact incumbent
+  // W/T/L mass, and every challenger win bound.
   Config *config = config_create_or_die(
       "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
       "-wmp false -leaves NWL23_crossplay -s1 score -s2 score -threads 4");
@@ -2017,17 +2035,19 @@ void test_cpeg_replybest_screen(void) {
   CpegWtlCertifiedResult result = {0};
   assert(cpeg_solve_pre_endgame_wtl_certified(config_get_game(config), &args,
                                               &result) == 204);
-  cpeg_assert_wtl_certified_results_byte_equal(&baseline, &result);
+  cpeg_assert_wtl_certified_win_bounds_equal(&baseline, &result);
   assert_strings_equal(result.cands[result.best_index].label, "C4 EYAS");
   assert(result.cands[result.best_index].win_lower_num == 6);
   assert(result.cands[result.best_index].win_upper_num == 6);
   assert(result.cands[result.best_index].outcome_den == 6);
   assert(result.trace.threshold_short_circuits > 0);
+  assert(result.trace.threshold_negative_proofs > 0);
   int64_t phase_queries = 0;
   int64_t phase_replies_generated = 0;
   int64_t phase_cache_hits = 0;
   int64_t phase_movegen_work_ns = 0;
   int64_t phase_threshold_short_circuits = 0;
+  int64_t phase_threshold_negative_proofs = 0;
   for (int phase = 0; phase < CPEG_WTL_REPLY_PHASE_COUNT; phase++) {
     const CpegWtlReplyPhaseTrace *phase_trace =
         &result.trace.reply_phases[phase];
@@ -2037,6 +2057,8 @@ void test_cpeg_replybest_screen(void) {
     phase_movegen_work_ns += phase_trace->movegen_work_ns;
     phase_threshold_short_circuits +=
         phase_trace->threshold_short_circuits;
+    phase_threshold_negative_proofs +=
+        phase_trace->threshold_negative_proofs;
   }
   assert(phase_queries == result.trace.final_reply_queries);
   assert(phase_replies_generated == result.trace.final_replies_generated);
@@ -2044,6 +2066,8 @@ void test_cpeg_replybest_screen(void) {
   assert(phase_movegen_work_ns == result.trace.final_reply_movegen_work_ns);
   assert(phase_threshold_short_circuits ==
          result.trace.threshold_short_circuits);
+  assert(phase_threshold_negative_proofs ==
+         result.trace.threshold_negative_proofs);
   CpegWtlCertifiedArgs endcache_args = args;
   endcache_args.use_exact_endgame_cache = true;
   load_and_exec_config_or_die(config, CPEG_WTL_BAG1_CGP);

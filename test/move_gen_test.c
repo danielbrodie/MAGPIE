@@ -712,6 +712,39 @@ void best_small_play_recorder_test(void) {
   assert_move_score(move_list->spare_move, 106);
   assert(move_list->spare_move->tiles_played == 7);
 
+  // A threshold-only search must agree with the exact maximum around the
+  // strict boundary without needing to recover the exact losing score.
+  Rack rack_before_threshold;
+  rack_copy(&rack_before_threshold, player_get_rack(player));
+  const int thresholds[] = {-1, 105, 106, 107, 2000};
+  for (size_t threshold_idx = 0;
+       threshold_idx < sizeof(thresholds) / sizeof(thresholds[0]);
+       threshold_idx++) {
+    MoveGenTrace trace = {0};
+    const int threshold = thresholds[threshold_idx];
+    const MoveGenArgs threshold_args = {
+        .game = game,
+        .move_list = move_list,
+        .move_record_type = MOVE_RECORD_BEST_SMALL,
+        .move_sort_type = MOVE_SORT_SCORE,
+        .eq_margin_movegen = 0,
+        .target_equity = int_to_equity(threshold),
+        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+        .prove_threshold_only = true,
+        .trace = &trace,
+    };
+    generate_moves(&threshold_args);
+    assert(move_list_get_count(move_list) == 1);
+    assert((small_move_get_score(move_list->small_moves[0]) > threshold) ==
+           (106 > threshold));
+    assert(racks_are_equal(player_get_rack(player), &rack_before_threshold));
+    assert(trace.anchors_surviving_threshold <= trace.anchors_prepared);
+    if (threshold == 2000) {
+      assert(trace.anchors_surviving_threshold == 0);
+      assert(trace.gaddag_arcs == 0);
+    }
+  }
+
   // Test 2: VS_OXY position — best score should be 1780
   load_cgp_or_die(game, VS_OXY);
   rack_set_to_string(ld, player_get_rack(player), "ABEOPXZ");

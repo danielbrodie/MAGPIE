@@ -358,6 +358,12 @@ typedef struct CpegWtlReplyPhaseTrace {
   int64_t cache_hits;
   int64_t movegen_work_ns;
   int64_t threshold_short_circuits;
+  int64_t threshold_negative_proofs;
+  int64_t shadow_work_ns;
+  int64_t recursive_work_ns;
+  int64_t gaddag_arcs;
+  int64_t anchors_prepared;
+  int64_t anchors_surviving_threshold;
 } CpegWtlReplyPhaseTrace;
 
 // Default-off producer instrumentation. Timings ending in `_work_ns` are sums
@@ -396,6 +402,12 @@ typedef struct CpegWtlTrace {
   int64_t final_reply_cache_hits;
   int64_t final_reply_movegen_work_ns;
   int64_t threshold_short_circuits;
+  int64_t threshold_negative_proofs;
+  int64_t reply_shadow_work_ns;
+  int64_t reply_recursive_work_ns;
+  int64_t reply_gaddag_arcs;
+  int64_t reply_anchors_prepared;
+  int64_t reply_anchors_surviving_threshold;
   CpegWtlReplyPhaseTrace reply_phases[CPEG_WTL_REPLY_PHASE_COUNT];
   int64_t exact_endgame_queries;
   int64_t exact_endgame_cache_hits;

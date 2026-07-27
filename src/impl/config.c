@@ -3639,6 +3639,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
         "compatible_draws_tested=%lld final_reply_queries=%lld "
         "final_replies_generated=%lld final_reply_cache_hits=%lld "
         "final_reply_movegen_work_ns=%lld threshold_short_circuits=%lld "
+        "threshold_negative_proofs=%lld "
         "exact_endgame_queries=%lld exact_endgame_cache_hits=%lld "
         "exact_endgame_work_ns=%lld fixed_endgame_queries=%lld "
         "fixed_endgame_cache_hits=%lld fixed_endgame_work_ns=%lld "
@@ -3674,6 +3675,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
         (long long)trace->final_reply_cache_hits,
         (long long)trace->final_reply_movegen_work_ns,
         (long long)trace->threshold_short_circuits,
+        (long long)trace->threshold_negative_proofs,
         (long long)trace->exact_endgame_queries,
         (long long)trace->exact_endgame_cache_hits,
         (long long)trace->exact_endgame_work_ns,
@@ -3707,13 +3709,22 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
           lines,
           "cpeg-wtl-reply-phase schema=cpeg-wtl-reply-phase-v1 "
           "phase=%s queries=%lld replies_generated=%lld cache_hits=%lld "
-          "movegen_work_ns=%lld threshold_short_circuits=%lld\n",
+          "movegen_work_ns=%lld threshold_short_circuits=%lld "
+          "threshold_negative_proofs=%lld shadow_work_ns=%lld "
+          "recursive_work_ns=%lld gaddag_arcs=%lld anchors_prepared=%lld "
+          "anchors_surviving_threshold=%lld\n",
           cpeg_wtl_reply_phase_name((CpegWtlReplyPhase)phase),
           (long long)phase_trace->queries,
           (long long)phase_trace->replies_generated,
           (long long)phase_trace->cache_hits,
           (long long)phase_trace->movegen_work_ns,
-          (long long)phase_trace->threshold_short_circuits);
+          (long long)phase_trace->threshold_short_circuits,
+          (long long)phase_trace->threshold_negative_proofs,
+          (long long)phase_trace->shadow_work_ns,
+          (long long)phase_trace->recursive_work_ns,
+          (long long)phase_trace->gaddag_arcs,
+          (long long)phase_trace->anchors_prepared,
+          (long long)phase_trace->anchors_surviving_threshold);
     }
   }
 
@@ -3776,7 +3787,8 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
           "defenses_refuted=%lld compatible_draws_tested=%lld "
           "final_reply_queries=%lld final_replies_generated=%lld "
           "final_reply_cache_hits=%lld final_reply_movegen_work_ns=%lld "
-          "threshold_short_circuits=%lld exact_endgame_queries=%lld "
+          "threshold_short_circuits=%lld threshold_negative_proofs=%lld "
+          "exact_endgame_queries=%lld "
           "exact_endgame_cache_hits=%lld exact_endgame_work_ns=%lld "
           "fixed_endgame_queries=%lld fixed_endgame_cache_hits=%lld "
           "fixed_endgame_work_ns=%lld fixed_endgame_threshold_queries=%lld "
@@ -3805,6 +3817,7 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
           (long long)trace->final_reply_cache_hits,
           (long long)trace->final_reply_movegen_work_ns,
           (long long)trace->threshold_short_circuits,
+          (long long)trace->threshold_negative_proofs,
           (long long)trace->exact_endgame_queries,
           (long long)trace->exact_endgame_cache_hits,
           (long long)trace->exact_endgame_work_ns,
@@ -3826,14 +3839,22 @@ static void impl_cpeg_wtl_certified(Config *config, int bag,
             "schema=cpeg-wtl-reply-phase-cand-v1 "
             "candidate_idx=%d rank=%d phase=%s queries=%lld "
             "replies_generated=%lld cache_hits=%lld movegen_work_ns=%lld "
-            "threshold_short_circuits=%lld\n",
+            "threshold_short_circuits=%lld threshold_negative_proofs=%lld "
+            "shadow_work_ns=%lld recursive_work_ns=%lld gaddag_arcs=%lld "
+            "anchors_prepared=%lld anchors_surviving_threshold=%lld\n",
             candidate_idx, rank_idx + 1,
             cpeg_wtl_reply_phase_name((CpegWtlReplyPhase)phase),
             (long long)phase_trace->queries,
             (long long)phase_trace->replies_generated,
             (long long)phase_trace->cache_hits,
             (long long)phase_trace->movegen_work_ns,
-            (long long)phase_trace->threshold_short_circuits);
+            (long long)phase_trace->threshold_short_circuits,
+            (long long)phase_trace->threshold_negative_proofs,
+            (long long)phase_trace->shadow_work_ns,
+            (long long)phase_trace->recursive_work_ns,
+            (long long)phase_trace->gaddag_arcs,
+            (long long)phase_trace->anchors_prepared,
+            (long long)phase_trace->anchors_surviving_threshold);
       }
     }
   }

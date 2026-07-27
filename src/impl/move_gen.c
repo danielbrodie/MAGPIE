@@ -1,6 +1,7 @@
 #include "move_gen.h"
 
 #include "../compat/cpthread.h"
+#include "../compat/ctime.h"
 #include "../def/board_defs.h"
 #include "../def/cpthread_defs.h"
 #include "../def/cross_set_defs.h"
@@ -1182,6 +1183,24 @@ static inline void go_on_small(MoveGen *gen, int current_col, MachineLetter L,
                                Equity main_word_score, int word_multiplier,
                                Equity cross_score);
 
+static inline uint32_t
+movegen_get_next_node_index_small(MoveGen *gen, uint32_t node_index,
+                                  MachineLetter letter) {
+  if (gen->trace == NULL) {
+    return kwg_get_next_node_index(gen->kwg, node_index, letter);
+  }
+  for (uint32_t arc_index = node_index;; arc_index++) {
+    const uint32_t node = kwg_node(gen->kwg, arc_index);
+    gen->trace->gaddag_arcs++;
+    if (kwg_node_tile(node) == letter) {
+      return kwg_node_arc_index_prefetch(node, gen->kwg);
+    }
+    if (kwg_node_is_end(node)) {
+      return 0;
+    }
+  }
+}
+
 // Specialized recursive_gen for MOVE_RECORD_ALL_SMALL that skips leave_map
 // operations. Only tracks rack state directly.
 static inline void recursive_gen_small(MoveGen *gen, int col,
@@ -1204,6 +1223,9 @@ static inline void recursive_gen_small(MoveGen *gen, int col,
     bool accepts = false;
     for (uint32_t i = node_index;; i++) {
       const uint32_t node = kwg_node(gen->kwg, i);
+      if (gen->trace != NULL) {
+        gen->trace->gaddag_arcs++;
+      }
       if (kwg_node_tile(node) == raw) {
         next_node_index = kwg_node_arc_index_prefetch(node, gen->kwg);
         accepts = kwg_node_accepts(node);
@@ -1220,6 +1242,9 @@ static inline void recursive_gen_small(MoveGen *gen, int col,
              ((possible_letters_here & gen->rack_cross_set) != 0)) {
     for (uint32_t i = node_index;; i++) {
       const uint32_t node = kwg_node(gen->kwg, i);
+      if (gen->trace != NULL) {
+        gen->trace->gaddag_arcs++;
+      }
       const MachineLetter ml = kwg_node_tile(node);
       const uint16_t number_of_ml = rack_get_letter(&gen->player_rack, ml);
       if (ml != 0 &&
@@ -1318,8 +1343,8 @@ static inline void go_on_small(MoveGen *gen, int current_col, MachineLetter L,
 
     if ((gen->tiles_played != 0) ||
         (gen->anchor_right_extension_set & gen->rack_cross_set) != 0) {
-      uint32_t separation_node_index = kwg_get_next_node_index(
-          gen->kwg, new_node_index, SEPARATION_MACHINE_LETTER);
+      uint32_t separation_node_index = movegen_get_next_node_index_small(
+          gen, new_node_index, SEPARATION_MACHINE_LETTER);
       if (separation_node_index != 0 && no_letter_directly_left &&
           gen->current_anchor_col < BOARD_DIM - 1) {
         recursive_gen_small(gen, gen->current_anchor_col + 1,
@@ -2617,6 +2642,9 @@ void shadow_play_for_anchor(MoveGen *gen, int col) {
 // Simplified shadow_play_for_anchor for small move types (BEST_SMALL).
 // Skips WMP operations.
 void shadow_play_for_anchor_small(MoveGen *gen, int col) {
+  if (gen->trace != NULL) {
+    gen->trace->anchors_prepared++;
+  }
   gen->current_left_col = col;
   gen->current_right_col = col;
 
@@ -2648,6 +2676,11 @@ void shadow_play_for_anchor_small(MoveGen *gen, int col) {
     return;
   }
 
+  if (gen->trace != NULL &&
+      (!gen->stop_on_threshold ||
+       gen->highest_shadow_score > gen->target_equity_cutoff)) {
+    gen->trace->anchors_surviving_threshold++;
+  }
   anchor_heap_add_unheaped_anchor(
       &gen->anchor_heap, gen->current_row_index, col, gen->last_anchor_col,
       gen->dir, gen->highest_shadow_score, gen->highest_shadow_score);
@@ -2730,6 +2763,12 @@ void gen_load_position(MoveGen *gen, const MoveGenArgs *args) {
        gen->minimum_tiles_played > RACK_SIZE)) {
     log_fatal("MOVE_RECORD_BEST_SMALL minimum tiles must be between 0 and %d",
               RACK_SIZE);
+  }
+  if (args->prove_threshold_only &&
+      (gen->move_record_type != MOVE_RECORD_BEST_SMALL ||
+       args->target_equity == EQUITY_MAX_VALUE)) {
+    log_fatal("threshold-only generation requires thresholded "
+              "MOVE_RECORD_BEST_SMALL");
   }
 
   gen->board = game_get_board(game);
@@ -2869,6 +2908,8 @@ void gen_load_position(MoveGen *gen, const MoveGenArgs *args) {
   gen->is_wordsmog = game_get_variant(game) == GAME_VARIANT_WORDSMOG;
   gen->threshold_exceeded = false;
   gen->stop_on_threshold = args->target_equity != EQUITY_MAX_VALUE;
+  gen->prove_threshold_only = args->prove_threshold_only;
+  gen->trace = args->trace;
 }
 
 void gen_look_up_leaves_and_record_exchanges(MoveGen *gen) {
@@ -3105,6 +3146,11 @@ void gen_record_scoring_plays(MoveGen *gen) {
       break;
     }
     const Anchor anchor = anchor_heap_extract_max(&gen->anchor_heap);
+    if (gen->move_record_type == MOVE_RECORD_BEST_SMALL &&
+        gen->stop_on_threshold && gen->prove_threshold_only &&
+        anchor.highest_possible_score <= gen->target_equity_cutoff) {
+      break;
+    }
     if (better_play_has_been_found(gen, anchor.highest_possible_equity)) {
       break;
     }
@@ -3212,8 +3258,20 @@ void generate_moves(const MoveGenArgs *args) {
   } else if (gen->move_record_type == MOVE_RECORD_BEST_SMALL) {
     // BEST_SMALL uses small shadow and small recursive_gen paths that skip
     // leave_map, WMP, and wordsmog operations entirely.
+    const int64_t shadow_start_ns =
+        gen->trace != NULL ? ctimer_monotonic_ns() : 0;
     gen_shadow_small(gen);
+    if (gen->trace != NULL) {
+      gen->trace->shadow_work_ns +=
+          ctimer_monotonic_ns() - shadow_start_ns;
+    }
+    const int64_t recursive_start_ns =
+        gen->trace != NULL ? ctimer_monotonic_ns() : 0;
     gen_record_scoring_plays(gen);
+    if (gen->trace != NULL) {
+      gen->trace->recursive_work_ns +=
+          ctimer_monotonic_ns() - recursive_start_ns;
+    }
   } else {
     gen_look_up_leaves_and_record_exchanges(gen);
 
