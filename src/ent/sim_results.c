@@ -32,6 +32,15 @@ struct SimmedPlay {
   Stat *equity_stat;
   Stat *leftover_stat;
   Stat *win_pct_stat;
+  int bag_after_root;
+  uint64_t terminal_rollouts;
+  uint64_t you_last_rollouts;
+  uint64_t opponent_last_rollouts;
+  uint64_t opponent_empties_next_rollouts;
+  Stat *you_last_win_pct_stat;
+  Stat *opponent_last_win_pct_stat;
+  Stat *you_last_margin_stat;
+  Stat *opponent_last_margin_stat;
   uint64_t similarity_key;
   int play_index_by_sort_type;
   XoshiroPRNG *prng;
@@ -94,6 +103,15 @@ SimmedPlay *simmed_play_create(const MoveList *move_list, int num_plies,
   simmed_play->equity_stat = stat_create(true);
   simmed_play->leftover_stat = stat_create(true);
   simmed_play->win_pct_stat = stat_create(true);
+  simmed_play->bag_after_root = -1;
+  simmed_play->terminal_rollouts = 0;
+  simmed_play->you_last_rollouts = 0;
+  simmed_play->opponent_last_rollouts = 0;
+  simmed_play->opponent_empties_next_rollouts = 0;
+  simmed_play->you_last_win_pct_stat = stat_create(true);
+  simmed_play->opponent_last_win_pct_stat = stat_create(true);
+  simmed_play->you_last_margin_stat = stat_create(true);
+  simmed_play->opponent_last_margin_stat = stat_create(true);
   simmed_play->num_alloc_plies = num_plies;
   simmed_play->ply_infos = malloc_or_die(sizeof(PlyInfo) * num_plies);
   for (int j = 0; j < num_plies; j++) {
@@ -115,6 +133,15 @@ SimmedPlay *simmed_play_reset(SimmedPlay *simmed_play,
   stat_reset(simmed_play->equity_stat);
   stat_reset(simmed_play->leftover_stat);
   stat_reset(simmed_play->win_pct_stat);
+  simmed_play->bag_after_root = -1;
+  simmed_play->terminal_rollouts = 0;
+  simmed_play->you_last_rollouts = 0;
+  simmed_play->opponent_last_rollouts = 0;
+  simmed_play->opponent_empties_next_rollouts = 0;
+  stat_reset(simmed_play->you_last_win_pct_stat);
+  stat_reset(simmed_play->opponent_last_win_pct_stat);
+  stat_reset(simmed_play->you_last_margin_stat);
+  stat_reset(simmed_play->opponent_last_margin_stat);
   for (int j = 0; j < simmed_play->num_alloc_plies && j < new_num_plies; j++) {
     ply_info_reset(&simmed_play->ply_infos[j], use_heat_map);
   }
@@ -216,6 +243,17 @@ void simmed_play_copy(SimmedPlay *dst, const SimmedPlay *src,
   stat_copy(dst->equity_stat, src->equity_stat);
   stat_copy(dst->leftover_stat, src->leftover_stat);
   stat_copy(dst->win_pct_stat, src->win_pct_stat);
+  dst->bag_after_root = src->bag_after_root;
+  dst->terminal_rollouts = src->terminal_rollouts;
+  dst->you_last_rollouts = src->you_last_rollouts;
+  dst->opponent_last_rollouts = src->opponent_last_rollouts;
+  dst->opponent_empties_next_rollouts =
+      src->opponent_empties_next_rollouts;
+  stat_copy(dst->you_last_win_pct_stat, src->you_last_win_pct_stat);
+  stat_copy(dst->opponent_last_win_pct_stat,
+            src->opponent_last_win_pct_stat);
+  stat_copy(dst->you_last_margin_stat, src->you_last_margin_stat);
+  stat_copy(dst->opponent_last_margin_stat, src->opponent_last_margin_stat);
   dst->similarity_key = src->similarity_key;
   dst->play_index_by_sort_type = src->play_index_by_sort_type;
   for (int i = 0; i < num_plies; i++) {
@@ -240,6 +278,10 @@ void simmed_plays_destroy(SimmedPlay **simmed_plays, int num_alloc_sps) {
     stat_destroy(simmed_plays[i]->equity_stat);
     stat_destroy(simmed_plays[i]->leftover_stat);
     stat_destroy(simmed_plays[i]->win_pct_stat);
+    stat_destroy(simmed_plays[i]->you_last_win_pct_stat);
+    stat_destroy(simmed_plays[i]->opponent_last_win_pct_stat);
+    stat_destroy(simmed_plays[i]->you_last_margin_stat);
+    stat_destroy(simmed_plays[i]->opponent_last_margin_stat);
     prng_destroy(simmed_plays[i]->prng);
     free(simmed_plays[i]);
   }
@@ -332,6 +374,47 @@ const Stat *simmed_play_get_equity_stat(const SimmedPlay *simmed_play) {
 
 const Stat *simmed_play_get_win_pct_stat(const SimmedPlay *simmed_play) {
   return simmed_play->win_pct_stat;
+}
+
+int simmed_play_get_bag_after_root(const SimmedPlay *simmed_play) {
+  return simmed_play->bag_after_root;
+}
+
+uint64_t simmed_play_get_terminal_rollouts(const SimmedPlay *simmed_play) {
+  return simmed_play->terminal_rollouts;
+}
+
+uint64_t simmed_play_get_you_last_rollouts(const SimmedPlay *simmed_play) {
+  return simmed_play->you_last_rollouts;
+}
+
+uint64_t simmed_play_get_opponent_last_rollouts(const SimmedPlay *simmed_play) {
+  return simmed_play->opponent_last_rollouts;
+}
+
+uint64_t simmed_play_get_opponent_empties_next_rollouts(
+    const SimmedPlay *simmed_play) {
+  return simmed_play->opponent_empties_next_rollouts;
+}
+
+const Stat *
+simmed_play_get_you_last_win_pct_stat(const SimmedPlay *simmed_play) {
+  return simmed_play->you_last_win_pct_stat;
+}
+
+const Stat *
+simmed_play_get_opponent_last_win_pct_stat(const SimmedPlay *simmed_play) {
+  return simmed_play->opponent_last_win_pct_stat;
+}
+
+const Stat *
+simmed_play_get_you_last_margin_stat(const SimmedPlay *simmed_play) {
+  return simmed_play->you_last_margin_stat;
+}
+
+const Stat *
+simmed_play_get_opponent_last_margin_stat(const SimmedPlay *simmed_play) {
+  return simmed_play->opponent_last_margin_stat;
 }
 
 int simmed_play_get_play_index_by_sort_type(const SimmedPlay *simmed_play) {
@@ -500,6 +583,33 @@ double simmed_play_add_win_pct_stat(const WinPct *wp, SimmedPlay *simmed_play,
   stat_push(simmed_play->win_pct_stat, wpct, 1);
   cpthread_mutex_unlock(&simmed_play->mutex);
   return wpct;
+}
+
+void simmed_play_add_bag_control_stat(
+    SimmedPlay *simmed_play, int bag_after_root, bool terminal_reached,
+    bool you_play_last, bool opponent_plays_last,
+    bool opponent_empties_next, double win_pct, Equity final_margin) {
+  cpthread_mutex_lock(&simmed_play->mutex);
+  simmed_play->bag_after_root = bag_after_root;
+  if (terminal_reached) {
+    simmed_play->terminal_rollouts++;
+  }
+  if (opponent_empties_next) {
+    simmed_play->opponent_empties_next_rollouts++;
+  }
+  if (you_play_last) {
+    simmed_play->you_last_rollouts++;
+    stat_push(simmed_play->you_last_win_pct_stat, win_pct, 1);
+    stat_push(simmed_play->you_last_margin_stat,
+              equity_to_double(final_margin), 1);
+  }
+  if (opponent_plays_last) {
+    simmed_play->opponent_last_rollouts++;
+    stat_push(simmed_play->opponent_last_win_pct_stat, win_pct, 1);
+    stat_push(simmed_play->opponent_last_margin_stat,
+              equity_to_double(final_margin), 1);
+  }
+  cpthread_mutex_unlock(&simmed_play->mutex);
 }
 
 void sim_results_set_valid_for_current_game_state(SimResults *sim_results,

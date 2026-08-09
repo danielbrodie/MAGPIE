@@ -530,6 +530,12 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
   } else {
     play_move(simmed_play_get_move(simmed_play), game, NULL);
   }
+  const int bag_after_root = bag_get_letters(game_get_bag(game));
+  int bag_emptying_player_index =
+      is_crossplay && candidate_bag_before > 0 && bag_after_root == 0
+          ? simmer->initial_player
+          : -1;
+  bool opponent_empties_next = false;
   int final_turns_remaining = is_crossplay && candidate_bag_before > 0 &&
                                       bag_is_empty(game_get_bag(game))
                                   ? 2
@@ -583,6 +589,9 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
     if (is_crossplay) {
       if (bag_before > 0 && bag_is_empty(game_get_bag(game))) {
         final_turns_remaining = 2;
+        bag_emptying_player_index = player_on_turn_index;
+        opponent_empties_next =
+            ply == 0 && player_on_turn_index != simmer->initial_player;
       } else if (bag_before == 0 && final_turns_remaining > 0) {
         final_turns_remaining--;
       }
@@ -606,6 +615,16 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
           rack_get_total_letters(player_get_rack(
               game_get_player(game, 1 - simmer->initial_player))),
       plies % 2);
+  if (is_crossplay) {
+    const bool terminal_reached = final_turns_remaining == 0;
+    simmed_play_add_bag_control_stat(
+        simmed_play, bag_after_root, terminal_reached,
+        terminal_reached &&
+            bag_emptying_player_index == simmer->initial_player,
+        terminal_reached &&
+            bag_emptying_player_index == 1 - simmer->initial_player,
+        opponent_empties_next, wpct, spread);
+  }
   // reset to first state. we only need to restore one backup.
   game_unplay_last_move(game);
   return_rack_to_bag(game, player_off_turn_index);

@@ -87,6 +87,7 @@ bool string_builder_add_sim_stats_with_display_lock(
     bool exclude_tile_placement_moves, bool use_ucgi_format) {
   const int num_simmed_plays = sim_results_get_number_of_plays(sim_results);
   const LetterDistribution *ld = game_get_ld(game);
+  const bool is_crossplay = ld_is_crossplay(ld);
   const Board *board = game_get_board(game);
   const bool has_filter = filter_row >= 0 || filter_col >= 0 ||
                           prefix_len > 0 || exclude_tile_placement_moves;
@@ -119,7 +120,8 @@ bool string_builder_add_sim_stats_with_display_lock(
   // UCGI mode adds 2 extra base columns (WpSE, EqSE) and 1 extra per-ply
   // column (PlyN-SD score stdev) between the score mean and bingo columns.
   const int num_cols = MIN_NUM_SIM_RESULT_COLS + (use_ucgi_format ? 2 : 0) +
-                       num_display_plies * (use_ucgi_format ? 3 : 2);
+                       num_display_plies * (use_ucgi_format ? 3 : 2) +
+                       (is_crossplay ? 1 : 0);
   StringGrid *sg = string_grid_create(num_rows, num_cols, 1);
 
   int curr_row = 0;
@@ -139,6 +141,10 @@ bool string_builder_add_sim_stats_with_display_lock(
                            get_formatted_string("P%d-S", j + 1));
       string_grid_set_cell(sg, curr_row, curr_col++,
                            get_formatted_string("P%d-BP", j + 1));
+    }
+    if (is_crossplay) {
+      string_grid_set_cell(sg, curr_row, curr_col++,
+                           string_duplicate("BagCtl"));
     }
     curr_row++;
   }
@@ -241,6 +247,32 @@ bool string_builder_add_sim_stats_with_display_lock(
       string_grid_set_cell(
           sg, curr_row, curr_col++,
           get_formatted_string("%.2f", stat_get_mean(bingo_stat) * 100.0));
+    }
+    if (is_crossplay) {
+      const Stat *you_last_win_pct =
+          simmed_play_get_you_last_win_pct_stat(sp);
+      const Stat *opponent_last_win_pct =
+          simmed_play_get_opponent_last_win_pct_stat(sp);
+      const Stat *you_last_margin =
+          simmed_play_get_you_last_margin_stat(sp);
+      const Stat *opponent_last_margin =
+          simmed_play_get_opponent_last_margin_stat(sp);
+      string_grid_set_cell(
+          sg, curr_row, curr_col++,
+          get_formatted_string(
+              "BC:n=%" PRIu64 ",b=%d,t=%" PRIu64 ",yl=%" PRIu64
+              ",ol=%" PRIu64 ",on=%" PRIu64
+              ",ylw=%.2f,olw=%.2f,ylm=%.2f,olm=%.2f",
+              stat_get_num_samples(win_pct_stat),
+              simmed_play_get_bag_after_root(sp),
+              simmed_play_get_terminal_rollouts(sp),
+              simmed_play_get_you_last_rollouts(sp),
+              simmed_play_get_opponent_last_rollouts(sp),
+              simmed_play_get_opponent_empties_next_rollouts(sp),
+              stat_get_mean(you_last_win_pct) * 100.0,
+              stat_get_mean(opponent_last_win_pct) * 100.0,
+              stat_get_mean(you_last_margin),
+              stat_get_mean(opponent_last_margin)));
     }
     curr_row++;
   }

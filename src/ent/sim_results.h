@@ -34,6 +34,19 @@ uint64_t simmed_play_get_ply_info_count(const SimmedPlay *simmed_play,
                                         ply_info_count_t count_type);
 const Stat *simmed_play_get_equity_stat(const SimmedPlay *simmed_play);
 const Stat *simmed_play_get_win_pct_stat(const SimmedPlay *simmed_play);
+int simmed_play_get_bag_after_root(const SimmedPlay *simmed_play);
+uint64_t simmed_play_get_terminal_rollouts(const SimmedPlay *simmed_play);
+uint64_t simmed_play_get_you_last_rollouts(const SimmedPlay *simmed_play);
+uint64_t simmed_play_get_opponent_last_rollouts(const SimmedPlay *simmed_play);
+uint64_t
+simmed_play_get_opponent_empties_next_rollouts(const SimmedPlay *simmed_play);
+const Stat *
+simmed_play_get_you_last_win_pct_stat(const SimmedPlay *simmed_play);
+const Stat *
+simmed_play_get_opponent_last_win_pct_stat(const SimmedPlay *simmed_play);
+const Stat *simmed_play_get_you_last_margin_stat(const SimmedPlay *simmed_play);
+const Stat *
+simmed_play_get_opponent_last_margin_stat(const SimmedPlay *simmed_play);
 int simmed_play_get_play_index_by_sort_type(const SimmedPlay *simmed_play);
 uint64_t simmed_play_get_seed(SimmedPlay *simmed_play);
 void simmed_play_add_stats_for_ply(SimmedPlay *simmed_play, int ply_index,
@@ -44,6 +57,10 @@ double simmed_play_add_win_pct_stat(const WinPct *wp, SimmedPlay *simmed_play,
                                     Equity spread, Equity leftover,
                                     game_end_reason_t game_end_reason,
                                     int game_unseen_tiles, bool plies_are_odd);
+void simmed_play_add_bag_control_stat(
+    SimmedPlay *simmed_play, int bag_after_root, bool terminal_reached,
+    bool you_play_last, bool opponent_plays_last,
+    bool opponent_empties_next, double win_pct, Equity final_margin);
 
 typedef struct SimResults SimResults;
 
