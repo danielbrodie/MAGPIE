@@ -374,6 +374,7 @@ void rv_normal_predetermined_reset(RandomVariables *rvs) {
 typedef struct SimmerWorker {
   Game *game;
   MoveList *move_list;
+  MoveList *takeout_move_list;
   XoshiroPRNG *prng;
 } SimmerWorker;
 
@@ -412,6 +413,7 @@ SimmerWorker *simmer_create_worker(const Game *game) {
   simmer_worker->game = game_duplicate(game);
   game_set_backup_mode(simmer_worker->game, BACKUP_MODE_SIMULATION);
   simmer_worker->move_list = move_list_create(1);
+  simmer_worker->takeout_move_list = move_list_create_small(1);
   simmer_worker->prng = prng_create(0);
   return simmer_worker;
 }
@@ -426,6 +428,7 @@ void simmer_worker_destroy(SimmerWorker *simmer_worker) {
   }
   game_destroy(simmer_worker->game);
   move_list_destroy(simmer_worker->move_list);
+  small_move_list_destroy(simmer_worker->takeout_move_list);
   prng_destroy(simmer_worker->prng);
   free(simmer_worker);
 }
@@ -457,6 +460,27 @@ static void play_crossplay_rollout_move(const Move *move, Game *game,
   }
   game_set_consecutive_scoreless_turns(game, 0);
   game_set_game_end_reason(game, GAME_END_REASON_NONE);
+}
+
+static bool crossplay_has_takeout_reply(Game *game, MoveList *move_list,
+                                        int bag_tiles) {
+  if (bag_tiles <= 0 || bag_tiles > RACK_SIZE) {
+    return false;
+  }
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = move_list,
+      .move_record_type = MOVE_RECORD_BEST_SMALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .minimum_tiles_played = bag_tiles,
+  };
+  generate_moves(&args);
+  return move_list_get_count(move_list) > 0 &&
+         !small_move_is_pass(move_list->small_moves[0]);
 }
 
 double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
@@ -536,6 +560,9 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
           ? simmer->initial_player
           : -1;
   bool opponent_empties_next = false;
+  bool opponent_reply = false;
+  bool opponent_can_empty_next = false;
+  bool opponent_misses_empty_next = false;
   int final_turns_remaining = is_crossplay && candidate_bag_before > 0 &&
                                       bag_is_empty(game_get_bag(game))
                                   ? 2
@@ -560,6 +587,17 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
                                 : get_top_equity_move(game, move_list);
     rack_copy(&spare_rack, player_get_rack(player_on_turn));
     const int bag_before = bag_get_letters(game_get_bag(game));
+    if (is_crossplay && ply == 0 && bag_before > 0 &&
+        player_on_turn_index != simmer->initial_player) {
+      opponent_reply = true;
+      opponent_can_empty_next = crossplay_has_takeout_reply(
+          game, simmer_worker->takeout_move_list, bag_before);
+      const bool chooses_takeout =
+          move_get_type(best_play) == GAME_EVENT_TILE_PLACEMENT_MOVE &&
+          move_get_tiles_played(best_play) >= bag_before;
+      opponent_misses_empty_next =
+          opponent_can_empty_next && !chooses_takeout;
+    }
 
     // On the final ply the resulting cross-sets are never read (no further move
     // generation happens before game_unplay_last_move restores the board), so
@@ -623,7 +661,8 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
             bag_emptying_player_index == simmer->initial_player,
         terminal_reached &&
             bag_emptying_player_index == 1 - simmer->initial_player,
-        opponent_empties_next, wpct, spread);
+        opponent_empties_next, opponent_reply, opponent_can_empty_next,
+        opponent_misses_empty_next, wpct, spread);
   }
   // reset to first state. we only need to restore one backup.
   game_unplay_last_move(game);

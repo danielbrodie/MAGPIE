@@ -37,6 +37,9 @@ struct SimmedPlay {
   uint64_t you_last_rollouts;
   uint64_t opponent_last_rollouts;
   uint64_t opponent_empties_next_rollouts;
+  uint64_t opponent_reply_rollouts;
+  uint64_t opponent_can_empty_next_rollouts;
+  uint64_t opponent_misses_empty_next_rollouts;
   Stat *you_last_win_pct_stat;
   Stat *opponent_last_win_pct_stat;
   Stat *you_last_margin_stat;
@@ -108,6 +111,9 @@ SimmedPlay *simmed_play_create(const MoveList *move_list, int num_plies,
   simmed_play->you_last_rollouts = 0;
   simmed_play->opponent_last_rollouts = 0;
   simmed_play->opponent_empties_next_rollouts = 0;
+  simmed_play->opponent_reply_rollouts = 0;
+  simmed_play->opponent_can_empty_next_rollouts = 0;
+  simmed_play->opponent_misses_empty_next_rollouts = 0;
   simmed_play->you_last_win_pct_stat = stat_create(true);
   simmed_play->opponent_last_win_pct_stat = stat_create(true);
   simmed_play->you_last_margin_stat = stat_create(true);
@@ -138,6 +144,9 @@ SimmedPlay *simmed_play_reset(SimmedPlay *simmed_play,
   simmed_play->you_last_rollouts = 0;
   simmed_play->opponent_last_rollouts = 0;
   simmed_play->opponent_empties_next_rollouts = 0;
+  simmed_play->opponent_reply_rollouts = 0;
+  simmed_play->opponent_can_empty_next_rollouts = 0;
+  simmed_play->opponent_misses_empty_next_rollouts = 0;
   stat_reset(simmed_play->you_last_win_pct_stat);
   stat_reset(simmed_play->opponent_last_win_pct_stat);
   stat_reset(simmed_play->you_last_margin_stat);
@@ -249,6 +258,11 @@ void simmed_play_copy(SimmedPlay *dst, const SimmedPlay *src,
   dst->opponent_last_rollouts = src->opponent_last_rollouts;
   dst->opponent_empties_next_rollouts =
       src->opponent_empties_next_rollouts;
+  dst->opponent_reply_rollouts = src->opponent_reply_rollouts;
+  dst->opponent_can_empty_next_rollouts =
+      src->opponent_can_empty_next_rollouts;
+  dst->opponent_misses_empty_next_rollouts =
+      src->opponent_misses_empty_next_rollouts;
   stat_copy(dst->you_last_win_pct_stat, src->you_last_win_pct_stat);
   stat_copy(dst->opponent_last_win_pct_stat,
             src->opponent_last_win_pct_stat);
@@ -395,6 +409,21 @@ uint64_t simmed_play_get_opponent_last_rollouts(const SimmedPlay *simmed_play) {
 uint64_t simmed_play_get_opponent_empties_next_rollouts(
     const SimmedPlay *simmed_play) {
   return simmed_play->opponent_empties_next_rollouts;
+}
+
+uint64_t simmed_play_get_opponent_reply_rollouts(
+    const SimmedPlay *simmed_play) {
+  return simmed_play->opponent_reply_rollouts;
+}
+
+uint64_t simmed_play_get_opponent_can_empty_next_rollouts(
+    const SimmedPlay *simmed_play) {
+  return simmed_play->opponent_can_empty_next_rollouts;
+}
+
+uint64_t simmed_play_get_opponent_misses_empty_next_rollouts(
+    const SimmedPlay *simmed_play) {
+  return simmed_play->opponent_misses_empty_next_rollouts;
 }
 
 const Stat *
@@ -588,7 +617,9 @@ double simmed_play_add_win_pct_stat(const WinPct *wp, SimmedPlay *simmed_play,
 void simmed_play_add_bag_control_stat(
     SimmedPlay *simmed_play, int bag_after_root, bool terminal_reached,
     bool you_play_last, bool opponent_plays_last,
-    bool opponent_empties_next, double win_pct, Equity final_margin) {
+    bool opponent_empties_next, bool opponent_reply,
+    bool opponent_can_empty_next, bool opponent_misses_empty_next,
+    double win_pct, Equity final_margin) {
   cpthread_mutex_lock(&simmed_play->mutex);
   simmed_play->bag_after_root = bag_after_root;
   if (terminal_reached) {
@@ -596,6 +627,15 @@ void simmed_play_add_bag_control_stat(
   }
   if (opponent_empties_next) {
     simmed_play->opponent_empties_next_rollouts++;
+  }
+  if (opponent_reply) {
+    simmed_play->opponent_reply_rollouts++;
+  }
+  if (opponent_can_empty_next) {
+    simmed_play->opponent_can_empty_next_rollouts++;
+  }
+  if (opponent_misses_empty_next) {
+    simmed_play->opponent_misses_empty_next_rollouts++;
   }
   if (you_play_last) {
     simmed_play->you_last_rollouts++;

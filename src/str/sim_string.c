@@ -261,7 +261,8 @@ bool string_builder_add_sim_stats_with_display_lock(
           sg, curr_row, curr_col++,
           get_formatted_string(
               "BC:n=%" PRIu64 ",b=%d,t=%" PRIu64 ",yl=%" PRIu64
-              ",ol=%" PRIu64 ",on=%" PRIu64
+              ",ol=%" PRIu64 ",on=%" PRIu64 ",or=%" PRIu64
+              ",oa=%" PRIu64 ",om=%" PRIu64
               ",ylw=%.2f,olw=%.2f,ylm=%.2f,olm=%.2f",
               stat_get_num_samples(win_pct_stat),
               simmed_play_get_bag_after_root(sp),
@@ -269,6 +270,9 @@ bool string_builder_add_sim_stats_with_display_lock(
               simmed_play_get_you_last_rollouts(sp),
               simmed_play_get_opponent_last_rollouts(sp),
               simmed_play_get_opponent_empties_next_rollouts(sp),
+              simmed_play_get_opponent_reply_rollouts(sp),
+              simmed_play_get_opponent_can_empty_next_rollouts(sp),
+              simmed_play_get_opponent_misses_empty_next_rollouts(sp),
               stat_get_mean(you_last_win_pct) * 100.0,
               stat_get_mean(opponent_last_win_pct) * 100.0,
               stat_get_mean(you_last_margin),

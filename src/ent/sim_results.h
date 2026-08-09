@@ -40,6 +40,12 @@ uint64_t simmed_play_get_you_last_rollouts(const SimmedPlay *simmed_play);
 uint64_t simmed_play_get_opponent_last_rollouts(const SimmedPlay *simmed_play);
 uint64_t
 simmed_play_get_opponent_empties_next_rollouts(const SimmedPlay *simmed_play);
+uint64_t
+simmed_play_get_opponent_reply_rollouts(const SimmedPlay *simmed_play);
+uint64_t simmed_play_get_opponent_can_empty_next_rollouts(
+    const SimmedPlay *simmed_play);
+uint64_t simmed_play_get_opponent_misses_empty_next_rollouts(
+    const SimmedPlay *simmed_play);
 const Stat *
 simmed_play_get_you_last_win_pct_stat(const SimmedPlay *simmed_play);
 const Stat *
@@ -60,7 +66,9 @@ double simmed_play_add_win_pct_stat(const WinPct *wp, SimmedPlay *simmed_play,
 void simmed_play_add_bag_control_stat(
     SimmedPlay *simmed_play, int bag_after_root, bool terminal_reached,
     bool you_play_last, bool opponent_plays_last,
-    bool opponent_empties_next, double win_pct, Equity final_margin);
+    bool opponent_empties_next, bool opponent_reply,
+    bool opponent_can_empty_next, bool opponent_misses_empty_next,
+    double win_pct, Equity final_margin);
 
 typedef struct SimResults SimResults;
 
