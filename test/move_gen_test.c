@@ -3,6 +3,7 @@
 #include "../src/def/game_history_defs.h"
 #include "../src/def/letter_distribution_defs.h"
 #include "../src/def/move_defs.h"
+#include "../src/ent/bag.h"
 #include "../src/ent/bit_rack.h"
 #include "../src/ent/board.h"
 #include "../src/ent/equity.h"
@@ -75,6 +76,18 @@ int count_nonscoring_plays(const MoveList *ml) {
     }
   }
   return sum;
+}
+
+int count_exchange_plays(const MoveList *move_list) {
+  int count = 0;
+  for (int move_idx = 0; move_idx < move_list_get_count(move_list);
+       move_idx++) {
+    if (move_get_type(move_list_get_move(move_list, move_idx)) ==
+        GAME_EVENT_EXCHANGE) {
+      count++;
+    }
+  }
+  return count;
 }
 
 // Use -1 for row if setting with CGP
@@ -1321,6 +1334,46 @@ void movegen_should_not_gen_exchanges(void) {
   config_destroy(config);
 }
 
+void movegen_uses_crossplay_exchange_window(void) {
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay");
+  Game *game = config_game_create(config);
+  load_cgp_or_die(
+      game, "11B3/6V4U3/6A4OD2/6XU3YO2/5F1N2PeG2/4ZA1W2ED3/4E2I2L4/"
+            "3KIVAS1JARS2/2HEN2H2G1C2/2UT6E1I2/2PALMeTTES1E2/"
+            "3M2WOOF1GNAR/2QI8C2/1HIND7E2/ROSE2RATIONS2 TEOB?LE/ 381/437 0");
+  draw_to_full_rack(game, 1);
+  assert(bag_get_letters(game_get_bag(game)) == 6);
+
+  MoveList *move_list = move_list_create(4000);
+  const MoveGenArgs move_gen_args = {
+      .game = game,
+      .move_list = move_list,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_EQUITY,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+  };
+  generate_moves_for_game(&move_gen_args);
+  assert(count_exchange_plays(move_list) == 0);
+
+  // Crossplay permits exchanges only with one to four public bag tiles. These
+  // two discarded draws model tiles already placed on the board; movegen only
+  // needs the resulting bag count for this legality boundary.
+  bag_draw_random_letter(game_get_bag(game), 0);
+  bag_draw_random_letter(game_get_bag(game), 0);
+  assert(bag_get_letters(game_get_bag(game)) == 4);
+  generate_moves_for_game(&move_gen_args);
+  assert(count_exchange_plays(move_list) > 0);
+
+  move_list_destroy(move_list);
+  game_destroy(game);
+  config_destroy(config);
+}
+
 void movegen_does_not_return_early_from_anchor(void) {
   Config *config = config_create_or_die("set -lex CSW21 -wmp true");
   Game *game = config_game_create(config);
@@ -1763,6 +1816,7 @@ void test_move_gen(void) {
   movegen_within_x_of_best_test(true);
   movegen_many_moves();
   movegen_should_not_gen_exchanges();
+  movegen_uses_crossplay_exchange_window();
   movegen_does_not_return_early_from_anchor();
   movegen_one_tile_nonwmp();
   movegen_one_tile_wmp();

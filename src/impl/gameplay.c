@@ -894,6 +894,20 @@ const Move *get_top_equity_move(Game *game, MoveList *move_list) {
   return move_list_get_move(move_list, 0);
 }
 
+const Move *get_top_score_move(Game *game, MoveList *move_list) {
+  const MoveGenArgs args = {.game = game,
+                            .move_list = move_list,
+                            .move_record_type = MOVE_RECORD_BEST,
+                            .move_sort_type = MOVE_SORT_SCORE,
+                            .override_kwg = NULL,
+                            .eq_margin_movegen = 0,
+                            .target_equity = EQUITY_MAX_VALUE,
+                            .target_leave_size_for_exchange_cutoff =
+                                UNSET_LEAVE_SIZE};
+  generate_moves(&args);
+  return move_list_get_move(move_list, 0);
+}
+
 Move *get_top_equity_move_for_inferences(
     Game *game, MoveList *move_list, Equity target_equity,
     int target_leave_size_for_exchange_cutoff, Equity equity_margin) {

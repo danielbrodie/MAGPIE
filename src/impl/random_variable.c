@@ -430,6 +430,35 @@ void simmer_worker_destroy(SimmerWorker *simmer_worker) {
   free(simmer_worker);
 }
 
+// MAGPIE's normal move executor applies Scrabble going-out bonuses and
+// scoreless-turn termination. Crossplay keeps the same board, rack, draw, and
+// turn mechanics, but scores only the move itself and never ends for either of
+// those reasons. The simulation backup is intentionally left intact so the
+// root state can still be restored with one game_unplay_last_move call.
+static void play_crossplay_rollout_move(const Move *move, Game *game,
+                                        bool update_cross_sets) {
+  const int actor = game_get_player_on_turn_index(game);
+  Equity scores_before[2];
+  for (int player_idx = 0; player_idx < 2; player_idx++) {
+    scores_before[player_idx] =
+        player_get_score(game_get_player(game, player_idx));
+  }
+
+  if (update_cross_sets) {
+    play_move(move, game, NULL);
+  } else {
+    play_move_no_cross_set_update(move, game, NULL);
+  }
+
+  for (int player_idx = 0; player_idx < 2; player_idx++) {
+    const Equity score = scores_before[player_idx] +
+                         (player_idx == actor ? move_get_score(move) : 0);
+    player_set_score(game_get_player(game, player_idx), score);
+  }
+  game_set_consecutive_scoreless_turns(game, 0);
+  game_set_game_end_reason(game, GAME_END_REASON_NONE);
+}
+
 double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
                      const int thread_index, const uint64_t sample_count,
                      BAILogger __attribute__((unused)) * bai_logger) {
@@ -453,6 +482,7 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
   Game *game = simmer_worker->game;
   MoveList *move_list = simmer_worker->move_list;
   const int plies = sim_results_get_num_plies(sim_results);
+  const bool is_crossplay = ld_is_crossplay(game_get_ld(game));
 
   // This will shuffle the bag, so there is no need
   // to call bag_shuffle explicitly.
@@ -483,7 +513,7 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
   Equity leftover = 0;
   game_set_backup_mode(game, BACKUP_MODE_SIMULATION);
   // For one-ply sims, we need to account for the candidate move's leave value
-  if (plies == 1) {
+  if (plies == 1 && !is_crossplay) {
     Rack candidate_rack;
     const Player *player_on_turn =
         game_get_player(game, simmer->initial_player);
@@ -492,33 +522,52 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
                                          simmed_play_get_move(simmed_play),
                                          &candidate_rack);
   }
-  // play move
-  play_move(simmed_play_get_move(simmed_play), game, NULL);
+  // Play the candidate. A Crossplay rollout tracks the two-turn final queue
+  // from the exact moment this or a later placement drains the bag.
+  const int candidate_bag_before = bag_get_letters(game_get_bag(game));
+  if (is_crossplay) {
+    play_crossplay_rollout_move(simmed_play_get_move(simmed_play), game, true);
+  } else {
+    play_move(simmed_play_get_move(simmed_play), game, NULL);
+  }
+  int final_turns_remaining = is_crossplay && candidate_bag_before > 0 &&
+                                      bag_is_empty(game_get_bag(game))
+                                  ? 2
+                                  : -1;
   sim_results_increment_node_count(sim_results);
   game_set_backup_mode(game, BACKUP_MODE_OFF);
   // further plies will NOT be backed up.
   Rack spare_rack;
-  for (int ply = 0; ply < plies; ply++) {
+  int ply = 0;
+  while (ply < plies || (is_crossplay && final_turns_remaining > 0)) {
     const int player_on_turn_index = game_get_player_on_turn_index(game);
     const Player *player_on_turn = game_get_player(game, player_on_turn_index);
 
-    if (game_over(game)) {
+    if ((!is_crossplay && game_over(game)) ||
+        (is_crossplay && final_turns_remaining == 0)) {
       break;
     }
 
-    const Move *best_play = get_top_equity_move(game, move_list);
+    const Move *best_play = is_crossplay && final_turns_remaining > 0 &&
+                                    bag_is_empty(game_get_bag(game))
+                                ? get_top_score_move(game, move_list)
+                                : get_top_equity_move(game, move_list);
     rack_copy(&spare_rack, player_get_rack(player_on_turn));
+    const int bag_before = bag_get_letters(game_get_bag(game));
 
     // On the final ply the resulting cross-sets are never read (no further move
     // generation happens before game_unplay_last_move restores the board), so
-    // skip the cross-set update for that play.
-    if (ply == plies - 1) {
+    // skip the cross-set update for that play. Crossplay can dynamically extend
+    // the rollout after the nominal final ply, so it always updates them.
+    if (!is_crossplay && ply == plies - 1) {
       play_move_no_cross_set_update(best_play, game, NULL);
+    } else if (is_crossplay) {
+      play_crossplay_rollout_move(best_play, game, true);
     } else {
       play_move(best_play, game, NULL);
     }
     sim_results_increment_node_count(sim_results);
-    if (ply == plies - 2 || ply == plies - 1) {
+    if (!is_crossplay && (ply == plies - 2 || ply == plies - 1)) {
       Equity this_leftover = get_leave_value_for_move(
           player_get_klv(player_on_turn), best_play, &spare_rack);
       if (player_on_turn_index == simmer->initial_player) {
@@ -527,7 +576,18 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
         leftover -= this_leftover;
       }
     }
-    simmed_play_add_stats_for_ply(simmed_play, ply, best_play);
+    if (ply < plies) {
+      simmed_play_add_stats_for_ply(simmed_play, ply, best_play);
+    }
+
+    if (is_crossplay) {
+      if (bag_before > 0 && bag_is_empty(game_get_bag(game))) {
+        final_turns_remaining = 2;
+      } else if (bag_before == 0 && final_turns_remaining > 0) {
+        final_turns_remaining--;
+      }
+    }
+    ply++;
   }
 
   const Equity spread =
@@ -535,9 +595,12 @@ double rv_sim_sample(RandomVariables *rvs, const uint64_t play_index,
       player_get_score(game_get_player(game, 1 - simmer->initial_player));
   simmed_play_add_equity_stat(simmed_play, simmer->initial_spread, spread,
                               leftover);
+  const game_end_reason_t evaluation_end_reason =
+      is_crossplay && final_turns_remaining == 0
+          ? GAME_END_REASON_STANDARD
+          : game_get_game_end_reason(game);
   const double wpct = simmed_play_add_win_pct_stat(
-      simmer->win_pcts, simmed_play, spread, leftover,
-      game_get_game_end_reason(game),
+      simmer->win_pcts, simmed_play, spread, leftover, evaluation_end_reason,
       // number of tiles unseen to us: bag tiles + tiles on opp rack.
       bag_get_letters(game_get_bag(game)) +
           rack_get_total_letters(player_get_rack(

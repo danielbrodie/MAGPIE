@@ -299,6 +299,10 @@ static inline const char *ld_get_name(const LetterDistribution *ld) {
   return ld->name;
 }
 
+static inline bool ld_is_crossplay(const LetterDistribution *ld) {
+  return strings_equal(ld_get_name(ld), "english_crossplay");
+}
+
 static inline int ld_get_size(const LetterDistribution *ld) { return ld->size; }
 
 static inline int ld_get_dist(const LetterDistribution *ld, MachineLetter ml) {

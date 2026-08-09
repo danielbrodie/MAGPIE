@@ -1143,6 +1143,38 @@ void test_snoprune_exchange_and_pass(void) {
   config_destroy(config);
 }
 
+void test_crossplay_final_queue_regression(void) {
+  // In the live bag-six incident, the Scrabble rollout strongly preferred a
+  // small OBE play because it stopped before Crossplay's complete final queue
+  // and applied the wrong going-out score. The Crossplay rollout must instead
+  // carry every bag-emptying sample through both final turns using raw scores.
+  Config *config = config_create_or_die(
+      "set -lex NWL23_crossplay -ld english_crossplay -bdn crossplay -bb 40 "
+      "-wmp false -leaves NWL23_crossplay -s1 equity -s2 equity -r1 all "
+      "-r2 all -numplays 20 -plies 2 -threads 1 -iter 2000 -minp 500 "
+      "-scond none -seed 42");
+  load_and_exec_config_or_die(
+      config, "cgp 11B3/6V4U3/6A4OD2/6XU3YO2/5F1N2PeG2/4ZA1W2ED3/4E2I2L4/"
+              "3KIVAS1JARS2/2HEN2H2G1C2/2UT6E1I2/2PALMeTTES1E2/"
+              "3M2WOOF1GNAR/2QI8C2/1HIND7E2/ROSE2RATIONS2 TEOB?LE/ 381/437 0");
+  load_and_exec_config_or_die(config, "gen");
+
+  SimResults *sim_results = config_get_sim_results(config);
+  assert(config_simulate_and_return_status(config, NULL, NULL, sim_results) ==
+         ERROR_STATUS_SUCCESS);
+  const SimmedPlay *best_play = get_best_simmed_play(sim_results);
+  StringBuilder *move_string_builder = string_builder_create();
+  string_builder_add_move_description(move_string_builder,
+                                      simmed_play_get_move(best_play),
+                                      config_get_ld(config));
+  assert_strings_equal(string_builder_peek(move_string_builder), "B3 EyEBOLT");
+  const double win_pct = stat_get_mean(simmed_play_get_win_pct_stat(best_play));
+  assert(win_pct > 0.2 && win_pct < 0.4);
+
+  string_builder_destroy(move_string_builder);
+  config_destroy(config);
+}
+
 void test_sim(void) {
   const char *sim_perf_iters = getenv("SIM_PERF_ITERS");
   if (sim_perf_iters) {
@@ -1170,6 +1202,7 @@ void test_sim(void) {
     test_sim_avoid_prune_cmd_multi();
     test_snoprune_with_opp_rack_and_mixed_coords();
     test_snoprune_exchange_and_pass();
+    test_crossplay_final_queue_regression();
     test_sim_avoid_prune_errors();
   }
 }

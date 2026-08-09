@@ -219,6 +219,24 @@ static inline Move *gen_get_current_move(MoveGen *gen) {
   return &gen->best_move_and_current_move[gen->best_move_index ^ 1];
 }
 
+static bool gen_exchange_is_legal(const MoveGen *gen) {
+  if (ld_is_crossplay(&gen->ld)) {
+    // Before the unknown opponent rack is sampled, those seven tiles still
+    // live in Game's bag. Once sampled, they live in opponent_rack instead.
+    // This invariant recovers the public bag count in either representation.
+    const int crossplay_bag_count =
+        gen->number_of_tiles_in_bag +
+        rack_get_total_letters(&gen->opponent_rack) - RACK_SIZE;
+    return crossplay_bag_count >= 1 && crossplay_bag_count <= 4;
+  }
+  // Standard play permits an exchange when at least seven tiles are unseen
+  // beyond the player's rack. The opponent rack is still in the bag from
+  // movegen's point of view, hence this equivalent 14-tile check.
+  return gen->number_of_tiles_in_bag +
+             rack_get_total_letters(&gen->opponent_rack) >=
+         (RACK_SIZE * 2);
+}
+
 static inline void gen_switch_best_move_and_current_move(MoveGen *gen) {
   gen->best_move_index ^= 1;
 }
@@ -2929,10 +2947,7 @@ void gen_look_up_leaves_and_record_exchanges(MoveGen *gen) {
   const bool check_leaves = (gen->number_of_tiles_in_bag > 0) &&
                             (gen->move_sort_type != MOVE_SORT_SCORE);
 
-  // Assumes the player has drawn a full rack but not the opponent.
-  const bool add_exchange = gen->number_of_tiles_in_bag +
-                                rack_get_total_letters(&gen->opponent_rack) >=
-                            (RACK_SIZE * 2);
+  const bool add_exchange = gen_exchange_is_legal(gen);
 
   // Try to use the pre-computed rack info table for full racks.
   const bool has_full_rack =
@@ -3289,13 +3304,9 @@ void generate_moves(const MoveGenArgs *args) {
       // rack and enumerating reads garbage. We only use the cache when
       // those values are known-fresh, on both write and read.
       WMPMoveGen *wgen = &gen->wmp_move_gen;
-      // Mirror the condition in gen_look_up_leaves_and_record_exchanges:
-      // add_exchange=true iff there are enough unseen tiles for the
-      // exchange walk to make sense.
-      const bool add_exchange =
-          gen->number_of_tiles_in_bag +
-              rack_get_total_letters(&gen->opponent_rack) >=
-          (RACK_SIZE * 2);
+      // Mirror the legality condition in
+      // gen_look_up_leaves_and_record_exchanges.
+      const bool add_exchange = gen_exchange_is_legal(gen);
       const bool leaves_are_populated =
           (gen->rit_entry != NULL) || check_leaves || add_exchange;
       const uint32_t subrack_slot = bit_rack_get_bucket_index(
